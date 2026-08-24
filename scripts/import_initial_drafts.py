@@ -40,7 +40,17 @@ def read_batch(batch_dir: Path):
     return batch
 
 
-def import_batch(batch_dir: Path, context_date: str):
+def import_batch(batch_dir: Path, context_date: str, *, legacy_archive: bool = False):
+    """Archive an old static batch without making it a queue candidate.
+
+    Static seed drafts predate the editorial pipeline. They are retained only
+    as traceable historical material and must never be able to enter the
+    publish queue.
+    """
+    if not legacy_archive:
+        raise ValueError(
+            "static initial drafts are archive-only; pass legacy_archive=True explicitly"
+        )
     batch = read_batch(batch_dir)
     app.init_db()
     inserted = 0
@@ -60,7 +70,7 @@ def import_batch(batch_dir: Path, context_date: str):
                 asset_id = item.get("asset_id", "").strip()
                 if asset_id and asset_id not in valid_asset_ids:
                     raise ValueError(f"{slug} has invalid asset_id: {asset_id}")
-                source = f"initial_batch:{context_date}:{item['slot']}"
+                source = f"legacy_initial_batch:{context_date}:{item['slot']}"
                 existing = conn.execute(
                     "SELECT asset_id FROM post_candidates WHERE persona_id=? AND context_date=? AND source=?",
                     (personas[slug], context_date, source),
@@ -70,20 +80,17 @@ def import_batch(batch_dir: Path, context_date: str):
                     """INSERT INTO post_candidates(
                         persona_id,context_date,title,body,status,source,asset_id,notes,created_at,updated_at
                     ) VALUES(?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(persona_id,context_date,source) DO UPDATE SET
-                        asset_id=excluded.asset_id,
-                        updated_at=excluded.updated_at
-                    WHERE post_candidates.status='needs_review'
-                      AND post_candidates.asset_id=''
-                      AND excluded.asset_id<>''""",
+                    ON CONFLICT(persona_id,context_date,source) DO NOTHING""",
                     (
                         personas[slug], context_date, item["topic"].strip(), item["body"].strip(),
-                        "needs_review", source, asset_id,
+                        "superseded", source, asset_id,
                         json.dumps({
                             "batch": batch_dir.name,
                             "kind": item["kind"],
                             "sources": item.get("sources", []),
-                            "published": False,
+                            "legacy_import": True,
+                            "publishable": False,
+                            "archived_at_import": True,
                         }, ensure_ascii=False),
                         now, now,
                     ),
@@ -102,11 +109,21 @@ def import_batch(batch_dir: Path, context_date: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Import a review-only initial persona draft batch.")
+    parser = argparse.ArgumentParser(
+        description="Archive a legacy static persona batch. It can never enter the publish queue."
+    )
     parser.add_argument("batch_dir", type=Path)
     parser.add_argument("--date", required=True)
+    parser.add_argument(
+        "--legacy-archive",
+        action="store_true",
+        help="required acknowledgement that static drafts are historical archive material only",
+    )
     args = parser.parse_args()
-    print(json.dumps(import_batch(args.batch_dir, args.date), ensure_ascii=False))
+    print(json.dumps(
+        import_batch(args.batch_dir, args.date, legacy_archive=args.legacy_archive),
+        ensure_ascii=False,
+    ))
 
 
 if __name__ == "__main__":
