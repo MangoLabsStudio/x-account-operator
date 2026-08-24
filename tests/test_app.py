@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -66,11 +67,132 @@ class AppTest(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"daily context run {context_date} did not finish")
 
+    def create_editorial_run(self, context_date, status="approved", topics=None, market_state="已批准的市场变化"):
+        topics = topics or [{
+            "claim_key": "approved-market-change",
+            "subject": "热点项目",
+            "title": "热点项目出现新的市场变化",
+            "core_claim": "公共题单的主张不等于任何人设已经表达。",
+            "eligible": True,
+        }]
+        now = int(time.time())
+        self.app_module.save_daily_context(
+            context_date,
+            self.app_module.DailyMarketContextIn(
+                market_state=market_state,
+                event_clusters="事件聚类",
+                debates="市场分歧",
+                evidence="可核验事实",
+                unknowns="",
+                raw_feed="",
+                sources=[],
+            ),
+        )
+        with self.app_module.db() as conn:
+            cursor = conn.execute(
+                """INSERT INTO daily_context_runs(
+                    context_date,status,trigger,raw_cards,synthesis,created_at,updated_at,approved_at
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    context_date,
+                    status,
+                    "test",
+                    json.dumps({"selected_topics": topics}, ensure_ascii=False),
+                    "{}",
+                    now,
+                    now,
+                    now if status == "approved" else None,
+                ),
+            )
+        return cursor.lastrowid
+
+    @staticmethod
+    def editorial_decision(topic, status, *, claim_key="", core_claim="", score=4, why_me="人设有明确观察角度"):
+        return {
+            str(topic["claim_key"]): {
+                "status": status,
+                "notice": score,
+                "authority": score,
+                "tension": score,
+                "marginal_value": score,
+                "why_me": why_me if status == "WRITE" else "",
+                "claim_key": claim_key,
+                "core_claim": core_claim,
+                "reason_code": status.lower(),
+                "rationale": "测试决策",
+                "open_loop": "",
+            }
+        }
+
+    def insert_pending_editorial_write(self, run_id, context_date, topic, *, slug="acheng",
+                                        claim_key="pending-claim", core_claim="待恢复的核心判断"):
+        with self.app_module.db() as conn:
+            persona = dict(conn.execute(
+                "SELECT id,slug,draft FROM personas WHERE slug=?", (slug,)
+            ).fetchone())
+            daily = self.app_module.daily_context_dict(conn.execute(
+                "SELECT * FROM daily_market_contexts WHERE context_date=?", (context_date,)
+            ).fetchone())
+            run = conn.execute(
+                "SELECT raw_cards,approval_revision FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            topics = self.app_module.json_value(run["raw_cards"], {}).get("selected_topics", [])
+            daily["approval_revision"] = run["approval_revision"]
+            stable_history = self.app_module.editorial_stable_claim_history(conn, context_date)
+            input_payload = self.app_module.editorial_topic_input_payload(
+                topic, daily, persona, {}, topics=topics, claim_history=stable_history
+            )
+            input_hash = self.app_module.editorial_topic_input_hash(
+                topic, daily, persona, {}, topics=topics, claim_history=stable_history
+            )
+            now = int(time.time())
+            cursor = conn.execute(
+                """INSERT INTO persona_editorial_evaluations(
+                    run_id,persona_id,topic_input_hash,input_json,topic_json,status,notice,authority,tension,marginal_value,
+                    why_me,claim_key,core_claim,reason_code,rationale,open_loop,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (run_id, persona["id"], input_hash, json.dumps(input_payload, ensure_ascii=False),
+                 json.dumps(topic, ensure_ascii=False), "WRITE", 5, 5, 4, 5, "这是该人设会说的",
+                 claim_key, core_claim, "write", "测试", "", now, now),
+            )
+        return cursor.lastrowid
+
     def test_health_is_public(self):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["daily_context_enabled"])
         self.assertEqual(response.json()["daily_context_run_time"], "08:15")
+
+    def test_init_db_migrates_legacy_daily_run_approval_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy_path = Path(directory) / "xops.db"
+            conn = sqlite3.connect(legacy_path)
+            conn.execute(
+                """CREATE TABLE daily_context_runs (
+                    id INTEGER PRIMARY KEY,context_date TEXT NOT NULL UNIQUE,status TEXT NOT NULL,
+                    trigger TEXT NOT NULL,raw_manifest TEXT NOT NULL DEFAULT '{}',raw_cards TEXT NOT NULL DEFAULT '{}',
+                    synthesis TEXT NOT NULL DEFAULT '{}',reviewer_notes TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',
+                    started_at INTEGER,completed_at INTEGER,approved_at INTEGER,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL
+                )"""
+            )
+            conn.commit()
+            conn.close()
+            original_data_dir = self.app_module.DATA_DIR
+            original_db_path = self.app_module.DB_PATH
+            try:
+                self.app_module.DATA_DIR = Path(directory)
+                self.app_module.DB_PATH = legacy_path
+                self.app_module.init_db()
+                with self.app_module.db() as migrated:
+                    columns = {
+                        row["name"] for row in migrated.execute(
+                            "PRAGMA table_info(daily_context_runs)"
+                        ).fetchall()
+                    }
+                self.assertIn("approval_revision", columns)
+            finally:
+                self.app_module.DATA_DIR = original_data_dir
+                self.app_module.DB_PATH = original_db_path
 
     def test_dashboard_is_public(self):
         self.assertEqual(self.client.get("/").status_code, 200)
@@ -162,72 +284,594 @@ class AppTest(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["title"], "新的候选内容")
         self.assertEqual(candidates[0]["source"], "daily_context_run")
-        latest = self.client.get("/api/daily-post").json()
-        self.assertEqual(latest["body"], "来自重新抓取母池后生成的候选。")
-        self.assertEqual(latest["persona_slug"], "acheng")
+        self.assertEqual(self.client.get("/api/daily-post").status_code, 404)
 
-    def test_daily_run_refreshes_one_persona_post_draft(self):
-        generated = AsyncMock(return_value={"post": "今天自动生成的 Post 草稿。"})
-        with patch.dict(
-            os.environ,
-            {"XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONA": "acheng"},
+    def test_unapproved_context_never_evaluates_or_generates_editorial_posts(self):
+        run_id = self.create_editorial_run("2026-08-21", status="needs_review")
+        evaluator = AsyncMock(side_effect=AssertionError("unapproved context must not be evaluated"))
+        generated = AsyncMock(side_effect=AssertionError("unapproved context must not generate"))
+        with patch.dict(os.environ, {"XOPS_DAILY_POST_ENABLED": "true"}), patch.object(
+            self.app_module, "evaluate_persona_editorial", evaluator
         ), patch.object(self.app_module, "generate_persona_post", generated):
-            asyncio.run(
-                self.app_module.refresh_daily_post_draft(
-                    "2026-08-24",
-                    7,
-                    {
-                        "selected_topics": [{"title": "今天有什么值得讨论？", "eligible": True}],
-                        "opinion_cards": [{"text": "市场观点" * 3000, "handle": "hidden"}],
-                    },
-                    {"market_state": "今日市场状态", "sources": [{"handle": "hidden"}]},
-                )
-            )
-        request = generated.await_args.args[1]
-        self.assertLessEqual(len(request.facts), 8000)
-        self.assertNotIn("hidden", request.facts)
-        latest = self.client.get("/api/daily-post").json()
-        self.assertEqual(latest["body"], "今天自动生成的 Post 草稿。")
-        self.assertEqual(latest["title"], "今天有什么值得讨论？")
-        self.assertEqual(latest["persona_slug"], "acheng")
+            self.assertEqual(asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id)), [])
+        evaluator.assert_not_awaited()
+        generated.assert_not_awaited()
+        with self.app_module.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM persona_editorial_evaluations").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 0)
 
-    def test_daily_run_generates_ten_persona_queue(self):
-        generated = AsyncMock(
-            side_effect=[{"post": f"草稿 {index}"} for index in range(1, 11)]
-        )
-        cards = {
-            "selected_topics": [
-                {"title": "题目一"},
-                {"title": "题目二"},
-                {"title": "题目三"},
-            ]
+    def test_editorial_decisions_only_write_and_never_fill_a_quota(self):
+        run_id = self.create_editorial_run("2026-08-22")
+        generated = AsyncMock(return_value={"post": "只给真正值得写的人设生成。"})
+
+        async def evaluator(persona, _context, _daily, topics, _history, _today_count):
+            topic = topics[0]
+            if persona["slug"] == "acheng":
+                return self.editorial_decision(
+                    topic, "WRITE", claim_key="acheng-market-thesis", core_claim="这次变化先改变的是流动性预期。"
+                )
+            if persona["slug"] == "ridehail-driver-zhao":
+                return self.editorial_decision(topic, "HOLD")
+            return self.editorial_decision(topic, "IGNORE")
+
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true",
+            "XOPS_DAILY_POST_PERSONAS": "acheng,ridehail-driver-zhao,college-student-linjia",
+        }), patch.object(self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)), patch.object(
+            self.app_module, "generate_persona_post", generated
+        ), patch.object(self.app_module, "publish_persona", side_effect=AssertionError("pipeline must never publish")):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+
+        self.assertEqual(generated.await_count, 1)
+        with self.app_module.db() as conn:
+            statuses = [row[0] for row in conn.execute(
+                "SELECT status FROM persona_editorial_evaluations ORDER BY id"
+            ).fetchall()]
+            self.assertEqual(statuses, ["WRITE", "HOLD", "IGNORE"])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)
+            claims = conn.execute(
+                "SELECT claim_key FROM topic_claim_history WHERE claim_key LIKE 'persona:%'"
+            ).fetchall()
+            self.assertEqual(len(claims), 1)
+
+    def test_editorial_same_claim_has_one_winner_but_different_claims_can_coexist(self):
+        topic = {
+            "claim_key": "hot-event",
+            "subject": "热点事件",
+            "title": "热点事件",
+            "core_claim": "公共题单",
+            "eligible": True,
         }
-        with patch.dict(
-            os.environ,
-            {
-                "XOPS_DAILY_POST_ENABLED": "true",
-                "XOPS_DAILY_POST_PERSONAS": (
-                    "acheng,ridehail-driver-zhao,college-student-linjia,atuo,axu,"
-                    "nanqiao,qiliang,aye,xiaoman,maili"
-                ),
-            },
-        ), patch.object(self.app_module, "generate_persona_post", generated):
-            asyncio.run(
-                self.app_module.refresh_daily_post_draft(
-                    "2026-08-24", 8, cards, {"market_state": "今日市场状态"}
-                )
+        run_id = self.create_editorial_run("2026-08-23", topics=[topic])
+        generated = AsyncMock(return_value={"post": "候选正文"})
+
+        async def evaluator(persona, _context, _daily, topics, _history, _today_count):
+            if persona["slug"] == "acheng":
+                return self.editorial_decision(topics[0], "WRITE", claim_key="same-claim", core_claim="同一个核心判断", score=5)
+            if persona["slug"] == "ridehail-driver-zhao":
+                return self.editorial_decision(topics[0], "WRITE", claim_key="same-claim", core_claim="同一个核心判断", score=3)
+            return self.editorial_decision(topics[0], "WRITE", claim_key="different-claim", core_claim="同热点的另一条具体判断", score=4)
+
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true",
+            "XOPS_DAILY_POST_PERSONAS": "acheng,ridehail-driver-zhao,college-student-linjia",
+        }), patch.object(self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)), patch.object(
+            self.app_module, "generate_persona_post", generated
+        ):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+
+        self.assertEqual(generated.await_count, 2)
+        with self.app_module.db() as conn:
+            decisions = [tuple(row) for row in conn.execute(
+                "SELECT p.slug,e.status,e.reason_code FROM persona_editorial_evaluations e JOIN personas p ON p.id=e.persona_id ORDER BY p.slug"
+            ).fetchall()]
+            self.assertIn(("acheng", "WRITE", "write"), decisions)
+            self.assertIn(("ridehail-driver-zhao", "HOLD", "cross_persona_collision"), decisions)
+            self.assertIn(("college-student-linjia", "WRITE", "write"), decisions)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 2)
+
+    def test_editorial_replay_recovers_pending_write_without_re_evaluation(self):
+        topic = {
+            "claim_key": "recovery-topic", "subject": "恢复", "title": "恢复", "core_claim": "公共题单", "eligible": True,
+        }
+        context_date = "2026-08-24"
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+        self.insert_pending_editorial_write(
+            run_id, context_date, topic,
+            claim_key="recovery-claim", core_claim="已有 WRITE 但尚未生成正文。",
+        )
+        evaluator = AsyncMock(side_effect=AssertionError("existing input must not be re-evaluated"))
+        generated = AsyncMock(return_value={"post": "恢复成功"})
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(self.app_module, "evaluate_persona_editorial", evaluator), patch.object(
+            self.app_module, "generate_persona_post", generated
+        ):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+        evaluator.assert_not_awaited()
+        self.assertEqual(generated.await_count, 1)
+        with self.app_module.db() as conn:
+            self.assertIsNotNone(conn.execute(
+                "SELECT candidate_id FROM persona_editorial_evaluations WHERE run_id=?", (run_id,)
+            ).fetchone()[0])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)
+
+    def test_editorial_material_input_change_allows_incremental_re_evaluation(self):
+        run_id = self.create_editorial_run("2026-08-25")
+        generated = AsyncMock(return_value={"post": "更新后的正文"})
+        calls = []
+
+        async def evaluator(_persona, _context, _daily, topics, _history, _today_count):
+            calls.append(True)
+            suffix = len(calls)
+            return self.editorial_decision(
+                topics[0], "WRITE", claim_key=f"incremental-{suffix}", core_claim=f"第 {suffix} 次输入的新增判断"
             )
+
+        env = {"XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng"}
+        with patch.dict(os.environ, env), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.app_module.save_daily_context(
+                "2026-08-25",
+                self.app_module.DailyMarketContextIn(
+                    market_state="实质新增的市场变化", event_clusters="事件聚类", debates="市场分歧",
+                    evidence="新增可核验事实", unknowns="", raw_feed="", sources=[],
+                ),
+            )
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(generated.await_count, 2)
+
+    def test_daily_posts_api_returns_only_real_candidates_not_ten_queued_placeholders(self):
+        context_date = self.app_module.shanghai_today()
+        run_id = self.create_editorial_run(context_date)
+        with self.app_module.db() as conn:
+            persona = conn.execute("SELECT id FROM personas WHERE slug='acheng'").fetchone()
+            now = int(time.time())
+            conn.execute(
+                """INSERT INTO persona_editorial_evaluations(
+                    id,run_id,persona_id,topic_input_hash,topic_json,status,notice,authority,tension,marginal_value,
+                    why_me,claim_key,core_claim,reason_code,rationale,open_loop,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (123, run_id, persona["id"], "api-test", "{}", "WRITE", 5, 5, 5, 5,
+                 "人设角度", "api-claim", "真实草稿", "write", "测试", "", now, now),
+            )
+            conn.execute(
+                """INSERT INTO post_candidates(
+                    persona_id,context_date,title,body,status,source,notes,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (persona["id"], context_date, "真实草稿", "只有真实候选会出现。", "needs_review", "persona_editorial:123", "未发布", now, now),
+            )
+        with patch.object(self.app_module, "shanghai_today", return_value=context_date):
             queue = self.client.get("/api/daily-posts").json()
-        self.assertEqual(generated.await_count, 10)
-        self.assertEqual([item["persona_slug"] for item in queue], [
-            "acheng", "ridehail-driver-zhao", "college-student-linjia", "atuo",
-            "axu", "nanqiao", "qiliang", "aye", "xiaoman", "maili"
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["persona_slug"], "acheng")
+        self.assertEqual(queue[0]["body"], "只有真实候选会出现。")
+        self.assertNotIn("queued", [item["status"] for item in queue])
+
+    def test_editorial_fingerprint_tracks_semantic_inputs_only(self):
+        with self.app_module.db() as conn:
+            persona = dict(conn.execute(
+                "SELECT id,slug,draft FROM personas WHERE slug='acheng'"
+            ).fetchone())
+        topic = {"claim_key": "fingerprint-topic", "title": "输入变化"}
+        daily = {
+            "context_date": "2026-08-24", "market_state": "状态", "event_clusters": "事件",
+            "debates": "分歧", "evidence": "证据", "unknowns": "", "sources": [{"url": "a"}],
+            "updated_at": 1,
+        }
+        context = {"prior_views": "旧判断", "updated_at": 1}
+        first = self.app_module.editorial_topic_input_hash(topic, daily, persona, context)
+        self.assertEqual(
+            first,
+            self.app_module.editorial_topic_input_hash(
+                topic, {**daily, "updated_at": 2}, persona, {**context, "updated_at": 2}
+            ),
+        )
+        self.assertNotEqual(
+            first,
+            self.app_module.editorial_topic_input_hash(
+                topic, {**daily, "sources": [{"url": "b"}]}, persona, context
+            ),
+        )
+        self.assertNotEqual(
+            first,
+            self.app_module.editorial_topic_input_hash(
+                topic, daily, persona, {**context, "prior_views": "新判断"}
+            ),
+        )
+
+    def test_editorial_claim_history_downgrades_duplicate_write(self):
+        decisions = {
+            "topic": {
+                "status": "WRITE", "claim_key": "same-thesis", "core_claim": "同一个核心判断",
+                "reason_code": "write", "rationale": "", "notice": 5, "authority": 5,
+                "tension": 5, "marginal_value": 5,
+            }
+        }
+        result = self.app_module.apply_editorial_claim_history(
+            2,
+            decisions,
+            [{
+                "claim_key": "persona:1:same-thesis", "core_claim": "同一个核心判断",
+                "status": "drafted", "source": "persona_editorial:1",
+            }],
+        )
+        self.assertEqual(result["topic"]["status"], "IGNORE")
+        self.assertEqual(result["topic"]["reason_code"], "historical_duplicate")
+
+    def test_default_editorial_pass_does_not_backfill_old_approved_days(self):
+        self.create_editorial_run("2020-01-01")
+        evaluator = AsyncMock(side_effect=AssertionError("historical runs must not be backfilled"))
+        with patch.dict(os.environ, {"XOPS_DAILY_POST_ENABLED": "true"}), patch.object(
+            self.app_module, "evaluate_persona_editorial", evaluator
+        ):
+            self.assertEqual(asyncio.run(self.app_module.run_persona_editorial_pipeline()), [])
+        evaluator.assert_not_awaited()
+
+    def test_editorial_reapproval_updates_formal_context(self):
+        context_date = "2026-08-19"
+        self.create_editorial_run(context_date, market_state="第一次批准")
+        reviewed = self.client.put(
+            f"/api/context/daily-runs/{context_date}/review",
+            json={"market_state": "第二次批准", "sources": []},
+        )
+        self.assertEqual(reviewed.status_code, 200)
+        approved = self.client.post(f"/api/context/daily-runs/{context_date}/approve")
+        self.assertEqual(approved.status_code, 200)
+        self.assertEqual(
+            self.client.get(f"/api/context/daily/{context_date}").json()["market_state"],
+            "第二次批准",
+        )
+
+    def test_editorial_evaluator_failure_does_not_block_other_personas(self):
+        run_id = self.create_editorial_run("2026-08-18")
+        generated = AsyncMock(return_value={"post": "后续人设仍然生成。"})
+
+        async def evaluator(persona, _context, _daily, topics, _history, _today_count):
+            if persona["slug"] == "acheng":
+                raise RuntimeError("one persona failed")
+            return self.editorial_decision(
+                topics[0], "WRITE", claim_key="second-persona-thesis", core_claim="第二个人设的独立判断"
+            )
+
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true",
+            "XOPS_DAILY_POST_PERSONAS": "acheng,ridehail-driver-zhao",
+        }), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+        self.assertEqual(generated.await_count, 1)
+        with self.app_module.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)
+
+    def test_editorial_collision_is_transitive(self):
+        run_id = self.create_editorial_run("2026-08-17")
+        now = int(time.time())
+        with self.app_module.db() as conn:
+            personas = conn.execute("SELECT id,slug FROM personas ORDER BY id LIMIT 3").fetchall()
+            values = [
+                (personas[0]["id"], "claim-a", "核心甲", 5),
+                (personas[1]["id"], "claim-a", "核心乙", 4),
+                (personas[2]["id"], "claim-c", "核心乙", 3),
+            ]
+            for index, (persona_id, claim_key, core_claim, score) in enumerate(values):
+                conn.execute(
+                    """INSERT INTO persona_editorial_evaluations(
+                        run_id,persona_id,topic_input_hash,topic_json,status,notice,authority,tension,marginal_value,
+                        why_me,claim_key,core_claim,reason_code,rationale,open_loop,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (run_id, persona_id, f"transitive-{index}", "{}", "WRITE", score, score, score, score,
+                     "匹配", claim_key, core_claim, "write", "", "", now, now),
+                )
+        self.app_module.resolve_persona_editorial_collisions(run_id)
+        with self.app_module.db() as conn:
+            statuses = [row[0] for row in conn.execute(
+                "SELECT status FROM persona_editorial_evaluations WHERE run_id=? ORDER BY id", (run_id,)
+            ).fetchall()]
+        self.assertEqual(statuses.count("WRITE"), 1)
+        self.assertEqual(statuses.count("HOLD"), 2)
+
+    def test_historical_pending_write_recovers_without_historical_backfill(self):
+        context_date = "2020-01-02"
+        topic = {
+            "claim_key": "historical-pending", "subject": "恢复", "title": "历史待恢复",
+            "core_claim": "这条已经完成编辑判断。", "eligible": True,
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+        self.insert_pending_editorial_write(run_id, context_date, topic)
+        evaluator = AsyncMock(side_effect=AssertionError("historical context must not be re-evaluated"))
+        generated = AsyncMock(return_value={"post": "只恢复已有 WRITE。"})
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(self.app_module, "evaluate_persona_editorial", evaluator), patch.object(
+            self.app_module, "generate_persona_post", generated
+        ):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline())
+            asyncio.run(self.app_module.run_persona_editorial_pipeline())
+        evaluator.assert_not_awaited()
+        self.assertEqual(generated.await_count, 1)
+        with self.app_module.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)
+
+    def test_later_claim_memory_supersedes_older_pending_duplicate(self):
+        old_date = "2026-08-01"
+        new_date = "2026-08-02"
+        old_topic = {
+            "claim_key": "old-pending-duplicate", "subject": "跨日重复", "title": "旧待恢复",
+            "core_claim": "公共旧主张", "eligible": True,
+        }
+        old_run = self.create_editorial_run(old_date, topics=[old_topic])
+        old_id = self.insert_pending_editorial_write(
+            old_run, old_date, old_topic,
+            claim_key="old-pending-claim", core_claim="跨日相同核心判断",
+        )
+        new_topic = {
+            "claim_key": "newer-duplicate", "subject": "跨日重复", "title": "较新候选",
+            "core_claim": "公共新主张", "eligible": True,
+        }
+        new_run = self.create_editorial_run(new_date, topics=[new_topic])
+
+        async def evaluator(_persona, _context, _daily, topics, _history, _today_count):
+            return self.editorial_decision(
+                topics[0], "WRITE", claim_key="newer-claim", core_claim="跨日相同核心判断"
+            )
+
+        generated = AsyncMock(return_value={"post": "较新的候选"})
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(new_run))
+            asyncio.run(self.app_module.run_persona_editorial_pipeline())
+        self.assertEqual(generated.await_count, 1)
+        with self.app_module.db() as conn:
+            old = conn.execute(
+                "SELECT status,reason_code FROM persona_editorial_evaluations WHERE id=?", (old_id,)
+            ).fetchone()
+            self.assertEqual(tuple(old), ("HOLD", "historical_duplicate_before_generation"))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)
+
+    def test_changed_context_supersedes_pending_write_before_generation(self):
+        context_date = "2026-08-16"
+        topic = {
+            "claim_key": "changed-input", "subject": "变化", "title": "Context 变化",
+            "core_claim": "旧公共主张", "eligible": True,
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic], market_state="旧市场状态")
+        old_id = self.insert_pending_editorial_write(
+            run_id, context_date, topic, claim_key="old-pending", core_claim="旧输入下的判断"
+        )
+        self.app_module.save_daily_context(
+            context_date,
+            self.app_module.DailyMarketContextIn(
+                market_state="新市场状态", event_clusters="新事件", debates="新分歧",
+                evidence="新证据", unknowns="", raw_feed="", sources=[],
+            ),
+        )
+        generated = AsyncMock(return_value={"post": "只使用新 Context 的正文。"})
+
+        async def evaluator(_persona, _context, _daily, topics, _history, _today_count):
+            return self.editorial_decision(
+                topics[0], "WRITE", claim_key="new-input-claim", core_claim="新输入下的判断"
+            )
+
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+        self.assertEqual(generated.await_count, 1)
+        self.assertIn("新市场状态", generated.await_args.args[1].facts)
+        self.assertNotIn("旧市场状态", generated.await_args.args[1].facts)
+        with self.app_module.db() as conn:
+            old = conn.execute(
+                "SELECT status,reason_code,candidate_id FROM persona_editorial_evaluations WHERE id=?",
+                (old_id,),
+            ).fetchone()
+            self.assertEqual(tuple(old), ("HOLD", "input_changed_before_generation", None))
+
+    def test_reopening_approved_context_hides_and_supersedes_old_candidate(self):
+        context_date = self.app_module.shanghai_today()
+        topic = {
+            "claim_key": "reopen-topic", "subject": "重审", "title": "重新审核",
+            "core_claim": "第一次判断", "eligible": True,
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+
+        async def evaluator(_persona, _context, _daily, topics, _history, _today_count):
+            return self.editorial_decision(
+                topics[0], "WRITE", claim_key="reopen-first", core_claim="第一次人设判断"
+            )
+
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
+        ), patch.object(
+            self.app_module, "generate_persona_post", AsyncMock(return_value={"post": "第一次草稿"})
+        ):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+        self.assertEqual(self.client.get("/api/daily-post").status_code, 200)
+        reviewed = self.client.put(
+            f"/api/context/daily-runs/{context_date}/review",
+            json={"market_state": "重新审核后的 Context", "sources": []},
+        )
+        self.assertEqual(reviewed.status_code, 200)
+        self.assertEqual(self.client.get("/api/daily-post").status_code, 404)
+        self.assertEqual(self.client.get("/api/daily-posts").json(), [])
+        with self.app_module.db() as conn:
+            evaluation = conn.execute(
+                "SELECT status,reason_code FROM persona_editorial_evaluations WHERE run_id=?", (run_id,)
+            ).fetchone()
+            candidate = conn.execute("SELECT status FROM post_candidates").fetchone()
+            self.assertEqual(tuple(evaluation), ("HOLD", "context_revised"))
+            self.assertEqual(candidate["status"], "superseded")
+
+    def test_reapproval_same_content_uses_a_new_approval_revision(self):
+        context_date = "2026-08-12"
+        topic = {
+            "claim_key": "same-content-reapproval", "subject": "重批", "title": "同内容重批",
+            "core_claim": "同一份正式内容", "eligible": True,
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+        calls = []
+
+        async def evaluator(_persona, _context, _daily, topics, _history, _today_count):
+            calls.append(True)
+            return self.editorial_decision(
+                topics[0], "WRITE", claim_key=f"revision-{len(calls)}",
+                core_claim=f"第 {len(calls)} 个审批周期的判断"
+            )
+
+        generated = AsyncMock(side_effect=[{"post": "第一版"}, {"post": "第二版"}])
+        env = {"XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng"}
+        with patch.dict(os.environ, env), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            daily = self.client.get(f"/api/context/daily/{context_date}").json()
+            reviewed = self.client.put(
+                f"/api/context/daily-runs/{context_date}/review",
+                json={key: daily[key] for key in (
+                    "market_state", "event_clusters", "debates", "evidence", "unknowns", "sources"
+                )},
+            )
+            self.assertEqual(reviewed.status_code, 200)
+            approved = self.client.post(f"/api/context/daily-runs/{context_date}/approve")
+            self.assertEqual(approved.status_code, 200)
+            self.assertEqual(approved.json()["approval_revision"], 1)
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(generated.await_count, 2)
+        with self.app_module.db() as conn:
+            statuses = [row[0] for row in conn.execute(
+                "SELECT status FROM post_candidates ORDER BY id"
+            ).fetchall()]
+        self.assertEqual(statuses, ["superseded", "needs_review"])
+
+    def test_context_change_during_generation_discards_stale_result(self):
+        context_date = "2026-08-11"
+        topic = {
+            "claim_key": "mid-generation-change", "subject": "并发变化", "title": "生成中变化",
+            "core_claim": "生成前的公共主张", "eligible": True,
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic], market_state="生成前状态")
+
+        async def evaluator(_persona, _context, _daily, topics, _history, _today_count):
+            return self.editorial_decision(
+                topics[0], "WRITE", claim_key="mid-generation-claim", core_claim="生成前的人设判断"
+            )
+
+        async def generated(_persona_id, _request):
+            self.app_module.save_daily_context(
+                context_date,
+                self.app_module.DailyMarketContextIn(
+                    market_state="生成期间改写", event_clusters="新事件", debates="新分歧",
+                    evidence="新证据", unknowns="", raw_feed="", sources=[],
+                ),
+            )
+            return {"post": "这条结果必须丢弃"}
+
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
+        ), patch.object(self.app_module, "generate_persona_post", AsyncMock(side_effect=generated)):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+        with self.app_module.db() as conn:
+            evaluation = conn.execute(
+                "SELECT status,reason_code FROM persona_editorial_evaluations WHERE run_id=?", (run_id,)
+            ).fetchone()
+            self.assertEqual(tuple(evaluation), ("HOLD", "input_changed_during_generation"))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 0)
+
+    def test_approval_rolls_back_formal_context_and_status_together(self):
+        context_date = "2026-08-15"
+        now = int(time.time())
+        with self.app_module.db() as conn:
+            conn.execute(
+                """INSERT INTO daily_context_runs(
+                    context_date,status,trigger,raw_cards,synthesis,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (context_date, "needs_review", "test", "{}", json.dumps({"market_state": "待批准"}), now, now),
+            )
+        original = self.app_module.save_daily_context_row
+
+        def fail_after_upsert(conn, date, request, timestamp):
+            original(conn, date, request, timestamp)
+            raise RuntimeError("simulated crash")
+
+        with patch.object(self.app_module, "save_daily_context_row", side_effect=fail_after_upsert):
+            with self.assertRaises(RuntimeError):
+                self.app_module.approve_daily_context_run(context_date)
+        with self.app_module.db() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT status FROM daily_context_runs WHERE context_date=?", (context_date,)
+            ).fetchone()[0], "needs_review")
+            self.assertIsNone(conn.execute(
+                "SELECT id FROM daily_market_contexts WHERE context_date=?", (context_date,)
+            ).fetchone())
+
+    def test_editorial_generation_facts_are_bounded_valid_json(self):
+        context_date = "2026-08-14"
+        topic = {
+            "claim_key": "large-input", "subject": "大输入", "title": "大输入",
+            "core_claim": "公共主张", "material_delta": "变化" * 5000,
+            "audience_value": "价值" * 5000, "eligible": True,
+        }
+        run_id = self.create_editorial_run(
+            context_date, topics=[topic], market_state="状态" * 5000
+        )
+
+        async def evaluator(_persona, _context, _daily, topics, _history, _today_count):
+            return self.editorial_decision(
+                topics[0], "WRITE", claim_key="bounded-facts", core_claim="大输入下的明确判断"
+            )
+
+        generated = AsyncMock(return_value={"post": "正文"})
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+        facts = generated.await_args.args[1].facts
+        self.assertLessEqual(len(facts), 8000)
+        self.assertIsInstance(json.loads(facts), dict)
+
+    def test_editorial_writer_failure_does_not_block_later_candidates(self):
+        topic = {
+            "claim_key": "writer-failure", "subject": "失败隔离", "title": "失败隔离",
+            "core_claim": "公共主张", "eligible": True,
+        }
+        run_id = self.create_editorial_run("2026-08-13", topics=[topic])
+
+        async def evaluator(persona, _context, _daily, topics, _history, _today_count):
+            return self.editorial_decision(
+                topics[0], "WRITE", claim_key=f"writer-{persona['slug']}",
+                core_claim=f"{persona['slug']} 的独立判断"
+            )
+
+        generated = AsyncMock(side_effect=[
+            self.app_module.HTTPException(502, "first failed"), {"post": "第二条仍生成"},
         ])
-        self.assertEqual([item["body"] for item in queue], [
-            f"草稿 {index}" for index in range(1, 11)
-        ])
-        self.assertTrue(all(item["image_url"] for item in queue[:3]))
-        self.assertTrue(all(item["image_url"] is None for item in queue[3:]))
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true",
+            "XOPS_DAILY_POST_PERSONAS": "acheng,ridehail-driver-zhao",
+        }), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+        self.assertEqual(generated.await_count, 2)
+        with self.app_module.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)
 
     def test_persona_draft_and_published_version(self):
         personas = self.client.get("/api/personas").json()

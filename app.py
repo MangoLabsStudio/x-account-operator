@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -470,6 +471,7 @@ def init_db():
                 started_at INTEGER,
                 completed_at INTEGER,
                 approved_at INTEGER,
+                approval_revision INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -504,8 +506,40 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_topic_claim_history_seen
             ON topic_claim_history(last_seen_at DESC);
+            CREATE TABLE IF NOT EXISTS persona_editorial_evaluations (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL REFERENCES daily_context_runs(id),
+                persona_id INTEGER NOT NULL REFERENCES personas(id),
+                topic_input_hash TEXT NOT NULL,
+                input_json TEXT NOT NULL DEFAULT '{}',
+                topic_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                notice INTEGER NOT NULL DEFAULT 0,
+                authority INTEGER NOT NULL DEFAULT 0,
+                tension INTEGER NOT NULL DEFAULT 0,
+                marginal_value INTEGER NOT NULL DEFAULT 0,
+                why_me TEXT NOT NULL DEFAULT '',
+                claim_key TEXT NOT NULL DEFAULT '',
+                core_claim TEXT NOT NULL DEFAULT '',
+                reason_code TEXT NOT NULL DEFAULT '',
+                rationale TEXT NOT NULL DEFAULT '',
+                open_loop TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER REFERENCES post_candidates(id),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(run_id, persona_id, topic_input_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_persona_editorial_evaluations_run
+            ON persona_editorial_evaluations(run_id, persona_id, status);
             """
         )
+        daily_run_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(daily_context_runs)").fetchall()
+        }
+        if "approval_revision" not in daily_run_columns:
+            conn.execute(
+                "ALTER TABLE daily_context_runs ADD COLUMN approval_revision INTEGER NOT NULL DEFAULT 0"
+            )
         conn.execute("PRAGMA optimize")
     seed_personas()
     seed_project_contexts()
@@ -540,7 +574,10 @@ def recent_topic_claims(limit: int = 200):
     with db() as conn:
         rows = conn.execute(
             """SELECT claim_key,subject,core_claim,context_date,source,status
-               FROM topic_claim_history ORDER BY last_seen_at DESC LIMIT ?""",
+               FROM topic_claim_history
+               WHERE status<>'superseded'
+                 AND NOT (source='daily_context_run' AND persona_id IS NULL)
+               ORDER BY last_seen_at DESC LIMIT ?""",
             (limit,),
         ).fetchall()
     return [dict(row) for row in rows]
@@ -1834,87 +1871,654 @@ def daily_post_persona_slugs():
     return list(dict.fromkeys(slug.strip() for slug in value.split(",") if slug.strip()))
 
 
-async def refresh_daily_post_draft(context_date: str, run_id: int, cards: dict, synthesis: dict):
-    if os.getenv("XOPS_DAILY_POST_ENABLED", "false").lower() != "true":
-        return
-    slugs = daily_post_persona_slugs()
-    questions = [
-        item for item in cards.get("selected_topics", [])
-        if isinstance(item, dict) and item.get("title") and item.get("eligible") is not False
-    ]
-    if not questions:
-        return
-    market = {
-        key: synthesis[key]
-        for key in ("market_state", "event_clusters", "debates", "evidence", "unknowns")
-        if synthesis.get(key)
+def persona_editorial_enabled():
+    return os.getenv("XOPS_DAILY_POST_ENABLED", "false").lower() == "true"
+
+
+def editorial_persona_card(persona: dict):
+    draft = json_value(persona.get("draft"), {})
+    return {
+        key: draft.get(key, {})
+        for key in ("identity", "voice", "content", "examples")
     }
-    topics = [
-        {
-            key: item[key]
-            for key in ("key", "title", "unique_authors", "post_count", "latest_at")
-            if key in item
-        }
-        for item in cards.get("discussion_topics", [])[:3]
-        if isinstance(item, dict)
-    ]
-    fact_cards = [
-        {
-            "status": item.get("status", ""),
-            "text": str(item.get("representative_text", ""))[:500],
-        }
-        for item in cards.get("fact_cards", [])[:2]
-        if isinstance(item, dict)
-    ]
-    opinion_cards = [
-        {
-            "status": item.get("status", ""),
-            "text": str(item.get("text", ""))[:500],
-            "reuse_rule": item.get("reuse_rule", ""),
-        }
-        for item in cards.get("opinion_cards", [])[:3]
-        if isinstance(item, dict)
-    ]
-    for index, slug in enumerate(slugs):
-        with db() as conn:
-            persona = conn.execute("SELECT id FROM personas WHERE slug=?", (slug,)).fetchone()
-            existing = conn.execute(
-                """SELECT 1 FROM post_candidates
-                   WHERE persona_id=? AND context_date=? AND source='daily_context_run'""",
-                (persona["id"], context_date),
-            ).fetchone() if persona else None
-        if not persona:
-            raise RuntimeError(f"每日 Post 人设不存在：{slug}")
-        if existing:
-            continue
-        selected = questions[index % len(questions)]
-        title = str(selected.get("title") or "今日市场观察")
-        facts = json.dumps(
-            {
-                "date": context_date,
-                "topic": selected,
-                "daily_market": market,
-                "discussion_topics": topics,
-                "fact_cards": fact_cards,
-                "opinion_cards": opinion_cards,
-            },
-            ensure_ascii=False,
+
+
+def editorial_persona_context(persona_context: dict):
+    return {
+        key: (persona_context or {}).get(key, "")
+        for key in ("audience_baseline", "prior_views", "watchlist", "unresolved", "forbidden_claims")
+    }
+
+
+def editorial_daily_input(daily: dict):
+    return {
+        key: daily.get(key, "" if key != "sources" else [])
+        for key in (
+            "context_date", "approval_revision", "market_state", "event_clusters", "debates",
+            "evidence", "unknowns", "sources"
         )
-        generated = await generate_persona_post(persona["id"], PostGenerationIn(facts=facts))
+    }
+
+
+def editorial_claim_memory(claim_history: list[dict]):
+    return [
+        {
+            key: item.get(key, "")
+            for key in ("claim_key", "core_claim", "context_date", "status")
+        }
+        for item in claim_history[:80]
+        if isinstance(item, dict)
+    ]
+
+
+def editorial_topic_input_payload(topic: dict, daily: dict, persona: dict, persona_context: dict,
+                                   topics: list[dict] | None = None,
+                                   claim_history: list[dict] | None = None):
+    return {
+        "evaluator_revision": EDITORIAL_EVALUATOR_REVISION,
+        "topic": topic,
+        "topic_batch": topics or [topic],
+        "daily": editorial_daily_input(daily),
+        "persona_card": editorial_persona_card(persona),
+        "persona_context": editorial_persona_context(persona_context),
+        "claim_memory": editorial_claim_memory(claim_history or []),
+    }
+
+
+def editorial_topic_input_hash(topic: dict, daily: dict, persona: dict, persona_context: dict,
+                                topics: list[dict] | None = None,
+                                claim_history: list[dict] | None = None):
+    payload = editorial_topic_input_payload(
+        topic, daily, persona, persona_context, topics, claim_history
+    )
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def normalize_editorial_claim(value):
+    return re.sub(r"[^0-9a-z\u3400-\u9fff]", "", str(value or "").lower())
+
+
+def editorial_score(item: dict):
+    return sum(int(item.get(key, 0) or 0) for key in ("notice", "authority", "tension", "marginal_value"))
+
+
+EDITORIAL_CLAIM_KEY = re.compile(r"^[a-z0-9][a-z0-9:_-]{2,119}$")
+EDITORIAL_EVALUATOR_REVISION = 1
+
+
+def validate_persona_editorial_decisions(result, topics: list[dict]):
+    """Validate the evaluator's pure JSON output without inferring a claim for it."""
+    raw = result.get("decisions", result) if isinstance(result, dict) else result
+    if not isinstance(raw, list):
+        raise ValueError("人设编辑评估不是 decisions 数组")
+    allowed = {str(item.get("claim_key", "")): item for item in topics if isinstance(item, dict)}
+    decisions = {}
+    write_count = 0
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        topic_key = str(item.get("topic_claim_key", ""))
+        if topic_key not in allowed or topic_key in decisions:
+            continue
+        status = str(item.get("status", "")).upper()
+        if status not in {"WRITE", "HOLD", "IGNORE"}:
+            continue
+        scores = {}
+        try:
+            for key in ("notice", "authority", "tension", "marginal_value"):
+                scores[key] = max(0, min(5, int(item.get(key, 0))))
+        except (TypeError, ValueError):
+            continue
+        claim_key = str(item.get("claim_key", "")).strip().lower()
+        core_claim = str(item.get("core_claim", "")).strip()
+        if status == "WRITE":
+            if not claim_key or not core_claim or not str(item.get("why_me", "")).strip():
+                status = "HOLD"
+            elif not EDITORIAL_CLAIM_KEY.fullmatch(claim_key):
+                status = "HOLD"
+            else:
+                write_count += 1
+        decisions[topic_key] = {
+            "status": status,
+            **scores,
+            "why_me": str(item.get("why_me", "")).strip(),
+            "claim_key": claim_key,
+            "core_claim": core_claim,
+            "reason_code": (
+                "invalid_claim_key"
+                if str(item.get("status", "")).upper() == "WRITE" and claim_key
+                and not EDITORIAL_CLAIM_KEY.fullmatch(claim_key)
+                else str(item.get("reason_code", "")).strip() or (
+                    "write" if status == "WRITE" else "editorial_hold"
+                )
+            ),
+            "rationale": str(item.get("rationale", "")).strip(),
+            "open_loop": str(item.get("open_loop", "")).strip(),
+            "topic_claim_key": topic_key,
+        }
+    # A persona may only receive one strongest draft from one evaluation pass.
+    if write_count > 1:
+        writes = sorted(
+            (item for item in decisions.values() if item["status"] == "WRITE"),
+            key=lambda item: (-editorial_score(item), item["claim_key"], item["topic_claim_key"]),
+        )
+        for item in writes[1:]:
+            item["status"] = "HOLD"
+            item["reason_code"] = "not_strongest_for_persona"
+    for topic in topics:
+        key = str(topic.get("claim_key", ""))
+        if key not in decisions:
+            decisions[key] = {
+                "status": "IGNORE", "notice": 0, "authority": 0, "tension": 0,
+                "marginal_value": 0, "why_me": "", "claim_key": "", "core_claim": "",
+                "reason_code": "evaluator_missing", "rationale": "评估器未返回该题。", "open_loop": "",
+                "topic_claim_key": key,
+            }
+    return decisions
+
+
+def apply_editorial_claim_history(persona_id: int, decisions: dict, claim_history: list[dict]):
+    history_claims = set()
+    for item in claim_history:
+        if not isinstance(item, dict) or item.get("status") == "superseded":
+            continue
+        claim = normalize_editorial_claim(item.get("core_claim"))
+        if claim:
+            history_claims.add(claim)
+    for decision in decisions.values():
+        if decision["status"] != "WRITE":
+            continue
+        claim = normalize_editorial_claim(decision["core_claim"])
+        if claim and claim in history_claims:
+            decision["status"] = "IGNORE"
+            decision["reason_code"] = "historical_duplicate"
+            decision["rationale"] = "核心主张已存在于可用 Claim Memory。"
+    return decisions
+
+
+def apply_editorial_marginal_threshold(decisions: dict, today_count: int):
+    minimum = 5 if today_count >= 5 else 4 if today_count >= 3 else 0
+    if not minimum:
+        return decisions
+    for decision in decisions.values():
+        if decision["status"] == "WRITE" and decision["marginal_value"] < minimum:
+            decision["status"] = "HOLD"
+            decision["reason_code"] = "insufficient_marginal_value"
+            decision["rationale"] = "当天已有候选后，这条主张的边际价值不足。"
+    return decisions
+
+
+async def evaluate_persona_editorial(persona: dict, persona_context: dict, daily: dict,
+                                     topics: list[dict], claim_history: list[dict], today_count: int):
+    """Return one validated WRITE/HOLD/IGNORE decision per input topic for a persona."""
+    if not topics:
+        return {}
+    prompt = (
+        "你是 Persona Editorial Engine 的编辑判断器。只输出 JSON：{\"decisions\":[...]}。"
+        "每个输入 topic 必须恰好有一项，topic_claim_key 必须等于输入的 claim_key。"
+        "逐题独立判断：notice/authority/tension/marginal_value 均为 0-5 整数；"
+        "status 只能 WRITE/HOLD/IGNORE；why_me 说明为什么该人设此刻有资格说；"
+        "WRITE 必须有新的 claim_key 和非显而易见 core_claim。HOLD 是内部状态，不是正文，绝不以等待后续凑稿。"
+        "一轮最多 WRITE 一题；没有足够强的判断就全部 HOLD 或 IGNORE。"
+        "同一热点只有不同核心主张才值得写；不要复述常识、冷门机制或已覆盖的主张。"
+        "today_accepted_count 不是配额，0 合法；数量越高越要求更强的边际价值。"
+        "不编造持仓、经历、交易、收益或事实。\n\n"
+        f"人设：{json.dumps({'slug': persona['slug'], 'card': editorial_persona_card(persona)}, ensure_ascii=False)}\n"
+        f"人设连续性：{json.dumps(editorial_persona_context(persona_context), ensure_ascii=False)}\n"
+        f"已批准市场语境：{json.dumps(editorial_daily_input(daily), ensure_ascii=False)}\n"
+        f"已覆盖主张：{json.dumps(editorial_claim_memory(claim_history), ensure_ascii=False)}\n"
+        f"待评估 topics：{json.dumps(topics, ensure_ascii=False)}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                os.getenv("XOPS_LLM_BASE_URL", "https://api.deepseek.com") + "/chat/completions",
+                headers={"Authorization": f"Bearer {llm_api_key()}"},
+                json={
+                    "model": os.getenv("XOPS_LLM_MODEL", "deepseek-chat"),
+                    "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.2,
+                },
+            )
+            response.raise_for_status()
+        result = json.loads(response.json()["choices"][0]["message"]["content"])
+        return validate_persona_editorial_decisions(result, topics)
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("人设编辑评估失败") from error
+
+
+def write_persona_editorial_evaluations(run_id: int, persona_id: int,
+                                        inputs: list[tuple[dict, str, dict]], decisions: dict):
+    now = int(time.time())
+    with db() as conn:
+        run = conn.execute(
+            "SELECT status FROM daily_context_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        if not run or run["status"] != "approved":
+            return
+        for topic, input_hash, input_payload in inputs:
+            decision = decisions[str(topic.get("claim_key", ""))]
+            conn.execute(
+                """INSERT INTO persona_editorial_evaluations(
+                    run_id,persona_id,topic_input_hash,input_json,topic_json,status,notice,authority,tension,marginal_value,
+                    why_me,claim_key,core_claim,reason_code,rationale,open_loop,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(run_id,persona_id,topic_input_hash) DO NOTHING""",
+                (
+                    run_id, persona_id, input_hash, json.dumps(input_payload, ensure_ascii=False),
+                    json.dumps(topic, ensure_ascii=False), decision["status"],
+                    decision["notice"], decision["authority"], decision["tension"], decision["marginal_value"],
+                    decision["why_me"], decision["claim_key"], decision["core_claim"], decision["reason_code"],
+                    decision["rationale"], decision["open_loop"], now, now,
+                ),
+            )
+
+
+def resolve_persona_editorial_collisions(run_id: int):
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT e.*,p.slug FROM persona_editorial_evaluations e
+               JOIN personas p ON p.id=e.persona_id WHERE e.run_id=? AND e.status='WRITE'""",
+            (run_id,),
+        ).fetchall()
+        items = [dict(row) for row in rows]
+        links = {item["id"]: {item["id"]} for item in items}
+        for index, item in enumerate(items):
+            item_key = str(item["claim_key"]).strip().lower()
+            item_claim = normalize_editorial_claim(item["core_claim"])
+            for other in items[index + 1:]:
+                same_key = item_key and item_key == str(other["claim_key"]).strip().lower()
+                same_claim = item_claim and item_claim == normalize_editorial_claim(other["core_claim"])
+                if same_key or same_claim:
+                    links[item["id"]].add(other["id"])
+                    links[other["id"]].add(item["id"])
+        now = int(time.time())
+        losers = set()
+        by_id = {item["id"]: item for item in items}
+        unseen = set(by_id)
+        while unseen:
+            pending = [unseen.pop()]
+            component = set(pending)
+            while pending:
+                linked = links[pending.pop()] - component
+                component.update(linked)
+                pending.extend(linked)
+                unseen.difference_update(linked)
+            if len(component) < 2:
+                continue
+            matches = [by_id[evaluation_id] for evaluation_id in component]
+            matches.sort(key=lambda item: (-editorial_score(item), item["slug"]))
+            for item in matches[1:]:
+                losers.add(item["id"])
+        for evaluation_id in losers:
+            conn.execute(
+                """UPDATE persona_editorial_evaluations SET status='HOLD',reason_code='cross_persona_collision',
+                   rationale='与更匹配人设的核心主张重复。',updated_at=? WHERE id=?""",
+                (now, evaluation_id),
+            )
+            conn.execute(
+                "UPDATE post_candidates SET status='superseded',updated_at=? WHERE id=(SELECT candidate_id FROM persona_editorial_evaluations WHERE id=?)",
+                (now, evaluation_id),
+            )
+            conn.execute(
+                "UPDATE topic_claim_history SET status='superseded',last_seen_at=? WHERE source=?",
+                (now, f"persona_editorial:{evaluation_id}"),
+            )
+
+
+def record_persona_editorial_claim(conn, evaluation: dict, context_date: str):
+    claim_key = f"persona:{evaluation['persona_id']}:{evaluation['claim_key']}"
+    now = int(time.time())
+    conn.execute(
+        """INSERT INTO topic_claim_history(
+            claim_key,persona_id,subject,core_claim,context_date,source,status,created_at,last_seen_at
+        ) VALUES(?,?,?,?,?,?, 'drafted',?,?)
+        ON CONFLICT(claim_key) DO UPDATE SET core_claim=excluded.core_claim,context_date=excluded.context_date,
+            source=excluded.source,status='drafted',last_seen_at=excluded.last_seen_at""",
+        (
+            claim_key, evaluation["persona_id"], str(json_value(evaluation["topic_json"], {}).get("subject", "")),
+            evaluation["core_claim"], context_date, f"persona_editorial:{evaluation['id']}", now, now,
+        ),
+    )
+
+
+def supersede_persona_editorial_evaluation(conn, evaluation_id: int, reason_code: str, rationale: str):
+    now = int(time.time())
+    conn.execute(
+        """UPDATE persona_editorial_evaluations
+           SET status='HOLD',reason_code=?,rationale=?,updated_at=? WHERE id=?""",
+        (reason_code, rationale, now, evaluation_id),
+    )
+    conn.execute(
+        "UPDATE post_candidates SET status='superseded',updated_at=? WHERE id=(SELECT candidate_id FROM persona_editorial_evaluations WHERE id=?)",
+        (now, evaluation_id),
+    )
+    conn.execute(
+        "UPDATE topic_claim_history SET status='superseded',last_seen_at=? WHERE source=?",
+        (now, f"persona_editorial:{evaluation_id}"),
+    )
+
+
+def editorial_stable_claim_history(conn, context_date: str):
+    return [dict(row) for row in conn.execute(
+        """SELECT claim_key,subject,core_claim,context_date,source,status
+           FROM topic_claim_history
+           WHERE status<>'superseded'
+             AND NOT (source='daily_context_run' AND persona_id IS NULL)
+             AND (context_date IS NULL OR context_date<?)
+           ORDER BY last_seen_at DESC LIMIT 80""",
+        (context_date,),
+    ).fetchall()]
+
+
+def current_editorial_input_payload(conn, evaluation: dict, context_date: str):
+    run = conn.execute(
+        "SELECT status,raw_cards,approval_revision FROM daily_context_runs WHERE id=?",
+        (evaluation["run_id"],),
+    ).fetchone()
+    if not run or run["status"] != "approved":
+        return None
+    daily_row = conn.execute(
+        "SELECT * FROM daily_market_contexts WHERE context_date=?", (context_date,)
+    ).fetchone()
+    persona = conn.execute(
+        "SELECT id,slug,draft FROM personas WHERE id=?", (evaluation["persona_id"],)
+    ).fetchone()
+    if not daily_row or not persona:
+        return None
+    context_row = conn.execute(
+        "SELECT * FROM persona_contexts WHERE persona_id=?", (evaluation["persona_id"],)
+    ).fetchone()
+    daily = daily_context_dict(daily_row)
+    daily["approval_revision"] = run["approval_revision"]
+    cards = json_value(run["raw_cards"], {})
+    topics = [
+        item for item in cards.get("selected_topics", [])
+        if isinstance(item, dict) and item.get("claim_key")
+    ]
+    return editorial_topic_input_payload(
+        json_value(evaluation["topic_json"], {}),
+        daily,
+        dict(persona),
+        persona_context_dict(context_row) if context_row else {},
+        topics=topics,
+        claim_history=editorial_stable_claim_history(conn, context_date),
+    )
+
+
+def editorial_claim_already_drafted(conn, evaluation: dict):
+    claim = normalize_editorial_claim(evaluation.get("core_claim"))
+    if not claim:
+        return False
+    rows = conn.execute(
+        """SELECT core_claim FROM topic_claim_history
+           WHERE status<>'superseded' AND source<>?
+             AND NOT (source='daily_context_run' AND persona_id IS NULL)""",
+        (f"persona_editorial:{evaluation['id']}",),
+    ).fetchall()
+    return any(normalize_editorial_claim(row["core_claim"]) == claim for row in rows)
+
+
+async def generate_pending_persona_editorial_candidates(run_id: int, context_date: str):
+    with db() as conn:
+        run = conn.execute(
+            "SELECT status FROM daily_context_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        if not run or run["status"] != "approved":
+            return
+        rows = conn.execute(
+            """SELECT e.*,p.slug,p.name,p.draft FROM persona_editorial_evaluations e
+               JOIN personas p ON p.id=e.persona_id
+               WHERE e.run_id=? AND e.status='WRITE' AND e.candidate_id IS NULL
+               ORDER BY e.id""",
+            (run_id,),
+        ).fetchall()
+    for row in rows:
+        evaluation = dict(row)
+        source = f"persona_editorial:{evaluation['id']}"
+        with db() as conn:
+            snapshot = json_value(evaluation.get("input_json"), {})
+            if snapshot != current_editorial_input_payload(conn, evaluation, context_date):
+                supersede_persona_editorial_evaluation(
+                    conn, evaluation["id"], "input_changed_before_generation",
+                    "评估输入已变化，旧 WRITE 不再生成正文。",
+                )
+                continue
+            if editorial_claim_already_drafted(conn, evaluation):
+                supersede_persona_editorial_evaluation(
+                    conn, evaluation["id"], "historical_duplicate_before_generation",
+                    "评估完成后已有其他候选覆盖相同核心主张。",
+                )
+                continue
+            existing_candidate = conn.execute(
+                "SELECT id FROM post_candidates WHERE persona_id=? AND context_date=? AND source=?",
+                (evaluation["persona_id"], context_date, source),
+            ).fetchone()
+            if existing_candidate:
+                conn.execute(
+                    "UPDATE persona_editorial_evaluations SET candidate_id=?,updated_at=? WHERE id=?",
+                    (existing_candidate["id"], int(time.time()), evaluation["id"]),
+                )
+                recovered = dict(conn.execute(
+                    "SELECT * FROM persona_editorial_evaluations WHERE id=?", (evaluation["id"],)
+                ).fetchone())
+                record_persona_editorial_claim(conn, recovered, context_date)
+                continue
+        topic = json_value(evaluation["topic_json"], {})
+        topic_fields = (
+            "claim_key", "subject", "title", "core_claim", "content_type", "material_delta",
+            "audience_value", "why_now", "fact_basis", "opinion_basis", "source_topic_keys",
+        )
+        compact_topic = {}
+        for key in topic_fields:
+            if key not in topic:
+                continue
+            value = topic[key]
+            if isinstance(value, str):
+                compact_topic[key] = value[:350]
+            elif isinstance(value, list):
+                compact_topic[key] = [str(item)[:120] for item in value[:10]]
+            else:
+                compact_topic[key] = value
+        compact_daily = dict(snapshot["daily"])
+        for key in ("market_state", "event_clusters", "debates", "evidence", "unknowns"):
+            compact_daily[key] = str(compact_daily.get(key, ""))[:500]
+        compact_daily["sources"] = list(compact_daily.get("sources") or [])[:5]
+        facts = json.dumps({
+            "date": context_date, "topic": compact_topic,
+            "editorial_claim": evaluation["core_claim"][:600], "daily_market": compact_daily,
+            "why_this_persona": evaluation["why_me"][:400], "rationale": evaluation["rationale"][:400],
+        }, ensure_ascii=False)
+        if len(facts) > 7900:
+            compact_daily["sources"] = []
+            compact_daily["evidence"] = compact_daily["evidence"][:200]
+            facts = json.dumps({
+                "date": context_date, "topic": compact_topic,
+                "editorial_claim": evaluation["core_claim"][:600], "daily_market": compact_daily,
+                "why_this_persona": evaluation["why_me"][:400], "rationale": evaluation["rationale"][:400],
+            }, ensure_ascii=False)
+        if len(facts) > 7900:
+            facts = json.dumps({
+                "date": context_date,
+                "topic": {
+                    key: str(topic.get(key, ""))[:300]
+                    for key in ("claim_key", "title", "core_claim", "material_delta", "audience_value")
+                },
+                "editorial_claim": evaluation["core_claim"][:500],
+                "daily_market": {
+                    key: str(snapshot["daily"].get(key, ""))[:300]
+                    for key in ("market_state", "event_clusters", "debates", "evidence", "unknowns")
+                },
+                "why_this_persona": evaluation["why_me"][:250],
+            }, ensure_ascii=False)
+        try:
+            generated = await generate_persona_post(
+                evaluation["persona_id"], PostGenerationIn(facts=facts)
+            )
+        except HTTPException:
+            continue
         now = int(time.time())
         with db() as conn:
+            current = conn.execute(
+                "SELECT * FROM persona_editorial_evaluations WHERE id=?", (evaluation["id"],)
+            ).fetchone()
+            if not current or current["candidate_id"] is not None or current["status"] != "WRITE":
+                continue
+            if snapshot != current_editorial_input_payload(conn, dict(current), context_date):
+                supersede_persona_editorial_evaluation(
+                    conn, evaluation["id"], "input_changed_during_generation",
+                    "正文生成期间评估输入发生变化，生成结果已丢弃。",
+                )
+                continue
+            if editorial_claim_already_drafted(conn, dict(current)):
+                supersede_persona_editorial_evaluation(
+                    conn, evaluation["id"], "historical_duplicate_during_generation",
+                    "正文生成期间已有其他候选覆盖相同核心主张。",
+                )
+                continue
             conn.execute(
                 """INSERT INTO post_candidates(
                     persona_id,context_date,title,body,status,source,notes,created_at,updated_at
                 ) VALUES(?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(persona_id,context_date,source) DO UPDATE SET
-                    title=excluded.title,body=excluded.body,status=excluded.status,
-                    notes=excluded.notes,updated_at=excluded.updated_at""",
+                ON CONFLICT(persona_id,context_date,source) DO NOTHING""",
                 (
-                    persona["id"], context_date, title, generated["post"], "needs_review",
-                    "daily_context_run", f"自动生成自每日运行 {run_id}；未发布。", now, now,
+                    evaluation["persona_id"], context_date, evaluation["core_claim"], generated["post"],
+                    "needs_review", source, f"Persona Editorial Engine 评估 {evaluation['id']}；未发布。", now, now,
                 ),
             )
+            candidate = conn.execute(
+                "SELECT id FROM post_candidates WHERE persona_id=? AND context_date=? AND source=?",
+                (evaluation["persona_id"], context_date, source),
+            ).fetchone()
+            if not candidate:
+                continue
+            conn.execute(
+                "UPDATE persona_editorial_evaluations SET candidate_id=?,updated_at=? WHERE id=?",
+                (candidate["id"], now, evaluation["id"]),
+            )
+            saved = dict(conn.execute(
+                "SELECT * FROM persona_editorial_evaluations WHERE id=?", (evaluation["id"],)
+            ).fetchone())
+            record_persona_editorial_claim(conn, saved, context_date)
+
+
+async def recover_pending_persona_editorial_candidates(run_id: int | None = None):
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT r.id AS run_id,r.context_date
+               FROM daily_context_runs r
+               JOIN persona_editorial_evaluations e ON e.run_id=r.id
+               WHERE r.status='approved' AND e.status='WRITE' AND e.candidate_id IS NULL
+                 AND (? IS NULL OR r.id=?)
+               ORDER BY r.context_date DESC"""
+            , (run_id, run_id)
+        ).fetchall()
+    recovered = []
+    for row in rows:
+        await generate_pending_persona_editorial_candidates(row["run_id"], row["context_date"])
+        recovered.append(row["run_id"])
+    return recovered
+
+
+async def run_persona_editorial_pipeline(run_id: int | None = None):
+    """Evaluate approved context only; WRITE creates a review-only candidate, never a post."""
+    if not persona_editorial_enabled():
+        return []
+    processed = await recover_pending_persona_editorial_candidates(run_id)
+    with db() as conn:
+        if run_id is None:
+            runs = conn.execute(
+                """SELECT * FROM daily_context_runs
+                   WHERE status='approved' AND context_date=? ORDER BY context_date DESC""",
+                (shanghai_today(),),
+            ).fetchall()
+        else:
+            runs = conn.execute(
+                "SELECT * FROM daily_context_runs WHERE id=? AND status='approved'", (run_id,)
+            ).fetchall()
+    for run_row in runs:
+        run = daily_context_run_dict(run_row)
+        cards = run["raw_cards"] if isinstance(run["raw_cards"], dict) else {}
+        topics = [item for item in cards.get("selected_topics", []) if isinstance(item, dict) and item.get("claim_key")]
+        if not topics:
+            continue
+        with db() as conn:
+            daily_row = conn.execute(
+                "SELECT * FROM daily_market_contexts WHERE context_date=?", (run["context_date"],)
+            ).fetchone()
+            slugs = daily_post_persona_slugs()
+            if not slugs:
+                continue
+            personas = conn.execute(
+                "SELECT id,slug,draft FROM personas WHERE slug IN (%s) ORDER BY id" % ",".join("?" * len(slugs)),
+                slugs,
+            ).fetchall()
+            history = [dict(row) for row in conn.execute(
+                """SELECT claim_key,subject,core_claim,context_date,source,status
+                   FROM topic_claim_history
+                   WHERE status<>'superseded'
+                     AND NOT (source='daily_context_run' AND persona_id IS NULL)
+                   ORDER BY last_seen_at DESC LIMIT 200"""
+            ).fetchall()]
+            stable_history = editorial_stable_claim_history(conn, run["context_date"])
+        if not daily_row:
+            continue
+        daily = daily_context_dict(daily_row)
+        daily["approval_revision"] = run.get("approval_revision", 0)
+        for persona_row in personas:
+            persona = dict(persona_row)
+            with db() as conn:
+                context_row = conn.execute(
+                    "SELECT * FROM persona_contexts WHERE persona_id=?", (persona["id"],)
+                ).fetchone()
+                persona_context = persona_context_dict(context_row) if context_row else {}
+                existing_hashes = {
+                    row["topic_input_hash"] for row in conn.execute(
+                        "SELECT topic_input_hash FROM persona_editorial_evaluations WHERE run_id=? AND persona_id=?",
+                        (run["id"], persona["id"]),
+                    ).fetchall()
+                }
+                today_count = conn.execute(
+                    """SELECT COUNT(*) FROM persona_editorial_evaluations
+                       WHERE persona_id=? AND status='WRITE' AND candidate_id IS NOT NULL
+                       AND EXISTS (SELECT 1 FROM daily_context_runs r WHERE r.id=persona_editorial_evaluations.run_id AND r.context_date=?)""",
+                    (persona["id"], run["context_date"]),
+                ).fetchone()[0]
+            inputs = []
+            for topic in topics:
+                input_payload = editorial_topic_input_payload(
+                    topic, daily, persona, persona_context, topics=topics, claim_history=stable_history
+                )
+                encoded = json.dumps(
+                    input_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+                inputs.append((
+                    topic,
+                    hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                    input_payload,
+                ))
+            pending = [item for item in inputs if item[1] not in existing_hashes]
+            if pending:
+                try:
+                    decisions = await evaluate_persona_editorial(
+                        persona, persona_context, daily, topics, stable_history, today_count
+                    )
+                except RuntimeError:
+                    continue
+                decisions = apply_editorial_marginal_threshold(decisions, today_count)
+                decisions = apply_editorial_claim_history(persona["id"], decisions, history)
+                write_persona_editorial_evaluations(run["id"], persona["id"], pending, decisions)
+        resolve_persona_editorial_collisions(run["id"])
+        await generate_pending_persona_editorial_candidates(run["id"], run["context_date"])
+        processed.append(run["id"])
+    return processed
+
+
+async def refresh_daily_post_draft(context_date: str, run_id: int, cards: dict | None = None, synthesis: dict | None = None):
+    # Compatibility entry point for older callers. The approved run is the sole input authority.
+    return await run_persona_editorial_pipeline(run_id)
 
 
 async def execute_daily_context_run(run_id: int):
@@ -2051,7 +2655,6 @@ async def execute_daily_context_run(run_id: int):
         ]
         coverage["selected_topics"] = len(selected_topics)
         coverage["rejected_topics"] = len(full_cards["rejected_topics"])
-        record_topic_claims(selected_topics, run["context_date"], "daily_context_run")
         result = update_daily_context_run(
             run_id,
             status="needs_review",
@@ -2060,7 +2663,6 @@ async def execute_daily_context_run(run_id: int):
             error="",
             completed_at=int(time.time()),
         )
-        await refresh_daily_post_draft(run["context_date"], run_id, full_cards, synthesis)
         return result
     except Exception as error:
         manifest["failed_stage"] = next(reversed(manifest["stages"]), "setup")
@@ -2104,31 +2706,16 @@ async def daily_context_scheduler():
 
 
 async def run_due_daily_post():
-    if os.getenv("XOPS_DAILY_POST_ENABLED", "false").lower() != "true":
-        return
-    context_date = shanghai_today()
-    slugs = daily_post_persona_slugs()
-    with db() as conn:
-        run = conn.execute(
-            """SELECT * FROM daily_context_runs
-               WHERE context_date=? AND status IN ('needs_review','approved')
-               ORDER BY updated_at DESC LIMIT 1""",
-            (context_date,),
-        ).fetchone()
-        existing = conn.execute(
-            """SELECT p.slug FROM post_candidates c
-               JOIN personas p ON p.id=c.persona_id
-               WHERE c.context_date=? AND c.source='daily_context_run'""",
-            (context_date,),
-        ).fetchall()
-    completed = {row["slug"] for row in existing}
-    if run and any(slug not in completed for slug in slugs):
-        await refresh_daily_post_draft(
-            context_date,
-            run["id"],
-            json_value(run["raw_cards"], {}),
-            json_value(run["synthesis"], {}),
-        )
+    return await run_persona_editorial_pipeline()
+
+
+async def persona_editorial_scheduler():
+    while True:
+        try:
+            await run_persona_editorial_pipeline()
+        except Exception:
+            pass
+        await asyncio.sleep(30)
 
 
 def recover_interrupted_daily_context_run():
@@ -2153,10 +2740,10 @@ async def lifespan(_app):
     init_db()
     recover_interrupted_daily_context_run()
     context_task = asyncio.create_task(daily_context_scheduler())
-    post_task = asyncio.create_task(run_due_daily_post())
+    editorial_task = asyncio.create_task(persona_editorial_scheduler())
     yield
     context_task.cancel()
-    post_task.cancel()
+    editorial_task.cancel()
     for task in list(DAILY_CONTEXT_TASKS):
         task.cancel()
 
@@ -2270,32 +2857,35 @@ def get_daily_context(context_date: str):
     return daily_context_dict(row)
 
 
+def save_daily_context_row(conn, context_date: str, request: DailyMarketContextIn, now: int):
+    conn.execute(
+        """INSERT INTO daily_market_contexts(
+            context_date,market_state,event_clusters,debates,evidence,unknowns,raw_feed,sources,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(context_date) DO UPDATE SET
+            market_state=excluded.market_state,event_clusters=excluded.event_clusters,
+            debates=excluded.debates,evidence=excluded.evidence,unknowns=excluded.unknowns,
+            raw_feed=excluded.raw_feed,sources=excluded.sources,updated_at=excluded.updated_at""",
+        (
+            context_date,
+            request.market_state,
+            request.event_clusters,
+            request.debates,
+            request.evidence,
+            request.unknowns,
+            request.raw_feed,
+            json.dumps(request.sources, ensure_ascii=False),
+            now,
+        ),
+    )
+    return conn.execute(
+        "SELECT * FROM daily_market_contexts WHERE context_date=?", (context_date,)
+    ).fetchone()
+
+
 def save_daily_context(context_date: str, request: DailyMarketContextIn):
-    now = int(time.time())
     with db() as conn:
-        conn.execute(
-            """INSERT INTO daily_market_contexts(
-                context_date,market_state,event_clusters,debates,evidence,unknowns,raw_feed,sources,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(context_date) DO UPDATE SET
-                market_state=excluded.market_state,event_clusters=excluded.event_clusters,
-                debates=excluded.debates,evidence=excluded.evidence,unknowns=excluded.unknowns,
-                raw_feed=excluded.raw_feed,sources=excluded.sources,updated_at=excluded.updated_at""",
-            (
-                context_date,
-                request.market_state,
-                request.event_clusters,
-                request.debates,
-                request.evidence,
-                request.unknowns,
-                request.raw_feed,
-                json.dumps(request.sources, ensure_ascii=False),
-                now,
-            ),
-        )
-        row = conn.execute(
-            "SELECT * FROM daily_market_contexts WHERE context_date=?", (context_date,)
-        ).fetchone()
+        row = save_daily_context_row(conn, context_date, request, int(time.time()))
     return daily_context_dict(row)
 
 
@@ -2468,45 +3058,72 @@ def review_daily_context_run(context_date: str, request: DailyMarketContextIn):
     run = get_daily_context_run_for_date(context_date)
     if run["status"] not in {"needs_review", "approved"}:
         raise HTTPException(409, "Only completed daily context runs can be reviewed")
-    values = {
-        "synthesis": json.dumps(
-            {
-                "market_state": request.market_state,
-                "event_clusters": request.event_clusters,
-                "debates": request.debates,
-                "evidence": request.evidence,
-                "unknowns": request.unknowns,
-                "sources": request.sources,
-                "opportunity_questions": run["synthesis"].get("opportunity_questions", []),
-                "editorial_questions": run["synthesis"].get("editorial_questions", []),
-                "research_questions": run["synthesis"].get("research_questions", []),
-            },
-            ensure_ascii=False,
-        )
-    }
-    if run["status"] == "approved":
-        values["status"] = "needs_review"
-        values["approved_at"] = None
-    return update_daily_context_run(run["id"], **values)
+    synthesis = json.dumps(
+        {
+            "market_state": request.market_state,
+            "event_clusters": request.event_clusters,
+            "debates": request.debates,
+            "evidence": request.evidence,
+            "unknowns": request.unknowns,
+            "sources": request.sources,
+            "opportunity_questions": run["synthesis"].get("opportunity_questions", []),
+            "editorial_questions": run["synthesis"].get("editorial_questions", []),
+            "research_questions": run["synthesis"].get("research_questions", []),
+        },
+        ensure_ascii=False,
+    )
+    now = int(time.time())
+    with db() as conn:
+        if run["status"] == "approved":
+            conn.execute(
+                """UPDATE post_candidates SET status='superseded',updated_at=?
+                   WHERE id IN (SELECT candidate_id FROM persona_editorial_evaluations WHERE run_id=?)""",
+                (now, run["id"]),
+            )
+            conn.execute(
+                """UPDATE topic_claim_history SET status='superseded',last_seen_at=?
+                   WHERE source IN (
+                     SELECT 'persona_editorial:' || id FROM persona_editorial_evaluations WHERE run_id=?
+                   )""",
+                (now, run["id"]),
+            )
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET status='HOLD',reason_code='context_revised',
+                       rationale='正式 Context 已撤回并重新审核。',updated_at=?
+                   WHERE run_id=? AND status='WRITE'""",
+                (now, run["id"]),
+            )
+            conn.execute(
+                """UPDATE daily_context_runs
+                   SET synthesis=?,status='needs_review',approved_at=NULL,updated_at=? WHERE id=?""",
+                (synthesis, now, run["id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE daily_context_runs SET synthesis=?,updated_at=? WHERE id=?",
+                (synthesis, now, run["id"]),
+            )
+        row = conn.execute("SELECT * FROM daily_context_runs WHERE id=?", (run["id"],)).fetchone()
+    return daily_context_run_dict(row)
 
 
 @app.post("/api/context/daily-runs/{context_date}/approve")
 def approve_daily_context_run(context_date: str):
-    run = get_daily_context_run_for_date(context_date)
-    if run["status"] == "approved":
-        return run
-    if run["status"] != "needs_review":
-        raise HTTPException(409, "Only reviewed daily context runs can be approved")
+    now = int(time.time())
     with db() as conn:
-        existing_daily = conn.execute(
-            "SELECT id FROM daily_market_contexts WHERE context_date=?", (context_date,)
+        current_row = conn.execute(
+            "SELECT * FROM daily_context_runs WHERE context_date=?", (context_date,)
         ).fetchone()
-    if existing_daily:
-        raise HTTPException(409, "Daily market context already exists for this date")
-    draft = run["draft_context"]
-    save_daily_context(
-        context_date,
-        DailyMarketContextIn(
+        if not current_row:
+            raise HTTPException(404, "Daily context run not found")
+        current = daily_context_run_dict(current_row)
+        if current["status"] == "approved":
+            return current
+        if current["status"] != "needs_review":
+            raise HTTPException(409, "Only reviewed daily context runs can be approved")
+        draft = current["draft_context"]
+        request = DailyMarketContextIn(
             market_state=draft["market_state"],
             event_clusters=draft["event_clusters"],
             debates=draft["debates"],
@@ -2514,9 +3131,18 @@ def approve_daily_context_run(context_date: str):
             unknowns=draft["unknowns"],
             raw_feed="",
             sources=draft["sources"],
-        ),
-    )
-    return update_daily_context_run(run["id"], status="approved", approved_at=int(time.time()))
+        )
+        save_daily_context_row(conn, context_date, request, now)
+        conn.execute(
+            """UPDATE daily_context_runs
+               SET status='approved',approved_at=?,approval_revision=approval_revision+1,updated_at=?
+               WHERE id=?""",
+            (now, now, current["id"]),
+        )
+        row = conn.execute(
+            "SELECT * FROM daily_context_runs WHERE id=?", (current["id"],)
+        ).fetchone()
+    return daily_context_run_dict(row)
 
 
 @app.get("/api/personas/{persona_id}/context")
@@ -2813,9 +3439,15 @@ def list_persona_post_candidates(persona_id: int):
         if not persona:
             raise HTTPException(404, "Persona not found")
         rows = conn.execute(
-            """SELECT * FROM post_candidates
-               WHERE persona_id=?
-               ORDER BY context_date DESC, id DESC""",
+            """SELECT c.* FROM post_candidates c
+               WHERE c.persona_id=?
+                 AND NOT (
+                   c.source LIKE 'persona_editorial:%' AND EXISTS (
+                       SELECT 1 FROM persona_editorial_evaluations e
+                       WHERE ('persona_editorial:' || e.id)=c.source AND e.status<>'WRITE'
+                   )
+                 )
+               ORDER BY c.context_date DESC, c.id DESC""",
             (persona_id,),
         ).fetchall()
     return [dict(row) for row in rows]
@@ -3043,7 +3675,12 @@ def get_daily_post():
         row = conn.execute(
             """SELECT c.*,p.slug persona_slug,p.name persona_name
                FROM post_candidates c JOIN personas p ON p.id=c.persona_id
-               WHERE c.source='daily_context_run'
+               WHERE c.source LIKE 'persona_editorial:%' AND EXISTS (
+                   SELECT 1 FROM persona_editorial_evaluations e
+                   JOIN daily_context_runs r ON r.id=e.run_id
+                   WHERE ('persona_editorial:' || e.id)=c.source
+                     AND e.status='WRITE' AND r.status='approved'
+               )
                ORDER BY c.context_date DESC,c.updated_at DESC LIMIT 1"""
         ).fetchone()
     if not row:
@@ -3068,31 +3705,29 @@ def get_daily_posts():
         rows = conn.execute(
             """SELECT c.*,p.slug persona_slug,p.name persona_name,p.avatar
                FROM post_candidates c JOIN personas p ON p.id=c.persona_id
-               WHERE c.context_date=? AND c.source='daily_context_run'""",
+               WHERE c.context_date=?
+                 AND c.source LIKE 'persona_editorial:%' AND EXISTS (
+                     SELECT 1 FROM persona_editorial_evaluations e
+                     JOIN daily_context_runs r ON r.id=e.run_id
+                     WHERE ('persona_editorial:' || e.id)=c.source
+                       AND e.status='WRITE' AND r.status='approved'
+                 )
+               ORDER BY c.updated_at DESC,c.id DESC""",
             (context_date,),
         ).fetchall()
-    candidates = {row["persona_slug"]: dict(row) for row in rows}
-    result = []
-    for position, slug in enumerate(daily_post_persona_slugs(), 1):
-        candidate = candidates.get(slug, {})
-        profile = PERSONA_PUBLIC_PROFILE.get(slug, {})
-        result.append(
-            {
-                **candidate,
-                "position": position,
-                "context_date": context_date,
-                "persona_slug": slug,
-                "persona_name": profile.get("display_name", candidate.get("persona_name", slug)),
-                "status": candidate.get("status", "queued"),
-                "image_url": daily_post_asset_url(slug, context_date),
-                "image_note": "素材候选；发布前确认图片与正文匹配。",
-            }
-        )
-    return result
+    return [
+        {
+            **dict(row),
+            "position": position,
+            "image_url": daily_post_asset_url(row["persona_slug"], context_date),
+            "image_note": "素材候选；发布前确认图片与正文匹配。",
+        }
+        for position, row in enumerate(rows, 1)
+    ]
 
 
 INDEX_HTML = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>每日 Post 草稿队列</title>
 <style>body{font:15px/1.7 system-ui;max-width:1080px;margin:36px auto;padding:0 18px;color:#18181b;background:#f7f8fa}header{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:22px}h1{margin:0;font-size:26px}header p{margin:3px 0 0;color:#71717a}nav{display:flex;gap:16px}a{color:#2563eb;text-decoration:none}.queue{display:grid;gap:18px}.card{display:grid;grid-template-columns:180px 1fr;background:#fff;border:1px solid #e2e4e8;border-radius:14px;overflow:hidden}.image{width:100%;height:100%;min-height:220px;object-fit:cover;background:#eceef1}.content{padding:20px;white-space:pre-wrap}.meta{color:#71717a;font-size:13px;margin-bottom:8px}.title{font-weight:750;margin-bottom:10px}.note{color:#8a641b;font-size:12px;margin-top:14px}.queued{padding:28px;color:#71717a}.empty-image{display:grid;place-items:center;background:#eceef1;color:#8b9098}@media(max-width:680px){header{display:block}nav{margin-top:12px}.card{grid-template-columns:1fr}.image{height:260px}}</style>
-<header><div><h1>每日 Post 草稿队列</h1><p>每天 08:15 自动刷新 10 条草稿；3 条带素材候选，7 条为文字草稿。</p></div><nav><a href="__BASE_URL__/personas">人设</a><a href="__BASE_URL__/market">每日研究</a></nav></header>
+<header><div><h1>每日 Post 草稿队列</h1><p>仅展示已通过人设编辑判断的真实草稿；无可写题时不补位。</p></div><nav><a href="__BASE_URL__/personas">人设</a><a href="__BASE_URL__/market">每日研究</a></nav></header>
 <main id="result" class="queue"><div class="queued">正在读取今天的队列…</div></main>
-<script>const base='__BASE_URL__',result=document.querySelector('#result');fetch(base+'/api/daily-posts').then(r=>r.json()).then(items=>{result.innerHTML='';items.forEach(x=>{const card=document.createElement('article');card.className='card';if(x.image_url){const img=document.createElement('img');img.className='image';img.src=base+x.image_url;img.alt=x.persona_name+' 素材候选';card.append(img)}else{const empty=document.createElement('div');empty.className='empty-image';empty.textContent='暂无素材';card.append(empty)}const content=document.createElement('div');content.className='content';const meta=document.createElement('div');meta.className='meta';meta.textContent=`队列 ${x.position} · ${x.context_date} · ${x.persona_name}`;content.append(meta);if(x.body){const title=document.createElement('div');title.className='title';title.textContent=x.title;content.append(title);const body=document.createElement('div');body.textContent=x.body;content.append(body);const note=document.createElement('div');note.className='note';note.textContent=x.image_note;content.append(note)}else{const pending=document.createElement('div');pending.className='queued';pending.textContent='正在等待生成…';content.append(pending)}card.append(content);result.append(card)})}).catch(e=>{result.textContent=e.message})</script>"""
+<script>const base='__BASE_URL__',result=document.querySelector('#result');fetch(base+'/api/daily-posts').then(r=>r.json()).then(items=>{result.innerHTML='';if(!items.length){result.textContent='今天暂无通过编辑判断的草稿。';return}items.forEach(x=>{const card=document.createElement('article');card.className='card';if(x.image_url){const img=document.createElement('img');img.className='image';img.src=base+x.image_url;img.alt=x.persona_name+' 素材候选';card.append(img)}else{const empty=document.createElement('div');empty.className='empty-image';empty.textContent='暂无素材';card.append(empty)}const content=document.createElement('div');content.className='content';const meta=document.createElement('div');meta.className='meta';meta.textContent=`队列 ${x.position} · ${x.context_date} · ${x.persona_name}`;content.append(meta);const title=document.createElement('div');title.className='title';title.textContent=x.title;content.append(title);const body=document.createElement('div');body.textContent=x.body;content.append(body);const note=document.createElement('div');note.className='note';note.textContent=x.image_note;content.append(note);card.append(content);result.append(card)})}).catch(e=>{result.textContent=e.message})</script>"""

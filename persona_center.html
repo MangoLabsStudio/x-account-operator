@@ -19,7 +19,7 @@
       <div id="peopleList"></div>
     </aside>
     <main>
-      <section class="intro"><strong>这个页面只负责定义“这个人是谁、怎么说话”</strong><p>每天 08:15 为全部 10 个人设生成草稿；阿坤、老任、桃桃带素材候选，其余 7 人生成文字草稿。</p></section>
+      <section class="intro"><strong>这个页面只负责定义“这个人是谁、怎么说话”</strong><p>正式市场 Context 到来后，每个人设会独立判断是否值得写；只有 WRITE 才生成待审核候选稿，HOLD 和 IGNORE 不会硬凑成正文。</p></section>
       <header class="hero">
         <div class="hero-main"><img id="heroAvatar" alt="人设头像"><div><h1 id="personaName">正在载入…</h1><p id="personaRole"></p></div></div>
         <div><span class="save-state" id="saveState"></span><button class="save" id="saveBtn">保存人设</button></div>
@@ -58,7 +58,6 @@
   <script>
     const base='__BASE_URL__';
     let personas=[],current=null,draft=null,dirty=false;
-    const assetSlugs=['acheng','ridehail-driver-zhao','college-student-linjia'];
     const $=selector=>document.querySelector(selector),$$=selector=>[...document.querySelectorAll(selector)];
     const api=async(path,options={})=>{const response=await fetch(base+path,{cache:'no-store',headers:{'content-type':'application/json'},...options});if(!response.ok)throw new Error((await response.json()).detail||'请求失败');return response.json()};
     const assetUrl=url=>url?base+url:'';
@@ -67,10 +66,10 @@
     const setPath=(object,path,value)=>{const keys=path.split('.');let target=object;keys.slice(0,-1).forEach(key=>target=target[key]??={});target[keys.at(-1)]=value};
     function notify(text){const toast=$('#toast');toast.textContent=text;toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),1800)}
     function markDirty(){dirty=true;$('#saveState').textContent='有未保存修改'}
-    function renderPeople(filter=''){const list=$('#peopleList');list.innerHTML='';const shown=personas.filter(person=>(person.display_name+person.role).toLowerCase().includes(filter.toLowerCase()));shown.forEach(person=>{const button=document.createElement('button');button.className='person'+(current?.id===person.id?' active':'');const queueType=assetSlugs.includes(person.slug)?'草稿＋配图':'文字草稿';button.innerHTML=`<img class="avatar" src="${assetUrl(person.avatar_url)}" alt=""><span class="person-copy"><span class="person-name">${esc(person.display_name)} <span class="daily">${queueType}</span></span><span class="person-role">${esc(person.role)}</span></span>`;button.onclick=()=>selectPersona(person.id);list.append(button)});$('#count').textContent=`${personas.length} 个`}
+    function renderPeople(filter=''){const list=$('#peopleList');list.innerHTML='';const shown=personas.filter(person=>(person.display_name+person.role).toLowerCase().includes(filter.toLowerCase()));shown.forEach(person=>{const button=document.createElement('button');button.className='person'+(current?.id===person.id?' active':'');button.innerHTML=`<img class="avatar" src="${assetUrl(person.avatar_url)}" alt=""><span class="person-copy"><span class="person-name">${esc(person.display_name)}</span><span class="person-role">${esc(person.role)}</span></span>`;button.onclick=()=>selectPersona(person.id);list.append(button)});$('#count').textContent=`${personas.length} 个`}
     function fillForm(){$$('[data-bind]').forEach(input=>{input.value=getPath(draft,input.dataset.bind);input.oninput=()=>{setPath(draft,input.dataset.bind,input.value);markDirty()}})}
     function renderAssets(){const assets=current.assets||[];$('#assetCount').textContent=assets.length?`已连接 ${assets.length} 张图片`:'还没有图片素材';const grid=$('#assetGrid');grid.innerHTML='';assets.slice(0,20).forEach(asset=>{const item=document.createElement('div');item.className='asset';item.title=asset.name;item.innerHTML=`<img loading="lazy" src="${assetUrl(asset.url)}" alt="${esc(asset.name)}">`;grid.append(item)});if(!assets.length)grid.innerHTML='<div class="empty">暂无素材</div>'}
-    function renderCurrent(){draft=structuredClone(current.draft);dirty=false;$('#saveState').textContent=assetSlugs.includes(current.slug)?'每日草稿＋配图':'每日文字草稿';$('#personaName').textContent=current.display_name;$('#personaRole').textContent=current.role;$('#heroAvatar').src=assetUrl(current.avatar_url);fillForm();renderAssets();renderPeople($('#search').value)}
+    function renderCurrent(){draft=structuredClone(current.draft);dirty=false;$('#saveState').textContent='人设编辑';$('#personaName').textContent=current.display_name;$('#personaRole').textContent=current.role;$('#heroAvatar').src=assetUrl(current.avatar_url);fillForm();renderAssets();renderPeople($('#search').value)}
     async function selectPersona(id){if(dirty&&!confirm('当前修改还没保存，确定切换吗？'))return;current=await api(`/api/personas/${id}`);renderCurrent();window.scrollTo({top:0,behavior:'smooth'})}
     async function save(){const button=$('#saveBtn');button.disabled=true;try{await api(`/api/personas/${current.id}`,{method:'PUT',body:JSON.stringify({data:draft})});dirty=false;current.draft=structuredClone(draft);current.display_name=draft.identity.name;current.role=draft.identity.role;$('#personaName').textContent=current.display_name;$('#personaRole').textContent=current.role;$('#saveState').textContent='已保存';await refreshList();renderPeople($('#search').value);notify('人设已保存')}catch(error){notify(error.message)}finally{button.disabled=false}}
     async function refreshList(){personas=await api('/api/personas')}
