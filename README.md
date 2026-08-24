@@ -16,10 +16,10 @@ Open `https://x-account-operator-api-production.up.railway.app/`.
 2. 每个人设都维护一份 Editorial Context 草稿与一份已批准版。草稿可随时修改，但只有已批准版会进入输入 fingerprint。
 3. 公共热点与该人设状态为 `ready` 的私有题合流，再由该人设独立给出 `WRITE`、`HOLD` 或 `IGNORE`。
 4. 系统仲裁跨人设的相同核心主张：同一事件可有不同结论；只有换了口吻的同一结论只保留最自然的人设。
-5. 只有 `WRITE` 生成候选稿，随后由人工审核。`HOLD` 仅保留在内部状态，绝不被写成“继续观察”等正文。
+5. 每个 `WRITE` 先由 Grok 用 X Search 与 Web Search 补齐市场语境和引用；Gemini 只能把批准事实卡（或批准生活事实）写成事实，再由 Gemini 主编复核。首稿被拒只允许按理由重写一次；仍不通过则 `HOLD`，不产生候选稿。提供方、解析或搜索证据失败会保留 `WRITE` 以便重试，不会撤掉旧候选。
 6. 同日只要正式输入 fingerprint 发生实质变化（包括公共 Context 更新或人设 Editorial Context 重批），就可增量评估；无变化不补稿。人设 Context 的新批准版会先撤销该人当天旧候选。
 
-没有固定 10 条、3–5 条或轮转栏目配额；当天可以是 0 条。自动流程不发布、不排期，也不操作 X 账号。候选稿只使用正式批准的公共 Context 与该人设正式批准的 Editorial Context。
+没有固定 10 条、3–5 条或轮转栏目配额；当天可以是 0 条。自动流程不发布、不排期，也不操作 X 账号。候选稿只使用正式批准的公共 Context 与该人设正式批准的 Editorial Context。Grok 搜索只作背景；正式事实只能来自批准输入。队列只接收带 `persona_editorial_grok_gemini:<evaluation-id>` 来源和审计记录的候选，历史批量稿与旧编辑稿不会进入队列。
 
 ### 每人 Editorial Context
 
@@ -45,7 +45,7 @@ Open `https://x-account-operator-api-production.up.railway.app/`.
 
 `configs/topic_selection_policy.json` is the permanent selection authority.
 
-The daily flow is: mother-pool heat → facts and opinions → public candidate questions → formal public Context + approved persona private topics → persona evaluation → claim arbitration → candidate writing → human review.
+The daily flow is: mother-pool heat → facts and opinions → public candidate questions → formal public Context + approved persona private topics → persona evaluation → claim arbitration → Grok context → Gemini draft → Gemini critic → human review.
 
 - Heat only decides what to research. It does not make a topic publishable.
 - A refreshed number is not a new topic unless it changes the conclusion, scale, mechanism, participation condition, or invalidation condition.
@@ -57,7 +57,7 @@ The daily flow is: mother-pool heat → facts and opinions → public candidate 
 
 ## Daily mother-pool scheduler
 
-The scheduler runs inside the service process and never stores credentials in SQLite or generated artifacts. On macOS it can read the existing Keychain entries. On Linux/systemd, set both `TWITTER241_RAPIDAPI_KEY` and `XOPS_LLM_API_KEY` in `/etc/x-account-operator.env`; the installer leaves the scheduler disabled until both are present.
+The scheduler runs inside the service process and never stores credentials in SQLite or generated artifacts. On Linux/systemd, set `TWITTER241_RAPIDAPI_KEY`, `XOPS_LLM_API_KEY`, `XOPS_GROK_API_KEY` and `XOPS_GEMINI_API_KEY` in `/etc/x-account-operator.env`; formal candidate generation stays retryable rather than falling back when either dedicated editor provider is absent.
 
 ```text
 XOPS_DAILY_CONTEXT_ENABLED=true
@@ -68,11 +68,20 @@ XOPS_DAILY_CONTEXT_RESUME_HOURS=20
 XOPS_MOTHER_POOL_ACCOUNTS=/path/to/content_source_accounts.json
 XOPS_DAILY_POST_ENABLED=true
 XOPS_DAILY_POST_PERSONAS=acheng,ridehail-driver-zhao,college-student-linjia,atuo,axu,nanqiao,qiliang,aye,xiaoman,maili
+XOPS_GROK_API_KEY=...
+XOPS_GROK_BASE_URL=https://www.micuapi.ai/v1
+XOPS_GROK_MODEL=grok-4.6
+XOPS_GEMINI_API_KEY=...
+XOPS_GEMINI_BASE_URL=https://www.micuapi.ai/v1
+XOPS_GEMINI_MODEL=gemini-3.1-pro-preview
+XOPS_OPERATOR_TOKEN=...  # optional: protect all /api write requests
 ```
 
 - `XOPS_DAILY_CONTEXT_ENABLED=false` pauses only the automatic run; manual runs in `/market` remain available.
 - `XOPS_DAILY_CONTEXT_RUN_TIME` is interpreted in `XOPS_TIMEZONE` (default: `Asia/Shanghai`).
 - `XOPS_MOTHER_POOL_ACCOUNTS` is the account-list JSON used by the collector. If omitted, the service uses the verified default source configuration.
 - `XOPS_DAILY_POST_PERSONAS` defines the personas that are evaluated, not a promised draft count. The pipeline may legitimately return no `WRITE` results.
+- If `XOPS_OPERATOR_TOKEN` is configured, every non-GET `/api` request must send it as `X-Ops-Token`. The three built-in operator pages prompt once after a 401 and keep it only in that browser tab's session storage. `/health` exposes `operator_auth_enabled`.
+- In `/market`, a reviewer may explicitly confirm only a fact card's representative source reference, with a different first-party verification URL and a short verification note. X/Twitter links, the same source-post URL, and empty evidence are rejected. `two_source_candidate` and `corroborated_candidate` never become verified facts automatically, and a promoted fact is usable only by a selected topic that cites that exact reviewed reference.
 
 结果入口是 `/`，当天真实候选稿 API 是 `/api/daily-posts`。人设评估状态保存在 SQLite，供流水线幂等、恢复和审计使用。数据保存在 Railway `/data` 持久卷。

@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import hashlib
 import json
 import os
@@ -8,13 +9,14 @@ import sqlite3
 import subprocess
 import time
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -26,6 +28,8 @@ TZ = ZoneInfo(os.getenv("XOPS_TIMEZONE", "Asia/Shanghai"))
 DAILY_CONTEXT_ARTIFACTS = DATA_DIR / "daily_context_runs"
 DAILY_CONTEXT_SOURCE_DB = DATA_DIR / "market_source_posts.sqlite3"
 DAILY_CONTEXT_TASKS: set[asyncio.Task] = set()
+EDITORIAL_GROK_CONTEXT_CACHE: dict[str, dict] = {}
+EDITORIAL_GROK_CONTEXT_CACHE_MAX = 64
 TOPIC_SELECTION_POLICY_PATH = APP_DIR / "configs" / "topic_selection_policy.json"
 
 PERSONA_META = {
@@ -538,6 +542,9 @@ def init_db():
                 rationale TEXT NOT NULL DEFAULT '',
                 open_loop TEXT NOT NULL DEFAULT '',
                 candidate_id INTEGER REFERENCES post_candidates(id),
+                generation_attempts INTEGER NOT NULL DEFAULT 0,
+                next_retry_at INTEGER,
+                generation_max_attempts INTEGER NOT NULL DEFAULT 3,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(run_id, persona_id, topic_input_hash)
@@ -558,6 +565,15 @@ def init_db():
         }
         if "asset_id" not in candidate_columns:
             conn.execute("ALTER TABLE post_candidates ADD COLUMN asset_id TEXT NOT NULL DEFAULT ''")
+        evaluation_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(persona_editorial_evaluations)").fetchall()
+        }
+        if "generation_attempts" not in evaluation_columns:
+            conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN generation_attempts INTEGER NOT NULL DEFAULT 0")
+        if "next_retry_at" not in evaluation_columns:
+            conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN next_retry_at INTEGER")
+        if "generation_max_attempts" not in evaluation_columns:
+            conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN generation_max_attempts INTEGER NOT NULL DEFAULT 3")
         conn.execute("PRAGMA optimize")
     seed_personas()
     seed_project_contexts()
@@ -594,6 +610,13 @@ def recent_topic_claims(limit: int = 200):
             """SELECT claim_key,subject,core_claim,context_date,source,status
                FROM topic_claim_history
                WHERE status<>'superseded'
+                 AND (
+                     source NOT LIKE 'persona_editorial:%'
+                     OR EXISTS (
+                         SELECT 1 FROM post_candidates c
+                         WHERE c.source=topic_claim_history.source AND c.status='published'
+                     )
+                 )
                  AND NOT (source='daily_context_run' AND persona_id IS NULL)
                ORDER BY last_seen_at DESC LIMIT ?""",
             (limit,),
@@ -870,6 +893,8 @@ class DailyMarketContextIn(BaseModel):
     unknowns: str = ""
     raw_feed: str = ""
     sources: list[dict] = Field(default_factory=list)
+    verified_fact_card_refs: list[str] | None = None
+    fact_verifications: list[dict] | None = None
 
 
 class PersonaContextIn(BaseModel):
@@ -1581,6 +1606,24 @@ def llm_api_key():
     raise HTTPException(503, "未配置 Post 生成模型")
 
 
+def editorial_provider_config(provider: str):
+    """Formal candidate writing has dedicated providers; never fall back to XOPS_LLM."""
+    prefix = f"XOPS_{provider.upper()}"
+    key = os.getenv(f"{prefix}_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(f"未配置 {provider} 正式编辑模型")
+    defaults = {
+        "GROK": ("https://www.micuapi.ai/v1", "grok-4.6"),
+        "GEMINI": ("https://www.micuapi.ai/v1", "gemini-3.1-pro-preview"),
+    }
+    base_url, model = defaults[provider.upper()]
+    return {
+        "key": key,
+        "base_url": os.getenv(f"{prefix}_BASE_URL", base_url).rstrip("/"),
+        "model": os.getenv(f"{prefix}_MODEL", model),
+    }
+
+
 async def synthesize_daily_cards(context_date: str, cards: dict):
     prompt = (
         "你是 Crypto 市场研究编辑。以下是经过筛选的事实候选卡、观点候选卡和覆盖统计。"
@@ -1641,15 +1684,32 @@ def bounded_selected_topics(result: dict, cards: dict):
         for item in cards.get("discussion_topics", [])
         if isinstance(item, dict) and item.get("key")
     }
+    source_refs = {}
+    for item in cards.get("discussion_topics", []):
+        if not isinstance(item, dict) or not item.get("key"):
+            continue
+        refs = {
+            str(value).strip()
+            for value in item.get("sample_refs", [])
+            if str(value).strip()
+        }
+        refs.update(
+            str(sample.get("source_ref", "")).strip()
+            for sample in item.get("sample_posts", [])
+            if isinstance(sample, dict) and str(sample.get("source_ref", "")).strip()
+        )
+        source_refs[str(item["key"])] = refs
     for item in cards.get("opinion_cards", []):
         if isinstance(item, dict) and item.get("source_ref"):
             source_topics[f"opinion:{item['source_ref']}"] = "母池高质量观点"
+            source_refs[f"opinion:{item['source_ref']}"] = {str(item["source_ref"])}
     for item in cards.get("fact_cards", []):
         if not isinstance(item, dict):
             continue
         source_ref = item.get("source_ref") or item.get("representative_source_ref")
         if source_ref:
             source_topics[f"fact:{source_ref}"] = "母池事实候选"
+            source_refs[f"fact:{source_ref}"] = {str(source_ref)}
     policy = cards.get("topic_selection_policy", {})
     if isinstance(policy, dict):
         for item in policy.get("evergreen_inspirations", []):
@@ -1692,6 +1752,11 @@ def bounded_selected_topics(result: dict, cards: dict):
                 **item,
                 "id": f"{content_type}:screened:{item['claim_key']}",
                 "source_topic_keys": keys,
+                # Model-owned topic keys identify the discussion. Exact source refs
+                # are derived from that discussion's captured samples only, so a
+                # manually promoted fact can enter a draft only when the chosen
+                # topic actually cites the same source.
+                "source_refs": sorted({ref for key in keys for ref in source_refs.get(key, set())}),
                 "source_topic_title": source_topics[keys[0]],
                 "question": item["core_claim"],
                 "research_brief": [item["material_delta"], item["audience_value"]],
@@ -2530,12 +2595,14 @@ def resolve_persona_editorial_collisions(run_id: int):
                 (now, evaluation_id),
             )
             conn.execute(
-                "UPDATE post_candidates SET status='superseded',updated_at=? WHERE id=(SELECT candidate_id FROM persona_editorial_evaluations WHERE id=?)",
-                (now, evaluation_id),
+                """UPDATE post_candidates SET status='superseded',updated_at=?
+                   WHERE id=(SELECT candidate_id FROM persona_editorial_evaluations WHERE id=?)
+                     AND source=? AND status<>'published'""",
+                (now, evaluation_id, persona_editorial_candidate_source(evaluation_id)),
             )
             conn.execute(
                 "UPDATE topic_claim_history SET status='superseded',last_seen_at=? WHERE source=?",
-                (now, f"persona_editorial:{evaluation_id}"),
+                (now, persona_editorial_candidate_source(evaluation_id)),
             )
 
 
@@ -2550,7 +2617,7 @@ def record_persona_editorial_claim(conn, evaluation: dict, context_date: str):
             source=excluded.source,status='drafted',last_seen_at=excluded.last_seen_at""",
         (
             claim_key, evaluation["persona_id"], str(json_value(evaluation["topic_json"], {}).get("subject", "")),
-            evaluation["core_claim"], context_date, f"persona_editorial:{evaluation['id']}", now, now,
+            evaluation["core_claim"], context_date, persona_editorial_candidate_source(evaluation["id"]), now, now,
         ),
     )
 
@@ -2563,12 +2630,43 @@ def supersede_persona_editorial_evaluation(conn, evaluation_id: int, reason_code
         (reason_code, rationale, now, evaluation_id),
     )
     conn.execute(
-        "UPDATE post_candidates SET status='superseded',updated_at=? WHERE id=(SELECT candidate_id FROM persona_editorial_evaluations WHERE id=?)",
-        (now, evaluation_id),
+        """UPDATE post_candidates SET status='superseded',updated_at=?
+           WHERE id=(SELECT candidate_id FROM persona_editorial_evaluations WHERE id=?)
+             AND source=? AND status<>'published'""",
+        (now, evaluation_id, persona_editorial_candidate_source(evaluation_id)),
     )
     conn.execute(
         "UPDATE topic_claim_history SET status='superseded',last_seen_at=? WHERE source=?",
-        (now, f"persona_editorial:{evaluation_id}"),
+        (now, persona_editorial_candidate_source(evaluation_id)),
+    )
+
+
+def mark_persona_editorial_generation_retryable(conn, evaluation_id: int, error: Exception):
+    row = conn.execute(
+        """SELECT generation_attempts,generation_max_attempts
+           FROM persona_editorial_evaluations WHERE id=?""",
+        (evaluation_id,),
+    ).fetchone()
+    if not row:
+        return
+    now = int(time.time())
+    attempts = row["generation_attempts"] + 1
+    maximum = max(1, row["generation_max_attempts"])
+    rationale = f"Grok/Gemini 正式写作可重试失败：{str(error)[:300]}"
+    if attempts >= maximum:
+        conn.execute(
+            """UPDATE persona_editorial_evaluations
+               SET status='HOLD',generation_attempts=?,next_retry_at=NULL,
+                   reason_code='formal_generation_retry_exhausted',rationale=?,updated_at=? WHERE id=?""",
+            (attempts, rationale, now, evaluation_id),
+        )
+        return
+    delay = min(3600, 30 * (2 ** (attempts - 1)))
+    conn.execute(
+        """UPDATE persona_editorial_evaluations
+           SET status='WRITE',generation_attempts=?,next_retry_at=?,
+               reason_code='formal_generation_retryable',rationale=?,updated_at=? WHERE id=?""",
+        (attempts, now + delay, rationale, now, evaluation_id),
     )
 
 
@@ -2577,8 +2675,15 @@ def editorial_stable_claim_history(conn, context_date: str, persona_id: int | No
         """SELECT h.claim_key,h.persona_id,h.subject,h.core_claim,h.context_date,h.source,h.status,
                   e.topic_json
            FROM topic_claim_history h
-           LEFT JOIN persona_editorial_evaluations e ON h.source=('persona_editorial:' || e.id)
+           LEFT JOIN persona_editorial_evaluations e ON h.source=('persona_editorial_grok_gemini:' || e.id)
            WHERE h.status<>'superseded'
+             AND (
+                 h.source NOT LIKE 'persona_editorial:%'
+                 OR EXISTS (
+                     SELECT 1 FROM post_candidates c
+                     WHERE c.source=h.source AND c.status='published'
+                 )
+             )
              AND NOT (h.source='daily_context_run' AND h.persona_id IS NULL)
              AND (h.context_date IS NULL OR h.context_date<?)
            ORDER BY h.last_seen_at DESC LIMIT 200""",
@@ -2643,12 +2748,23 @@ def editorial_claim_already_drafted(conn, evaluation: dict):
     if not claim:
         return False
     rows = conn.execute(
-        """SELECT core_claim FROM topic_claim_history
-           WHERE status<>'superseded' AND source<>?
-             AND NOT (source='daily_context_run' AND persona_id IS NULL)""",
-        (f"persona_editorial:{evaluation['id']}",),
+        """SELECT h.core_claim FROM topic_claim_history h
+           WHERE h.status<>'superseded' AND h.source NOT IN (?,?)
+             AND (
+                 h.source NOT LIKE 'persona_editorial:%'
+                 OR EXISTS (
+                     SELECT 1 FROM post_candidates c
+                     WHERE c.source=h.source AND c.status='published'
+                 )
+             )
+             AND NOT (h.source='daily_context_run' AND h.persona_id IS NULL)""",
+        (persona_editorial_candidate_source(evaluation["id"]), f"persona_editorial:{evaluation['id']}"),
     ).fetchall()
     return any(normalize_editorial_claim(row["core_claim"]) == claim for row in rows)
+
+
+def persona_editorial_candidate_source(evaluation_id: int) -> str:
+    return f"persona_editorial_grok_gemini:{evaluation_id}"
 
 
 def editorial_writer_context(input_snapshot: dict, topic: dict):
@@ -2734,26 +2850,320 @@ def unauthorized_first_person_experience(post: str, writer_context: dict):
     remaining = post
     for phrase in SAFE_FIRST_PERSON_OPINION_LEADS:
         remaining = remaining.replace(phrase, "")
-    return any(pronoun in remaining for pronoun in ("我", "本人", "自己"))
+    return any(pronoun in remaining for pronoun in ("我", "本人"))
+
+
+FACT_CARD_STATUSES = {
+    "verified", "official_primary", "official_verified", "primary_verified",
+    "cross_validated_verified",
+}
+
+
+def editorial_verified_facts(raw_cards: dict, topic: dict, writer_context: dict):
+    """Build fact permissions from exact approved card references, never from model prose."""
+    references = set()
+    for field in ("source_topic_keys", "source_refs"):
+        values = topic.get(field, [])
+        if isinstance(values, str):
+            values = [values]
+        for value in values if isinstance(values, list) else []:
+            text = str(value or "").strip()
+            if text:
+                references.add(text.removeprefix("fact:"))
+    facts = []
+    for card in raw_cards.get("fact_cards", []) if isinstance(raw_cards, dict) else []:
+        if not isinstance(card, dict) or card.get("status") not in FACT_CARD_STATUSES:
+            continue
+        card_refs = {
+            str(card.get("representative_source_ref") or card.get("source_ref") or "").strip()
+        }
+        card_refs.update(
+            str(item.get("source_ref", "")).strip()
+            for item in card.get("evidence", []) if isinstance(item, dict)
+        )
+        card_refs.discard("")
+        authorized_refs = {
+            str(value).strip() for value in card.get("review_promoted_refs", [])
+            if str(value).strip()
+        } if card.get("review_promoted") else card_refs
+        matched = sorted(authorized_refs & references)
+        if not matched:
+            continue
+        fact_text = str(card.get("representative_text", "")).strip()
+        if not fact_text:
+            continue
+        fact_id = f"fact:{matched[0]}"
+        fact = {
+            "id": fact_id,
+            "text": fact_text[:900],
+            "source_refs": sorted(card_refs)[:12],
+            "status": card["status"],
+        }
+        if card.get("review_promoted") and isinstance(card.get("verification_evidence"), dict):
+            fact["verification_evidence"] = card["verification_evidence"]
+        facts.append(fact)
+    source_item = writer_context.get("source_item") or {}
+    if writer_context.get("source_kind") == "life" and source_item.get("fact"):
+        source_id = str(writer_context.get("source_id") or "life")
+        facts.append({
+            "id": f"life:{source_id}",
+            "text": str(source_item["fact"]).strip()[:900],
+            "source_refs": [f"life:{source_id}"],
+            "status": "approved_life",
+        })
+    return {"schema": "facts_used_ids", "facts": facts, "requires_fact_ids": bool(facts)}
+
+
+def response_output_text_and_citations(body: dict):
+    parts, citations, tool_usage = [], [], set()
+
+    def visit(value):
+        if isinstance(value, dict):
+            kinds = " ".join(
+                str(value.get(key) or "").lower() for key in ("type", "tool_name", "name")
+            )
+            if "x_search" in kinds or "x_keyword_search" in kinds:
+                tool_usage.add("x_search")
+            if "web_search" in kinds:
+                tool_usage.add("web_search")
+            if value.get("type") == "output_text" and value.get("text"):
+                parts.append(str(value["text"]))
+            for annotation in value.get("annotations", []) or []:
+                if not isinstance(annotation, dict):
+                    continue
+                url = annotation.get("url") or annotation.get("url_citation", {}).get("url")
+                if url and url not in citations:
+                    citations.append(str(url))
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    visit(nested)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(body)
+    return "\n".join(parts).strip(), citations[:12], sorted(tool_usage)
+
+
+def chat_completion_json(body: dict):
+    content = body["choices"][0]["message"]["content"]
+    if isinstance(content, list):
+        content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    content = str(content).strip()
+    if content.startswith("```"):
+        content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    result = json.loads(content)
+    if not isinstance(result, dict):
+        raise ValueError("模型输出不是 JSON 对象")
+    return result
+
+
+async def enrich_persona_editorial_context(topic: dict, verified_facts: dict, daily_context: dict):
+    """Use Grok search only as fresh market background, never as a fact authority."""
+    cache_key = hashlib.sha256(json.dumps(
+        {"context_date": daily_context.get("context_date"), "topic": topic,
+         "facts": verified_facts, "daily": daily_context},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    cached = EDITORIAL_GROK_CONTEXT_CACHE.get(cache_key)
+    if cached:
+        return cached
+    provider = editorial_provider_config("GROK")
+    prompt = (
+        "你是中文 Crypto 编辑的实时研究助手。必须使用 X Search 和 Web Search。"
+        "母池与 X 搜索只证明讨论和观点，不能自动成为事实；请补齐圈内前情、争议、反方、今天为何讨论，"
+        "并附上可追溯 URL。不要写成帖子，不要给交易建议。\n\n"
+        f"题目：{json.dumps(topic, ensure_ascii=False)}\n"
+        f"可写成事实的已核材料（仅这些）：{json.dumps(verified_facts, ensure_ascii=False)}\n"
+        f"已批准市场 Context（仅作背景）：{json.dumps(daily_context, ensure_ascii=False)}"
+    )
+    async with httpx.AsyncClient(timeout=180) as client:
+        from_date = (datetime.fromisoformat(str(daily_context["context_date"])).date() - timedelta(days=1)).isoformat() + "T00:00:00Z"
+        response = await client.post(
+            provider["base_url"] + "/responses",
+            headers={
+                "Authorization": f"Bearer {provider['key']}", "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            },
+            json={
+                "model": provider["model"], "input": prompt,
+                "tools": [
+                    {"type": "x_search", "from_date": from_date},
+                    {"type": "web_search"},
+                ],
+                "max_output_tokens": 3000,
+            },
+        )
+        response.raise_for_status()
+    text, citations, tool_usage = response_output_text_and_citations(response.json())
+    if not text:
+        raise RuntimeError("Grok 未返回研究 Context")
+    is_public = str(topic.get("scope", "public")) != "persona"
+    if is_public and ({"x_search", "web_search"} - set(tool_usage) or not citations):
+        raise RuntimeError("Grok 未留下完整的 X/Web 搜索或引用证据")
+    result = {
+        "text": text[:9000], "citations": citations, "tool_usage": tool_usage,
+        "model": provider["model"],
+    }
+    if len(EDITORIAL_GROK_CONTEXT_CACHE) >= EDITORIAL_GROK_CONTEXT_CACHE_MAX:
+        EDITORIAL_GROK_CONTEXT_CACHE.pop(next(iter(EDITORIAL_GROK_CONTEXT_CACHE)))
+    EDITORIAL_GROK_CONTEXT_CACHE[cache_key] = result
+    return result
+
+
+async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_facts: dict,
+                                         grok_context: dict, writer_context: dict,
+                                         rewrite_instruction: str = ""):
+    provider = editorial_provider_config("GEMINI")
+    prompt = (
+        "你是中文 Crypto KOL 编辑。把以下正式选题写成一条能进入人工审核的帖子，只输出 JSON："
+        "{\"text\":\"...\",\"facts_used_ids\":[\"fact:...\"],\"stance\":\"...\"}。\n"
+        "唯一可作为确定事实、数字或日期的材料是 verified_facts（已批准事实依据）；Grok 内容只用于理解前情、圈内争议和语言语境。"
+        "X 上重复出现的说法仍只是观点。必须给清楚判断和现实后果，不写研报、免责声明、标题、来源列表或观察清单。"
+        "若 verified_facts.facts 为空，不得写日期、数字或已被确认的事实；只能写明确标出的观点、解释或判断。"
+        "不写“结论很明确/本质上/值得注意的是/核心逻辑/不是X而是Y/一方面另一方面”。"
+        "不要讲读者已经知道的常识；只保留这次题目里新发生的冲突、机会或看法。"
+        "人设只影响取材角度和语气，不能补造外卖、乘客、课程、实测、持仓、成交、收益或朋友对话。"
+        "除非 source_kind=life 且 first_person_allowed=true，否则第一人称只能表达判断，不能写个人经历。"
+        "不号召追涨、合约、杠杆或借钱。\n\n"
+        f"人设：{json.dumps(persona, ensure_ascii=False)}\n"
+        f"选题：{json.dumps(topic, ensure_ascii=False)}\n"
+        f"verified_facts：{json.dumps(verified_facts, ensure_ascii=False)}\n"
+        f"Grok 背景：{json.dumps({'text': grok_context.get('text', ''), 'citations': grok_context.get('citations', [])}, ensure_ascii=False)}\n"
+        f"第一人称权限：{json.dumps(minimal_editorial_writer_context(writer_context), ensure_ascii=False)}"
+    )
+    if rewrite_instruction:
+        prompt += f"\n\n上一稿被编辑否决，按此定向重写：{rewrite_instruction}"
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            provider["base_url"] + "/chat/completions",
+            headers={
+                "Authorization": f"Bearer {provider['key']}", "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            },
+            json={
+                "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"}, "temperature": 0.8, "max_tokens": 3000,
+            },
+        )
+        response.raise_for_status()
+    result = chat_completion_json(response.json())
+    text = str(result.get("text", "")).strip()
+    if not text:
+        raise RuntimeError("Gemini 未返回正文")
+    valid_fact_ids = {item["id"] for item in verified_facts.get("facts", [])}
+    raw_facts_used = result.get("facts_used_ids", [])
+    if not isinstance(raw_facts_used, list) or not all(isinstance(item, str) for item in raw_facts_used):
+        raise RuntimeError("Gemini facts_used_ids 不符合 JSON 数组约束")
+    facts_used = [item for item in raw_facts_used if item]
+    if any(item not in valid_fact_ids for item in facts_used):
+        raise RuntimeError("Gemini 引用了未提供的事实编号")
+    if verified_facts.get("requires_fact_ids") and not facts_used:
+        raise RuntimeError("Gemini 未标注已使用的事实编号")
+    return {
+        "text": text,
+        "facts_used_ids": facts_used,
+        "stance": str(result.get("stance", "")).strip(),
+        "model": provider["model"],
+    }
+
+
+def deterministic_editorial_style_failures(post: str, writer_context: dict, verified_facts: dict | None = None):
+    text = str(post or "").strip()
+    failures = []
+    if len(text) < 80:
+        failures.append("正文过短，未形成可读的具体判断")
+    if any(phrase in text for phrase in EMPTY_WAITING_PHRASES):
+        failures.append("用等待或观察句替代当前结论")
+    if unauthorized_first_person_experience(text, writer_context):
+        failures.append("虚构或未授权的第一人称经历")
+    if verified_facts is not None and not verified_facts.get("facts") and re.search(r"\d", text):
+        failures.append("无已核事实时出现数字、日期或价格式断言")
+    boilerplate = ("结论很明确", "我的结论很简单", "我的结论很直白", "本质上", "值得注意的是", "核心逻辑", "一方面", "另一方面", "显而易见", "大家都知道")
+    if any(phrase in text for phrase in boilerplate) or re.search(r"^\s*不是.{1,30}而是", text):
+        failures.append("AI 模板或常识性空话")
+    return failures
+
+
+async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_facts: dict,
+                                           grok_context: dict, writer_context: dict, draft: dict,
+                                           deterministic_failures: list[str]):
+    provider = editorial_provider_config("GEMINI")
+    critic_grok_context = {**grok_context, "text": str(grok_context.get("text", ""))[:5000]}
+    prompt = (
+        "你是中文 Crypto 内容主编。只输出 JSON：{\"verdict\":\"PASS或REJECT\",\"reasons\":[\"...\"],"
+        "\"unsupported_claims\":[\"...\"],\"rewrite_instruction\":\"...\"}。逐句核对待审稿：每条日期、数字、"
+        "价格、已经发生的事件、官方关系和因果断言，只要不能由 verified_facts 直接支持，就原句摘入 unsupported_claims。"
+        "unsupported_claims 非空必须 REJECT。严格：没有具体的新冲突、只是在讲常识、AI 模板腔、"
+        "把 Grok 背景或未提供材料写成事实、虚构人设经历、没有明确判断，均 REJECT。PASS 必须是有信息量、"
+        "有明确主题、像这个人设会说的话的帖子。只允许 verified_facts 成为事实；facts_used_ids 必须是其子集，"
+        "且有 verified_facts 时不可为空。\n\n"
+        f"永久成稿门槛：{json.dumps(topic_selection_policy().get('draft_quality_gates', []), ensure_ascii=False)}\n"
+        f"人设：{json.dumps(persona, ensure_ascii=False)}\n题目：{json.dumps(topic, ensure_ascii=False)}\n"
+        f"verified_facts：{json.dumps(verified_facts, ensure_ascii=False)}\n"
+        f"Grok 背景：{json.dumps(critic_grok_context, ensure_ascii=False)}\n"
+        f"第一人称权限：{json.dumps(minimal_editorial_writer_context(writer_context), ensure_ascii=False)}\n"
+        f"确定性检查：{json.dumps(deterministic_failures, ensure_ascii=False)}\n"
+        f"待审稿：{json.dumps(draft, ensure_ascii=False)}"
+    )
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            provider["base_url"] + "/chat/completions",
+            headers={
+                "Authorization": f"Bearer {provider['key']}", "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            },
+            json={
+                "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"}, "temperature": 0.2, "max_tokens": 3000,
+            },
+        )
+        response.raise_for_status()
+    result = chat_completion_json(response.json())
+    verdict = str(result.get("verdict", "REJECT")).upper()
+    reasons = [str(item)[:240] for item in result.get("reasons", []) if str(item)]
+    raw_unsupported = result.get("unsupported_claims")
+    if not isinstance(raw_unsupported, list) or not all(isinstance(item, str) for item in raw_unsupported):
+        raise RuntimeError("Gemini critic unsupported_claims 不符合 JSON 字符串数组约束")
+    unsupported = [item.strip()[:320] for item in raw_unsupported if item.strip()]
+    rewrite_instruction = str(result.get("rewrite_instruction", "")).strip()
+    return {
+        "verdict": "PASS" if verdict == "PASS" and not deterministic_failures and not unsupported else "REJECT",
+        "reasons": reasons or unsupported or deterministic_failures or ["主编未给出可发布结论"],
+        "unsupported_claims": unsupported,
+        "rewrite_instruction": (rewrite_instruction or "请围绕题目补足具体冲突和明确判断，删掉模板句。")[:600],
+        "model": provider["model"],
+    }
 
 
 async def generate_pending_persona_editorial_candidates(run_id: int, context_date: str):
+    retry_now = int(time.time())
     with db() as conn:
         run = conn.execute(
-            "SELECT status FROM daily_context_runs WHERE id=?", (run_id,)
+            "SELECT status,raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
         ).fetchone()
         if not run or run["status"] != "approved":
             return
         rows = conn.execute(
             """SELECT e.*,p.slug,p.name,p.draft FROM persona_editorial_evaluations e
                JOIN personas p ON p.id=e.persona_id
-               WHERE e.run_id=? AND e.status='WRITE' AND e.candidate_id IS NULL
+               WHERE e.run_id=? AND e.status='WRITE'
+                 AND (e.next_retry_at IS NULL OR e.next_retry_at<=?) AND (
+                   e.candidate_id IS NULL OR NOT EXISTS (
+                       SELECT 1 FROM post_candidates c
+                       WHERE c.id=e.candidate_id AND c.source LIKE 'persona_editorial_grok_gemini:%'
+                   ) AND EXISTS (
+                       SELECT 1 FROM post_candidates c
+                       WHERE c.id=e.candidate_id AND c.status<>'published'
+                   )
+               )
                ORDER BY e.id""",
-            (run_id,),
+            (run_id, retry_now),
         ).fetchall()
+        raw_cards = json_value(run["raw_cards"], {})
     for row in rows:
         evaluation = dict(row)
-        source = f"persona_editorial:{evaluation['id']}"
+        source = persona_editorial_candidate_source(evaluation["id"])
         with db() as conn:
             snapshot = json_value(evaluation.get("input_json"), {})
             if snapshot != current_editorial_input_payload(conn, evaluation, context_date):
@@ -2795,72 +3205,89 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                 continue
             value = topic[key]
             if isinstance(value, str):
-                compact_topic[key] = value[:350]
+                compact_topic[key] = value[:600]
             elif isinstance(value, list):
-                compact_topic[key] = [str(item)[:120] for item in value[:10]]
+                compact_topic[key] = [str(item)[:300] for item in value[:10]]
             else:
                 compact_topic[key] = value
+        compact_topic.pop("fact_basis", None)
         compact_daily = dict(snapshot["daily"])
         for key in ("market_state", "event_clusters", "debates", "evidence", "unknowns"):
-            compact_daily[key] = str(compact_daily.get(key, ""))[:500]
-        compact_daily["sources"] = list(compact_daily.get("sources") or [])[:5]
+            compact_daily[key] = str(compact_daily.get(key, ""))[:1200]
+        compact_daily["sources"] = list(compact_daily.get("sources") or [])[:10]
         writer_context = editorial_writer_context(snapshot, topic)
-        facts = json.dumps({
-            "date": context_date, "topic": compact_topic,
-            "editorial_claim": evaluation["core_claim"][:600], "daily_market": compact_daily,
-            "why_this_persona": evaluation["why_me"][:400], "rationale": evaluation["rationale"][:400],
-            "approved_persona_context": writer_context,
-        }, ensure_ascii=False)
-        if len(facts) > 7900:
-            compact_daily["sources"] = []
-            compact_daily["evidence"] = compact_daily["evidence"][:200]
-            facts = json.dumps({
-                "date": context_date, "topic": compact_topic,
-                "editorial_claim": evaluation["core_claim"][:600], "daily_market": compact_daily,
-                "why_this_persona": evaluation["why_me"][:400], "rationale": evaluation["rationale"][:400],
-                "approved_persona_context": writer_context,
-            }, ensure_ascii=False)
-        if len(facts) > 7900:
-            facts = json.dumps({
-                "date": context_date,
-                "topic": {
-                    key: str(topic.get(key, ""))[:300]
-                    for key in ("claim_key", "title", "core_claim", "material_delta", "audience_value")
-                },
-                "editorial_claim": evaluation["core_claim"][:500],
-                "daily_market": {
-                    key: str(snapshot["daily"].get(key, ""))[:300]
-                    for key in ("market_state", "event_clusters", "debates", "evidence", "unknowns")
-                },
-                "why_this_persona": evaluation["why_me"][:250],
-                "approved_persona_context": minimal_editorial_writer_context(writer_context),
-            }, ensure_ascii=False)
-        if len(facts) > 7900:
-            with db() as conn:
-                supersede_persona_editorial_evaluation(
-                    conn, evaluation["id"], "writer_context_too_large",
-                    "写作输入超过受控长度，未生成正文。",
-                )
-            continue
+        verified_facts = editorial_verified_facts(raw_cards, topic, writer_context)
+        persona = {
+            "slug": evaluation["slug"],
+            "name": PERSONA_PUBLIC_PROFILE.get(evaluation["slug"], {}).get(
+                "display_name", evaluation["name"]
+            ),
+            "card": snapshot.get("persona_card", {}), "continuity": snapshot.get("persona_context", {}),
+            "why_this_persona": evaluation["why_me"][:400],
+        }
         try:
-            generated = await generate_persona_post(
-                evaluation["persona_id"], PostGenerationIn(facts=facts)
+            grok_context = await enrich_persona_editorial_context(
+                compact_topic, verified_facts, compact_daily
             )
-        except HTTPException:
+            generated = await write_persona_editorial_gemini(
+                persona, compact_topic, verified_facts, grok_context, writer_context
+            )
+            failures = deterministic_editorial_style_failures(generated["text"], writer_context, verified_facts)
+            critic = await critique_persona_editorial_draft(
+                persona, compact_topic, verified_facts, grok_context, writer_context, generated, failures
+            )
+            attempts = 1
+            if critic["verdict"] != "PASS" or failures:
+                generated = await write_persona_editorial_gemini(
+                    persona, compact_topic, verified_facts, grok_context, writer_context,
+                    critic["rewrite_instruction"],
+                )
+                failures = deterministic_editorial_style_failures(generated["text"], writer_context, verified_facts)
+                critic = await critique_persona_editorial_draft(
+                    persona, compact_topic, verified_facts, grok_context, writer_context, generated, failures
+                )
+                attempts = 2
+        except (HTTPException, httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, RuntimeError) as error:
+            with db() as conn:
+                mark_persona_editorial_generation_retryable(conn, evaluation["id"], error)
             continue
-        if unauthorized_first_person_experience(generated["post"], writer_context):
+        if critic["verdict"] != "PASS" or failures:
             with db() as conn:
                 supersede_persona_editorial_evaluation(
-                    conn, evaluation["id"], "unsupported_first_person_experience",
-                    "生成稿出现未获生活事实支持的具体第一人称经历。",
+                    conn, evaluation["id"], "grok_gemini_critic_reject",
+                    "；".join(critic["reasons"])[:1000],
                 )
             continue
+        audit = {
+            "topic": {key: compact_topic.get(key, "") for key in ("claim_key", "title", "core_claim")},
+            "verified_facts": verified_facts,
+            "facts_used_ids": generated["facts_used_ids"],
+            "stance": generated["stance"],
+            "grok": {
+                "model": grok_context["model"], "citations": grok_context["citations"],
+                "tool_usage": grok_context["tool_usage"],
+                "context_hash": hashlib.sha256(grok_context["text"].encode("utf-8")).hexdigest()[:16],
+            },
+            "gemini": {"model": generated["model"], "attempts": attempts},
+            "critic": {
+                "verdict": critic["verdict"], "reasons": critic["reasons"],
+                "unsupported_claims": critic.get("unsupported_claims", []),
+            },
+        }
         now = int(time.time())
         with db() as conn:
             current = conn.execute(
                 "SELECT * FROM persona_editorial_evaluations WHERE id=?", (evaluation["id"],)
             ).fetchone()
-            if not current or current["candidate_id"] is not None or current["status"] != "WRITE":
+            if not current or current["status"] != "WRITE":
+                continue
+            legacy = (
+                conn.execute("SELECT id,source,status FROM post_candidates WHERE id=?", (current["candidate_id"],)).fetchone()
+                if current["candidate_id"] else None
+            )
+            if legacy and legacy["status"] == "published":
+                continue
+            if legacy and legacy["source"] == source:
                 continue
             if snapshot != current_editorial_input_payload(conn, dict(current), context_date):
                 supersede_persona_editorial_evaluation(
@@ -2880,9 +3307,9 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                 ) VALUES(?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(persona_id,context_date,source) DO NOTHING""",
                 (
-                    evaluation["persona_id"], context_date, evaluation["core_claim"], generated["post"],
+                    evaluation["persona_id"], context_date, evaluation["core_claim"], generated["text"],
                     "needs_review", source, editorial_candidate_asset_id(snapshot, topic),
-                    f"Persona Editorial Engine 评估 {evaluation['id']}；未发布。", now, now,
+                    json.dumps(audit, ensure_ascii=False, separators=(",", ":")), now, now,
                 ),
             )
             candidate = conn.execute(
@@ -2891,6 +3318,15 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             ).fetchone()
             if not candidate:
                 continue
+            if legacy and legacy["status"] == "needs_review":
+                conn.execute(
+                    "UPDATE post_candidates SET status='superseded',updated_at=? WHERE id=? AND status='needs_review'",
+                    (now, legacy["id"]),
+                )
+                conn.execute(
+                    "UPDATE topic_claim_history SET status='superseded',last_seen_at=? WHERE source=?",
+                    (now, f"persona_editorial:{evaluation['id']}"),
+                )
             conn.execute(
                 "UPDATE persona_editorial_evaluations SET candidate_id=?,updated_at=? WHERE id=?",
                 (candidate["id"], now, evaluation["id"]),
@@ -2902,15 +3338,23 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
 
 
 async def recover_pending_persona_editorial_candidates(run_id: int | None = None):
+    retry_now = int(time.time())
     with db() as conn:
         rows = conn.execute(
             """SELECT DISTINCT r.id AS run_id,r.context_date
                FROM daily_context_runs r
                JOIN persona_editorial_evaluations e ON e.run_id=r.id
-               WHERE r.status='approved' AND e.status='WRITE' AND e.candidate_id IS NULL
+               WHERE r.status='approved' AND e.status='WRITE'
+                 AND (e.next_retry_at IS NULL OR e.next_retry_at<=?) AND (
+                   e.candidate_id IS NULL OR EXISTS (
+                       SELECT 1 FROM post_candidates c
+                       WHERE c.id=e.candidate_id AND c.status<>'published'
+                         AND c.source NOT LIKE 'persona_editorial_grok_gemini:%'
+                   )
+               )
                  AND (? IS NULL OR r.id=?)
                ORDER BY r.context_date DESC"""
-            , (run_id, run_id)
+            , (retry_now, run_id, run_id)
         ).fetchall()
     recovered = []
     for row in rows:
@@ -2960,6 +3404,13 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
                 """SELECT h.claim_key,h.persona_id,h.subject,h.core_claim,h.context_date,h.source,h.status
                    FROM topic_claim_history h
                    WHERE h.status<>'superseded'
+                     AND (
+                         h.source NOT LIKE 'persona_editorial:%'
+                         OR EXISTS (
+                             SELECT 1 FROM post_candidates c
+                             WHERE c.source=h.source AND c.status='published'
+                         )
+                     )
                      AND NOT (h.source='daily_context_run' AND h.persona_id IS NULL)
                    ORDER BY h.last_seen_at DESC LIMIT 200"""
             ).fetchall()]
@@ -3264,6 +3715,22 @@ if CHARACTERS_DIR.exists():
     app.mount("/assets/characters", StaticFiles(directory=CHARACTERS_DIR), name="characters")
 
 
+def operator_token():
+    return os.getenv("XOPS_OPERATOR_TOKEN", "").strip()
+
+
+@app.middleware("http")
+async def require_operator_token(request: Request, call_next):
+    expected = operator_token()
+    if (
+        expected and (request.url.path == "/api" or request.url.path.startswith("/api/"))
+        and request.method not in {"GET", "HEAD", "OPTIONS"}
+        and not hmac.compare_digest(request.headers.get("X-Ops-Token", ""), expected)
+    ):
+        return JSONResponse({"detail": "Operator token required"}, status_code=401)
+    return await call_next(request)
+
+
 @app.get("/health")
 def health():
     hour, minute = daily_context_schedule()
@@ -3272,6 +3739,7 @@ def health():
         "daily_context_enabled": daily_context_scheduler_enabled(),
         "daily_context_run_time": f"{hour:02d}:{minute:02d}",
         "timezone": str(TZ),
+        "operator_auth_enabled": bool(operator_token()),
     }
 
 
@@ -3409,6 +3877,94 @@ def synthesis_text(value):
     if value is None:
         return ""
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+def normalized_verification_url(value: str) -> str:
+    parsed = urlparse(str(value or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path}?{parsed.query}".rstrip("?/")
+
+
+def reviewed_fact_cards(raw_cards: dict, selected_refs: list[str] | None, now: int,
+                      fact_verifications: list[dict] | None = None):
+    """Apply an explicit human promotion with primary-source verification evidence."""
+    if selected_refs is None:
+        return raw_cards
+    refs = {str(value).strip() for value in selected_refs if str(value).strip()}
+    if refs and not isinstance(fact_verifications, list):
+        raise HTTPException(422, "每条人工确认事实都必须提交一手验证 URL 和说明")
+    verification_by_ref = {}
+    for item in fact_verifications or []:
+        if not isinstance(item, dict):
+            raise HTTPException(422, "事实验证材料格式不正确")
+        ref = str(item.get("source_ref", "")).strip()
+        if not ref or ref in verification_by_ref:
+            raise HTTPException(422, "事实验证材料必须一条对应一个原帖")
+        verification_by_ref[ref] = {
+            "source_ref": ref,
+            "verification_url": str(item.get("verification_url", "")).strip(),
+            "verification_note": str(item.get("verification_note", "")).strip(),
+        }
+    if set(verification_by_ref) != refs:
+        raise HTTPException(422, "每条人工确认事实都必须有对应的一手验证材料")
+    cards = json.loads(json.dumps(raw_cards, ensure_ascii=False)) if isinstance(raw_cards, dict) else {}
+    candidates = []
+    known = set()
+    for card in cards.get("fact_cards", []):
+        if not isinstance(card, dict):
+            continue
+        status = str(card.get("status", ""))
+        source_ref = str(card.get("representative_source_ref") or card.get("source_ref") or "").strip()
+        if status in {"two_source_candidate", "corroborated_candidate"} or card.get("review_promoted"):
+            if source_ref:
+                known.add(source_ref)
+                candidates.append((card, source_ref))
+            if card.get("review_promoted"):
+                card["status"] = card.get("original_status") or card.get("cross_validation_status", "two_source_candidate")
+                card.pop("review_promoted", None)
+                card.pop("review_promoted_at", None)
+                card.pop("review_promoted_refs", None)
+                card.pop("verified_by", None)
+                card.pop("verified_at", None)
+                card.pop("verification_evidence", None)
+    unknown = refs - known
+    if unknown:
+        raise HTTPException(422, f"Unknown fact card source_ref: {sorted(unknown)[0]}")
+    for card, source_ref in candidates:
+        if source_ref not in refs:
+            continue
+        evidence = verification_by_ref[source_ref]
+        verification_url = normalized_verification_url(evidence["verification_url"])
+        source_urls = {
+            normalized_verification_url(card.get(key, ""))
+            for key in ("representative_url", "url")
+        }
+        source_urls.update(
+            normalized_verification_url(item.get("url", ""))
+            for item in card.get("evidence", []) if isinstance(item, dict)
+        )
+        source_urls.discard("")
+        hostname = urlparse(verification_url).hostname or ""
+        social_host = any(hostname.lower() == domain or hostname.lower().endswith(f".{domain}")
+                          for domain in ("x.com", "twitter.com", "t.co"))
+        if (not verification_url or len(evidence["verification_note"]) < 4
+                or verification_url in source_urls
+                or social_host):
+            raise HTTPException(422, "事实验证必须提供不同于原帖的一手 URL 和简短说明")
+        card.setdefault("original_status", card.get("status", "two_source_candidate"))
+        card.setdefault("cross_validation_status", card["original_status"])
+        card["status"] = "verified"
+        card["review_promoted"] = True
+        card["review_promoted_at"] = now
+        card["review_promoted_refs"] = [source_ref]
+        card["verified_by"] = "daily_context_reviewer"
+        card["verified_at"] = now
+        card["verification_evidence"] = {
+            **evidence, "verification_url": verification_url,
+            "verified_by": card["verified_by"], "verified_at": now,
+        }
+    return cards
 
 
 @app.post("/api/context/daily/{context_date}/synthesize")
@@ -3569,6 +4125,11 @@ def review_daily_context_run(context_date: str, request: DailyMarketContextIn):
     run = get_daily_context_run_for_date(context_date)
     if run["status"] not in {"needs_review", "approved"}:
         raise HTTPException(409, "Only completed daily context runs can be reviewed")
+    now = int(time.time())
+    reviewed_cards = reviewed_fact_cards(
+        run["raw_cards"] if isinstance(run["raw_cards"], dict) else {},
+        request.verified_fact_card_refs, now, request.fact_verifications,
+    )
     synthesis = json.dumps(
         {
             "market_state": request.market_state,
@@ -3583,18 +4144,18 @@ def review_daily_context_run(context_date: str, request: DailyMarketContextIn):
         },
         ensure_ascii=False,
     )
-    now = int(time.time())
     with db() as conn:
         if run["status"] == "approved":
             conn.execute(
                 """UPDATE post_candidates SET status='superseded',updated_at=?
-                   WHERE id IN (SELECT candidate_id FROM persona_editorial_evaluations WHERE run_id=?)""",
+                   WHERE id IN (SELECT candidate_id FROM persona_editorial_evaluations WHERE run_id=?)
+                     AND source LIKE 'persona_editorial_grok_gemini:%' AND status<>'published'""",
                 (now, run["id"]),
             )
             conn.execute(
                 """UPDATE topic_claim_history SET status='superseded',last_seen_at=?
                    WHERE source IN (
-                     SELECT 'persona_editorial:' || id FROM persona_editorial_evaluations WHERE run_id=?
+                     SELECT 'persona_editorial_grok_gemini:' || id FROM persona_editorial_evaluations WHERE run_id=?
                    )""",
                 (now, run["id"]),
             )
@@ -3607,13 +4168,13 @@ def review_daily_context_run(context_date: str, request: DailyMarketContextIn):
             )
             conn.execute(
                 """UPDATE daily_context_runs
-                   SET synthesis=?,status='needs_review',approved_at=NULL,updated_at=? WHERE id=?""",
-                (synthesis, now, run["id"]),
+                   SET synthesis=?,raw_cards=?,status='needs_review',approved_at=NULL,updated_at=? WHERE id=?""",
+                (synthesis, json.dumps(reviewed_cards, ensure_ascii=False), now, run["id"]),
             )
         else:
             conn.execute(
-                "UPDATE daily_context_runs SET synthesis=?,updated_at=? WHERE id=?",
-                (synthesis, now, run["id"]),
+                "UPDATE daily_context_runs SET synthesis=?,raw_cards=?,updated_at=? WHERE id=?",
+                (synthesis, json.dumps(reviewed_cards, ensure_ascii=False), now, run["id"]),
             )
         row = conn.execute("SELECT * FROM daily_context_runs WHERE id=?", (run["id"],)).fetchone()
     return daily_context_run_dict(row)
@@ -4049,15 +4610,49 @@ def list_persona_post_candidates(persona_id: int):
             """SELECT c.* FROM post_candidates c
                WHERE c.persona_id=?
                  AND NOT (
-                   c.source LIKE 'persona_editorial:%' AND EXISTS (
+                   c.source LIKE 'persona_editorial_grok_gemini:%' AND EXISTS (
                        SELECT 1 FROM persona_editorial_evaluations e
-                       WHERE ('persona_editorial:' || e.id)=c.source AND e.status<>'WRITE'
+                       WHERE ('persona_editorial_grok_gemini:' || e.id)=c.source AND e.status<>'WRITE'
                    )
                  )
                ORDER BY c.context_date DESC, c.id DESC""",
             (persona_id,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+@app.post("/api/persona-editorial-evaluations/{evaluation_id}/retry")
+def retry_persona_editorial_evaluation(evaluation_id: int):
+    with db() as conn:
+        row = conn.execute(
+            """SELECT e.id,e.status,e.reason_code,e.candidate_id,r.status run_status,
+                      c.status candidate_status,c.source candidate_source
+               FROM persona_editorial_evaluations e
+               JOIN daily_context_runs r ON r.id=e.run_id
+               LEFT JOIN post_candidates c ON c.id=e.candidate_id WHERE e.id=?""",
+            (evaluation_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Editorial evaluation not found")
+        if row["run_status"] != "approved":
+            raise HTTPException(409, "Editorial context is not approved")
+        if row["reason_code"] not in {
+            "formal_generation_retryable", "formal_generation_retry_exhausted"
+        }:
+            raise HTTPException(409, "Editorial evaluation is not retryable")
+        if row["candidate_status"] == "published" or str(row["candidate_source"] or "").startswith(
+            "persona_editorial_grok_gemini:"
+        ):
+            raise HTTPException(409, "Editorial evaluation is not retryable")
+        now = int(time.time())
+        conn.execute(
+            """UPDATE persona_editorial_evaluations
+               SET status='WRITE',generation_attempts=0,next_retry_at=NULL,
+                   reason_code='formal_generation_manual_retry',rationale='人工复位正式生成重试。',updated_at=?
+               WHERE id=?""",
+            (now, evaluation_id),
+        )
+    return {"id": evaluation_id, "status": "WRITE", "generation_attempts": 0, "next_retry_at": None}
 
 
 @app.get("/api/personas/{persona_id}")
@@ -4282,16 +4877,14 @@ def queued_post_rows(conn):
     return conn.execute(
         """SELECT c.*,p.slug persona_slug,p.name persona_name,p.avatar
            FROM post_candidates c JOIN personas p ON p.id=c.persona_id
-           WHERE c.status='needs_review' AND (
-               c.source LIKE 'initial_batch:%' OR (
-                   c.source LIKE 'persona_editorial:%' AND EXISTS (
-                       SELECT 1 FROM persona_editorial_evaluations e
-                       JOIN daily_context_runs r ON r.id=e.run_id
-                       WHERE ('persona_editorial:' || e.id)=c.source
-                         AND e.status='WRITE' AND r.status='approved'
-                   )
-               )
-           )
+           WHERE c.status='needs_review'
+             AND c.source LIKE 'persona_editorial_grok_gemini:%'
+             AND EXISTS (
+                 SELECT 1 FROM persona_editorial_evaluations e
+                 JOIN daily_context_runs r ON r.id=e.run_id
+                 WHERE ('persona_editorial_grok_gemini:' || e.id)=c.source
+                   AND e.status='WRITE' AND r.status='approved'
+             )
            ORDER BY c.persona_id,c.created_at,c.id"""
     ).fetchall()
 
@@ -4377,6 +4970,7 @@ INDEX_HTML = """<!doctype html><meta charset="utf-8"><meta name="viewport" conte
 <main id="result" class="queue"><div class="queued">正在读取队列…</div></main>
 <script>
 const base='__BASE_URL__',result=document.querySelector('#result');
+async function writeApi(path,options={}){const headers={...(options.headers||{})},request=()=>fetch(base+path,{...options,headers});if(sessionStorage.getItem('xops_operator_token'))headers['X-Ops-Token']=sessionStorage.getItem('xops_operator_token');let response=await request();if(response.status===401){const token=prompt('请输入 Operator Token');if(token){sessionStorage.setItem('xops_operator_token',token);headers['X-Ops-Token']=token;response=await request()}}return response}
 async function load(){
   try{
     const response=await fetch(base+'/api/daily-posts'),items=await response.json();
@@ -4398,7 +4992,7 @@ async function load(){
       const title=document.createElement('div');title.className='title';title.textContent=x.title;content.append(title);
       const body=document.createElement('div');body.textContent=x.body;content.append(body);
       const note=document.createElement('div');note.className='note';note.textContent=x.image_note;content.append(note);
-      if(x.is_head){const done=document.createElement('button');done.className='done';done.textContent='已发，下一条';done.onclick=async()=>{done.disabled=true;done.textContent='处理中…';try{const marked=await fetch(base+`/api/post-candidates/${x.id}/published`,{method:'POST'});if(!marked.ok){const error=await marked.json();throw new Error(error.detail||'更新失败')}await load()}catch(error){done.disabled=false;done.textContent='已发，下一条';alert(error.message)}};content.append(done)}
+      if(x.is_head){const done=document.createElement('button');done.className='done';done.textContent='已发，下一条';done.onclick=async()=>{done.disabled=true;done.textContent='处理中…';try{const marked=await writeApi(`/api/post-candidates/${x.id}/published`,{method:'POST'});if(!marked.ok){const error=await marked.json();throw new Error(error.detail||'更新失败')}await load()}catch(error){done.disabled=false;done.textContent='已发，下一条';alert(error.message)}};content.append(done)}
       else{const waiting=document.createElement('span');waiting.className='waiting';waiting.textContent='排队中';content.append(waiting)}
       card.append(content);tweets.append(card);
       });

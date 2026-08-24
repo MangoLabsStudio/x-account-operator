@@ -72,7 +72,7 @@
     let personas=[],current=null,draft=null,editorialContext=null,dirty=false;
     const editorialKeys=['life_context','thought_threads','expression_debt','real_feedback'];
     const $=selector=>document.querySelector(selector),$$=selector=>[...document.querySelectorAll(selector)];
-    const api=async(path,options={})=>{const response=await fetch(base+path,{cache:'no-store',headers:{'content-type':'application/json'},...options});if(!response.ok)throw new Error((await response.json()).detail||'请求失败');return response.json()};
+    const api=async(path,options={})=>{const write=!['GET','HEAD','OPTIONS'].includes((options.method||'GET').toUpperCase()),headers={'content-type':'application/json',...(options.headers||{})};const request=()=>fetch(base+path,{cache:'no-store',...options,headers});if(write&&sessionStorage.getItem('xops_operator_token'))headers['X-Ops-Token']=sessionStorage.getItem('xops_operator_token');let response=await request();if(write&&response.status===401){const token=prompt('请输入 Operator Token');if(token){sessionStorage.setItem('xops_operator_token',token);headers['X-Ops-Token']=token;response=await request()}}if(!response.ok)throw new Error((await response.json()).detail||'请求失败');return response.json()};
     const assetUrl=url=>url?base+url:'';
     const esc=value=>String(value??'').replace(/[&<>"]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[char]));
     const getPath=(object,path)=>path.split('.').reduce((value,key)=>value?.[key],object)??'';
