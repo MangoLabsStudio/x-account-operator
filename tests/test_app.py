@@ -106,6 +106,14 @@ class AppTest(unittest.TestCase):
             )
         return cursor.lastrowid
 
+    def run_editorial_pipeline(self, run_id):
+        with self.app_module.db() as conn:
+            context_date = conn.execute(
+                "SELECT context_date FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()[0]
+        with patch.object(self.app_module, "shanghai_today", return_value=context_date):
+            return asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+
     @staticmethod
     def editorial_decision(topic, status, *, claim_key="", core_claim="", score=4, why_me="人设有明确观察角度"):
         return {
@@ -293,7 +301,7 @@ class AppTest(unittest.TestCase):
         with patch.dict(os.environ, {"XOPS_DAILY_POST_ENABLED": "true"}), patch.object(
             self.app_module, "evaluate_persona_editorial", evaluator
         ), patch.object(self.app_module, "generate_persona_post", generated):
-            self.assertEqual(asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id)), [])
+            self.assertEqual(self.run_editorial_pipeline(run_id), [])
         evaluator.assert_not_awaited()
         generated.assert_not_awaited()
         with self.app_module.db() as conn:
@@ -320,7 +328,7 @@ class AppTest(unittest.TestCase):
         }), patch.object(self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)), patch.object(
             self.app_module, "generate_persona_post", generated
         ), patch.object(self.app_module, "publish_persona", side_effect=AssertionError("pipeline must never publish")):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
 
         self.assertEqual(generated.await_count, 1)
         with self.app_module.db() as conn:
@@ -333,6 +341,47 @@ class AppTest(unittest.TestCase):
                 "SELECT claim_key FROM topic_claim_history WHERE claim_key LIKE 'persona:%'"
             ).fetchall()
             self.assertEqual(len(claims), 1)
+
+    def test_multiple_distinct_writes_same_persona_are_all_kept(self):
+        topics = [
+            {
+                "claim_key": "security-topic", "subject": "安全", "title": "协议安全变化",
+                "core_claim": "公共安全题", "eligible": True,
+            },
+            {
+                "claim_key": "market-topic", "subject": "市场", "title": "市场结构变化",
+                "core_claim": "公共市场题", "eligible": True,
+            },
+        ]
+        run_id = self.create_editorial_run("2026-08-26", topics=topics)
+        generated = AsyncMock(return_value={"post": "独立候选正文"})
+
+        async def evaluator(_persona, _context, _daily, input_topics, _history, _today_count):
+            return {
+                **self.editorial_decision(
+                    input_topics[0], "WRITE", claim_key="security-thesis",
+                    core_claim="安全变化会先影响协议方的响应节奏。",
+                ),
+                **self.editorial_decision(
+                    input_topics[1], "WRITE", claim_key="market-thesis",
+                    core_claim="市场变化会先影响流动性结构。",
+                ),
+            }
+
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            self.run_editorial_pipeline(run_id)
+
+        self.assertEqual(generated.await_count, 2)
+        with self.app_module.db() as conn:
+            statuses = [row[0] for row in conn.execute(
+                "SELECT status FROM persona_editorial_evaluations WHERE run_id=? ORDER BY id", (run_id,)
+            ).fetchall()]
+            self.assertEqual(statuses, ["WRITE", "WRITE"])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 2)
 
     def test_editorial_same_claim_has_one_winner_but_different_claims_can_coexist(self):
         topic = {
@@ -358,7 +407,7 @@ class AppTest(unittest.TestCase):
         }), patch.object(self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)), patch.object(
             self.app_module, "generate_persona_post", generated
         ):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
 
         self.assertEqual(generated.await_count, 2)
         with self.app_module.db() as conn:
@@ -387,8 +436,8 @@ class AppTest(unittest.TestCase):
         }), patch.object(self.app_module, "evaluate_persona_editorial", evaluator), patch.object(
             self.app_module, "generate_persona_post", generated
         ):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
+            self.run_editorial_pipeline(run_id)
         evaluator.assert_not_awaited()
         self.assertEqual(generated.await_count, 1)
         with self.app_module.db() as conn:
@@ -413,7 +462,7 @@ class AppTest(unittest.TestCase):
         with patch.dict(os.environ, env), patch.object(
             self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
         ), patch.object(self.app_module, "generate_persona_post", generated):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
             self.app_module.save_daily_context(
                 "2026-08-25",
                 self.app_module.DailyMarketContextIn(
@@ -421,7 +470,7 @@ class AppTest(unittest.TestCase):
                     evidence="新增可核验事实", unknowns="", raw_feed="", sources=[],
                 ),
             )
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
         self.assertEqual(len(calls), 2)
         self.assertEqual(generated.await_count, 2)
 
@@ -512,6 +561,20 @@ class AppTest(unittest.TestCase):
             self.assertEqual(asyncio.run(self.app_module.run_persona_editorial_pipeline()), [])
         evaluator.assert_not_awaited()
 
+    def test_explicit_historical_run_does_not_backfill_new_evaluations(self):
+        run_id = self.create_editorial_run("2020-01-03")
+        evaluator = AsyncMock(side_effect=AssertionError("historical runs must not be evaluated"))
+        generated = AsyncMock(side_effect=AssertionError("historical runs must not generate new drafts"))
+        with patch.dict(os.environ, {"XOPS_DAILY_POST_ENABLED": "true"}), patch.object(
+            self.app_module, "evaluate_persona_editorial", evaluator
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            self.assertEqual(asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id)), [])
+        evaluator.assert_not_awaited()
+        generated.assert_not_awaited()
+        with self.app_module.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM persona_editorial_evaluations").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 0)
+
     def test_editorial_reapproval_updates_formal_context(self):
         context_date = "2026-08-19"
         self.create_editorial_run(context_date, market_state="第一次批准")
@@ -544,7 +607,7 @@ class AppTest(unittest.TestCase):
         }), patch.object(
             self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
         ), patch.object(self.app_module, "generate_persona_post", generated):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
         self.assertEqual(generated.await_count, 1)
         with self.app_module.db() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)
@@ -598,6 +661,43 @@ class AppTest(unittest.TestCase):
         with self.app_module.db() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)
 
+    def test_pending_recovery_arbitrates_collisions_before_generation(self):
+        context_date = "2020-01-04"
+        topic = {
+            "claim_key": "recovery-collision", "subject": "恢复", "title": "恢复撞题",
+            "core_claim": "公共恢复题", "eligible": True,
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+        self.insert_pending_editorial_write(
+            run_id, context_date, topic, slug="acheng",
+            claim_key="same-recovery-claim", core_claim="第一种措辞",
+        )
+        self.insert_pending_editorial_write(
+            run_id, context_date, topic, slug="ridehail-driver-zhao",
+            claim_key="same-recovery-claim", core_claim="第二种措辞",
+        )
+        evaluator = AsyncMock(side_effect=AssertionError("historical recovery must not evaluate"))
+        generated = AsyncMock(return_value={"post": "只生成仲裁赢家"})
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true",
+            "XOPS_DAILY_POST_PERSONAS": "acheng,ridehail-driver-zhao",
+        }), patch.object(self.app_module, "evaluate_persona_editorial", evaluator), patch.object(
+            self.app_module, "generate_persona_post", generated
+        ):
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+
+        evaluator.assert_not_awaited()
+        self.assertEqual(generated.await_count, 1)
+        with self.app_module.db() as conn:
+            decisions = [tuple(row) for row in conn.execute(
+                "SELECT status,reason_code FROM persona_editorial_evaluations WHERE run_id=? ORDER BY id",
+                (run_id,),
+            ).fetchall()]
+            self.assertEqual(sum(status == "WRITE" for status, _reason in decisions), 1)
+            self.assertIn(("HOLD", "cross_persona_collision"), decisions)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)
+
     def test_later_claim_memory_supersedes_older_pending_duplicate(self):
         old_date = "2026-08-01"
         new_date = "2026-08-02"
@@ -627,7 +727,7 @@ class AppTest(unittest.TestCase):
         }), patch.object(
             self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
         ), patch.object(self.app_module, "generate_persona_post", generated):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(new_run))
+            self.run_editorial_pipeline(new_run)
             asyncio.run(self.app_module.run_persona_editorial_pipeline())
         self.assertEqual(generated.await_count, 1)
         with self.app_module.db() as conn:
@@ -666,7 +766,7 @@ class AppTest(unittest.TestCase):
         }), patch.object(
             self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
         ), patch.object(self.app_module, "generate_persona_post", generated):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
         self.assertEqual(generated.await_count, 1)
         self.assertIn("新市场状态", generated.await_args.args[1].facts)
         self.assertNotIn("旧市场状态", generated.await_args.args[1].facts)
@@ -697,7 +797,7 @@ class AppTest(unittest.TestCase):
         ), patch.object(
             self.app_module, "generate_persona_post", AsyncMock(return_value={"post": "第一次草稿"})
         ):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
         self.assertEqual(self.client.get("/api/daily-post").status_code, 200)
         reviewed = self.client.put(
             f"/api/context/daily-runs/{context_date}/review",
@@ -735,7 +835,7 @@ class AppTest(unittest.TestCase):
         with patch.dict(os.environ, env), patch.object(
             self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
         ), patch.object(self.app_module, "generate_persona_post", generated):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
             daily = self.client.get(f"/api/context/daily/{context_date}").json()
             reviewed = self.client.put(
                 f"/api/context/daily-runs/{context_date}/review",
@@ -747,7 +847,7 @@ class AppTest(unittest.TestCase):
             approved = self.client.post(f"/api/context/daily-runs/{context_date}/approve")
             self.assertEqual(approved.status_code, 200)
             self.assertEqual(approved.json()["approval_revision"], 1)
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
         self.assertEqual(len(calls), 2)
         self.assertEqual(generated.await_count, 2)
         with self.app_module.db() as conn:
@@ -784,7 +884,7 @@ class AppTest(unittest.TestCase):
         }), patch.object(
             self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
         ), patch.object(self.app_module, "generate_persona_post", AsyncMock(side_effect=generated)):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
         with self.app_module.db() as conn:
             evaluation = conn.execute(
                 "SELECT status,reason_code FROM persona_editorial_evaluations WHERE run_id=?", (run_id,)
@@ -841,7 +941,7 @@ class AppTest(unittest.TestCase):
         }), patch.object(
             self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
         ), patch.object(self.app_module, "generate_persona_post", generated):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
         facts = generated.await_args.args[1].facts
         self.assertLessEqual(len(facts), 8000)
         self.assertIsInstance(json.loads(facts), dict)
@@ -868,7 +968,7 @@ class AppTest(unittest.TestCase):
         }), patch.object(
             self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
         ), patch.object(self.app_module, "generate_persona_post", generated):
-            asyncio.run(self.app_module.run_persona_editorial_pipeline(run_id))
+            self.run_editorial_pipeline(run_id)
         self.assertEqual(generated.await_count, 2)
         with self.app_module.db() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)

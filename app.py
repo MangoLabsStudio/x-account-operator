@@ -1954,7 +1954,6 @@ def validate_persona_editorial_decisions(result, topics: list[dict]):
         raise ValueError("人设编辑评估不是 decisions 数组")
     allowed = {str(item.get("claim_key", "")): item for item in topics if isinstance(item, dict)}
     decisions = {}
-    write_count = 0
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -1977,8 +1976,6 @@ def validate_persona_editorial_decisions(result, topics: list[dict]):
                 status = "HOLD"
             elif not EDITORIAL_CLAIM_KEY.fullmatch(claim_key):
                 status = "HOLD"
-            else:
-                write_count += 1
         decisions[topic_key] = {
             "status": status,
             **scores,
@@ -1997,15 +1994,6 @@ def validate_persona_editorial_decisions(result, topics: list[dict]):
             "open_loop": str(item.get("open_loop", "")).strip(),
             "topic_claim_key": topic_key,
         }
-    # A persona may only receive one strongest draft from one evaluation pass.
-    if write_count > 1:
-        writes = sorted(
-            (item for item in decisions.values() if item["status"] == "WRITE"),
-            key=lambda item: (-editorial_score(item), item["claim_key"], item["topic_claim_key"]),
-        )
-        for item in writes[1:]:
-            item["status"] = "HOLD"
-            item["reason_code"] = "not_strongest_for_persona"
     for topic in topics:
         key = str(topic.get("claim_key", ""))
         if key not in decisions:
@@ -2060,7 +2048,7 @@ async def evaluate_persona_editorial(persona: dict, persona_context: dict, daily
         "逐题独立判断：notice/authority/tension/marginal_value 均为 0-5 整数；"
         "status 只能 WRITE/HOLD/IGNORE；why_me 说明为什么该人设此刻有资格说；"
         "WRITE 必须有新的 claim_key 和非显而易见 core_claim。HOLD 是内部状态，不是正文，绝不以等待后续凑稿。"
-        "一轮最多 WRITE 一题；没有足够强的判断就全部 HOLD 或 IGNORE。"
+        "逐题独立决定，可有多条 WRITE，也可以全部 HOLD 或 IGNORE；不设数量上下限。"
         "同一热点只有不同核心主张才值得写；不要复述常识、冷门机制或已覆盖的主张。"
         "today_accepted_count 不是配额，0 合法；数量越高越要求更强的边际价值。"
         "不编造持仓、经历、交易、收益或事实。\n\n"
@@ -2417,6 +2405,7 @@ async def recover_pending_persona_editorial_candidates(run_id: int | None = None
         ).fetchall()
     recovered = []
     for row in rows:
+        resolve_persona_editorial_collisions(row["run_id"])
         await generate_pending_persona_editorial_candidates(row["run_id"], row["context_date"])
         recovered.append(row["run_id"])
     return recovered
@@ -2436,7 +2425,9 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
             ).fetchall()
         else:
             runs = conn.execute(
-                "SELECT * FROM daily_context_runs WHERE id=? AND status='approved'", (run_id,)
+                """SELECT * FROM daily_context_runs
+                   WHERE id=? AND status='approved' AND context_date=?""",
+                (run_id, shanghai_today()),
             ).fetchall()
     for run_row in runs:
         run = daily_context_run_dict(run_row)
