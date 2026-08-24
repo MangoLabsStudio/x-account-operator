@@ -2997,7 +2997,7 @@ async def enrich_persona_editorial_context(topic: dict, verified_facts: dict, da
         f"可写成事实的已核材料（仅这些）：{json.dumps(verified_facts, ensure_ascii=False)}\n"
         f"已批准市场 Context（仅作背景）：{json.dumps(research_daily, ensure_ascii=False)}"
     )
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         from_date = (datetime.fromisoformat(str(daily_context["context_date"])).date() - timedelta(days=1)).isoformat() + "T00:00:00Z"
         response = await client.post(
             provider["base_url"] + "/responses",
@@ -3056,7 +3056,7 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
     )
     if rewrite_instruction:
         prompt += f"\n\n上一稿被编辑否决，按此定向重写：{rewrite_instruction}"
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=240) as client:
         response = await client.post(
             provider["base_url"] + "/chat/completions",
             headers={
@@ -3129,7 +3129,7 @@ async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_
         f"确定性检查：{json.dumps(deterministic_failures, ensure_ascii=False)}\n"
         f"待审稿：{json.dumps(draft, ensure_ascii=False)}"
     )
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=240) as client:
         response = await client.post(
             provider["base_url"] + "/chat/completions",
             headers={
