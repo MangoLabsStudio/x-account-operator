@@ -2574,6 +2574,11 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
         if len(normalized) < 10 or any(phrase in core_claim for phrase in EMPTY_WAITING_PHRASES):
             reject(item, "no_conclusion", "没有形成当前可成立的具体结论。")
             continue
+        angle_text = " ".join(str(item.get(key, "")) for key in required)
+        numeric_text = PROTOCOL_IDENTIFIER_RE.sub("", angle_text)
+        if UNVERIFIED_NUMERIC_ASSERTION_RE.search(numeric_text):
+            reject(item, "unverified_numeric_angle", "角度把 Grok 语境里的未核数字写成了可发布主张。")
+            continue
         generic = {
             normalize_editorial_claim(value) for value in (
                 "投资有风险", "风险和收益并存", "不要盲目跟风", "需要独立思考",
@@ -3113,6 +3118,11 @@ SAFE_FIRST_PERSON_OPINION_LEADS = (
     "我倾向于", "我倾向", "我更关心", "在我看来",
 )
 
+PROTOCOL_IDENTIFIER_RE = re.compile(
+    r"\b(?:ERC|EIP|BEP|BIP|SIP|SIMD|SGP|GP|TIP|CIP|AIP|RIP|CAIP|SLIP|PIP|ZIP)-\d+\b",
+    re.IGNORECASE,
+)
+
 UNVERIFIED_NUMERIC_ASSERTION_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:[$¥￥]\s*)?\d+(?:[.,]\d+)*(?:\s*(?:%|美元|美金|元|万|亿|小时|天|周|月|年|倍|bp|bps))?(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -3461,7 +3471,10 @@ async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_contex
         "必须放进 rejected_angles，不能为了显得丰富而保留。"
         "机会角度必须存在正向参与或计算条件；如果结论只有别做、别追、风险很大，就不要生成。"
         "行业、项目、认知和哲学角度也必须绑定这个母题的具体冲突，不能脱离当天语境讲大道理。"
-        "Grok 只提供语境；不得把其中数字、日期、价格或事件写成已确认事实。"
+        "Grok 只提供语境；title、core_claim、specific_tension、non_obvious_delta、audience_value 和"
+        "why_worth_saying 中都不得出现从 Grok 得到的数字、日期、价格、比例或已发生事件断言。"
+        "把它们改写成不依赖未核事实的观点或条件判断，例如说‘判断是否形成长尾网络，要看收入是否仍集中在头部’，"
+        "而不是复述一个未经批准的占比。"
         "rejected_angles 每项包含 parent_seed_key,title,core_claim,reason_code,reason。"
         "每个输入母题必须至少有一条合格 angle，或在 rejected_angles 中用 no_worthwhile_angle 明确说明零产出；"
         "漏掉母题会让整批失败重试。\n\n"
@@ -3732,7 +3745,8 @@ def deterministic_editorial_style_failures(post: str, writer_context: dict, veri
         failures.append("用等待或观察句替代当前结论")
     if unauthorized_first_person_experience(text, writer_context):
         failures.append("虚构或未授权的第一人称经历")
-    if verified_facts is not None and not verified_facts.get("facts") and UNVERIFIED_NUMERIC_ASSERTION_RE.search(text):
+    numeric_text = PROTOCOL_IDENTIFIER_RE.sub("", text)
+    if verified_facts is not None and not verified_facts.get("facts") and UNVERIFIED_NUMERIC_ASSERTION_RE.search(numeric_text):
         failures.append("无已核事实时出现数字、日期或价格式断言")
     boilerplate = ("结论很明确", "我的结论很简单", "我的结论很直白", "本质上", "值得注意的是", "核心逻辑", "一方面", "另一方面", "显而易见", "大家都知道")
     if any(phrase in text for phrase in boilerplate) or re.search(r"^\s*不是.{1,30}而是", text):

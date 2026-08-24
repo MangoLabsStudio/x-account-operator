@@ -668,6 +668,40 @@ class AppTest(unittest.TestCase):
             {"semantic_duplicate", "no_conclusion"},
         )
 
+    def test_angle_expansion_rejects_unverified_numbers_but_allows_protocol_ids(self):
+        mothers = self.app_module.editorial_mother_topics({
+            "selected_topics": [self.mother_topic()]
+        })
+        safe = self.expanded_angle(
+            "discussion:btc", "protocol-ids-angle",
+            core_claim=(
+                "TermMax S1、x402、L2、ERC-20、EIP-1559、GP-0003、SIMD-0096 和 BEP-20 的竞争重点"
+                "正在从概念转向产品分发。"
+            ),
+        )
+        numeric = [
+            self.expanded_angle(
+                "discussion:btc", "numeric-count-angle",
+                core_claim="这个市场已有 204 万持有人，头部占比达到 77%。",
+            ),
+            self.expanded_angle(
+                "discussion:btc", "numeric-apy-angle", core_claim="这个活动的 APY 是 12%。",
+            ),
+            self.expanded_angle(
+                "discussion:btc", "numeric-date-angle", core_claim="这个产品将在 2026 年上线。",
+            ),
+            self.expanded_angle(
+                "discussion:btc", "numeric-price-angle", core_claim="这个资产已经涨到 $120。",
+            ),
+        ]
+        topics, rejected = self.app_module.bounded_editorial_angles(
+            {"angles": [safe, *numeric], "rejected_angles": []}, mothers, [],
+        )
+        self.assertEqual([item["claim_key"] for item in topics], ["protocol-ids-angle"])
+        self.assertEqual(
+            [item["reason_code"] for item in rejected], ["unverified_numeric_angle"] * 4,
+        )
+
     def test_ready_angle_expansion_resumes_without_researching(self):
         parent = self.mother_topic()
         run_id = self.create_editorial_run("2026-08-21", topics=[parent])
@@ -1674,7 +1708,8 @@ class AppTest(unittest.TestCase):
 
     def test_unverified_numeric_gate_allows_protocol_identifiers_only(self):
         identifiers = (
-            "TermMax S1 和 x402 都是具体对象，L2 也是协议语境中的标识。这里讨论的是参与方式和产品结构，"
+            "TermMax S1、x402、L2、ERC-20、EIP-1559、GP-0003、SIMD-0096 和 BEP-20 都是协议语境中的标识。"
+            "这里讨论的是参与方式和产品结构，"
             "没有把价格、比例、日期或数量写成已经确认的市场事实，因此仍然可以进入主编审核。"
         )
         self.assertNotIn(
