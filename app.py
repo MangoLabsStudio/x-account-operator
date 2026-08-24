@@ -3353,7 +3353,7 @@ async def research_editorial_angle_context_grok_batch(mother_topics: list[dict],
                     {"type": "x_search", "from_date": from_date},
                     {"type": "web_search"},
                 ],
-                "max_output_tokens": 4500,
+                "max_output_tokens": 1600 if len(mother_topics) == 1 else 3000,
             },
         )
         response.raise_for_status()
@@ -3394,22 +3394,35 @@ async def research_editorial_angle_context_grok_batch(mother_topics: list[dict],
 
 
 async def research_editorial_angle_context_grok(mother_topics: list[dict], daily_context: dict):
-    """Research the approved slate in small batches before any persona sees it."""
-    batches = [mother_topics[index:index + 3] for index in range(0, len(mother_topics), 3)]
-    if len(batches) == 1:
-        return await research_editorial_angle_context_grok_batch(batches[0], daily_context)
-    semaphore = asyncio.Semaphore(2)
+    """Research each mother independently so one slow topic cannot block the slate."""
+    batches = [[topic] for topic in mother_topics]
+    semaphore = asyncio.Semaphore(3)
 
     async def research_batch(batch):
         async with semaphore:
             return await research_editorial_angle_context_grok_batch(batch, daily_context)
 
-    results = await asyncio.gather(
+    first_results = await asyncio.gather(
         *(research_batch(batch) for batch in batches), return_exceptions=True
     )
-    errors = [result for result in results if isinstance(result, Exception)]
-    if errors:
-        raise RuntimeError(f"Grok 母题分批研究失败: {errors[0]}") from errors[0]
+    failed_indexes = [
+        index for index, result in enumerate(first_results) if isinstance(result, Exception)
+    ]
+    if failed_indexes:
+        retry_results = await asyncio.gather(
+            *(research_batch(batches[index]) for index in failed_indexes),
+            return_exceptions=True,
+        )
+        for index, result in zip(failed_indexes, retry_results):
+            first_results[index] = result
+    results = [result for result in first_results if not isinstance(result, Exception)]
+    failed_seed_keys = [
+        str(batches[index][0]["seed_key"])
+        for index, result in enumerate(first_results) if isinstance(result, Exception)
+    ]
+    if not results:
+        error = next(result for result in first_results if isinstance(result, Exception))
+        raise RuntimeError(f"Grok 所有母题研究均失败: {error}") from error
     contexts, citations, tool_usage = [], [], set()
     for result in results:
         contexts.extend(result["contexts"])
@@ -3426,6 +3439,7 @@ async def research_editorial_angle_context_grok(mother_topics: list[dict], daily
         "model": results[0].get("model", ""),
         "context_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
         "batches": len(batches),
+        "failed_seed_keys": failed_seed_keys,
     }
 
 
@@ -3599,9 +3613,24 @@ async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict
             if not persist_editorial_angle_expansion(run_id, input_hash, attempt_token, working):
                 return None
         history = recent_topic_claims()
-        result = await expand_editorial_angles_gemini(mothers, daily, research, history)
+        failed_seed_keys = set(research.get("failed_seed_keys", []))
+        researched_mothers = [
+            mother for mother in mothers if mother["seed_key"] not in failed_seed_keys
+        ]
+        result = await expand_editorial_angles_gemini(
+            researched_mothers, daily, research, history
+        )
         model = str(result.pop("_model", ""))
-        expanded, rejected = bounded_editorial_angles(result, mothers, history)
+        expanded, rejected = bounded_editorial_angles(result, researched_mothers, history)
+        for mother in mothers:
+            if mother["seed_key"] in failed_seed_keys:
+                rejected.append({
+                    "parent_seed_key": mother["seed_key"],
+                    "title": mother["title"],
+                    "core_claim": "",
+                    "reason_code": "context_unavailable",
+                    "reason": "Grok 两次实时研究均失败，本轮不让模型凭常识补写。",
+                })
     except (HTTPException, httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, RuntimeError) as error:
         attempts = working["attempts"] + 1
         exhausted = attempts >= EDITORIAL_ANGLE_MAX_ATTEMPTS

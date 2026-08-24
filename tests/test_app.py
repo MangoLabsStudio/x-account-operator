@@ -585,6 +585,67 @@ class AppTest(unittest.TestCase):
             self.assertEqual(evaluation["status"], "WRITE")
             self.assertIsNotNone(evaluation["candidate_id"])
 
+    def test_failed_mother_context_does_not_block_other_angles(self):
+        btc = self.mother_topic()
+        sol = {
+            **self.mother_topic("sol-mother", "discussion:sol"),
+            "subject": "Solana",
+            "title": "SOL 供给结构",
+            "source_topic_title": "SOL 供给结构",
+            "source_refs": ["x:sol:1"],
+        }
+        run_id = self.create_editorial_run("2026-08-21", topics=[btc, sol])
+        researched = {
+            "text": "BTC 有实时语境，SOL 查询失败。",
+            "citations": ["https://example.com/btc"],
+            "tool_usage": ["x_search", "web_search"],
+            "model": "grok-test",
+            "failed_seed_keys": ["discussion:sol"],
+        }
+        expanded_mothers = []
+
+        async def expand(mothers, _daily, _research, _history):
+            expanded_mothers.extend(mothers)
+            return {
+                "angles": [self.expanded_angle("discussion:btc", "btc-survives-sol-failure")],
+                "rejected_angles": [],
+                "_model": "gemini-test",
+            }
+
+        async def evaluator(_persona, _context, _daily, topics, _history, _count):
+            return {
+                key: value
+                for topic in topics
+                for key, value in self.editorial_decision(topic, "IGNORE").items()
+            }
+
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(
+            self.app_module, "ensure_editorial_angle_expansion",
+            new=self._real_ensure_editorial_angle_expansion,
+        ), patch.object(
+            self.app_module, "research_editorial_angle_context_grok",
+            AsyncMock(return_value=researched),
+        ), patch.object(
+            self.app_module, "expand_editorial_angles_gemini", AsyncMock(side_effect=expand),
+        ), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator),
+        ):
+            self.run_editorial_pipeline(run_id)
+        self.assertEqual([item["seed_key"] for item in expanded_mothers], ["discussion:btc"])
+        with self.app_module.db() as conn:
+            cards = self.app_module.json_value(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()[0], {})
+        stage = cards["editorial_angle_expansion"]
+        self.assertEqual([item["claim_key"] for item in stage["expanded_topics"]], [
+            "btc-survives-sol-failure"
+        ])
+        self.assertIn("context_unavailable", {
+            item["reason_code"] for item in stage["rejected_angles"]
+        })
+
     def test_angle_expansion_rejects_duplicate_common_knowledge_and_no_conclusion(self):
         parent = self.mother_topic()
         mothers = self.app_module.editorial_mother_topics({"selected_topics": [parent]})
@@ -1521,7 +1582,7 @@ class AppTest(unittest.TestCase):
             self.app_module.httpx, "AsyncClient",
             return_value=FakeAsyncClient(payload(complete), []),
         ):
-            result = asyncio.run(self.app_module.research_editorial_angle_context_grok(
+            result = asyncio.run(self.app_module.research_editorial_angle_context_grok_batch(
                 mothers, {"context_date": "2026-08-24"},
             ))
         self.assertEqual({item["seed_key"] for item in result["contexts"]}, {"seed-a", "seed-b"})
@@ -1532,7 +1593,7 @@ class AppTest(unittest.TestCase):
             return_value=FakeAsyncClient(payload(complete[:1]), []),
         ):
             with self.assertRaisesRegex(RuntimeError, "逐题覆盖"):
-                asyncio.run(self.app_module.research_editorial_angle_context_grok(
+                asyncio.run(self.app_module.research_editorial_angle_context_grok_batch(
                     mothers, {"context_date": "2026-08-24"},
                 ))
 
@@ -1544,11 +1605,11 @@ class AppTest(unittest.TestCase):
             return_value=FakeAsyncClient(payload(incomplete), []),
         ):
             with self.assertRaisesRegex(RuntimeError, "缺少可用"):
-                asyncio.run(self.app_module.research_editorial_angle_context_grok(
+                asyncio.run(self.app_module.research_editorial_angle_context_grok_batch(
                     mothers, {"context_date": "2026-08-24"},
                 ))
 
-    def test_grok_angle_research_splits_large_slates_into_small_batches(self):
+    def test_grok_angle_research_isolates_each_mother_topic(self):
         mothers = [
             {"seed_key": f"seed-{index}", "subject": str(index), "title": str(index)}
             for index in range(7)
@@ -1572,11 +1633,44 @@ class AppTest(unittest.TestCase):
             result = asyncio.run(self.app_module.research_editorial_angle_context_grok(
                 mothers, {"context_date": "2026-08-24"},
             ))
-        self.assertEqual([len(call.args[0]) for call in batches.await_args_list], [3, 3, 1])
+        self.assertEqual([len(call.args[0]) for call in batches.await_args_list], [1] * 7)
         self.assertEqual({item["seed_key"] for item in result["contexts"]}, {
             item["seed_key"] for item in mothers
         })
-        self.assertEqual(result["batches"], 3)
+        self.assertEqual(result["batches"], 7)
+
+    def test_grok_angle_research_retries_then_reports_only_failed_seed(self):
+        mothers = [
+            {"seed_key": f"seed-{index}", "subject": str(index), "title": str(index)}
+            for index in range(3)
+        ]
+        calls = {}
+
+        async def research_batch(batch, _daily):
+            key = batch[0]["seed_key"]
+            calls[key] = calls.get(key, 0) + 1
+            if key == "seed-1":
+                raise RuntimeError("provider timeout")
+            contexts = [{"seed_key": key}]
+            text = json.dumps({"contexts": contexts}, ensure_ascii=False)
+            return {
+                "text": text,
+                "contexts": contexts,
+                "citations": [f"https://example.com/{key}"],
+                "tool_usage": ["x_search", "web_search"],
+                "model": "grok-test",
+            }
+
+        with patch.object(
+            self.app_module, "research_editorial_angle_context_grok_batch",
+            AsyncMock(side_effect=research_batch),
+        ):
+            result = asyncio.run(self.app_module.research_editorial_angle_context_grok(
+                mothers, {"context_date": "2026-08-24"},
+            ))
+        self.assertEqual(calls, {"seed-0": 1, "seed-1": 2, "seed-2": 1})
+        self.assertEqual(result["failed_seed_keys"], ["seed-1"])
+        self.assertEqual({item["seed_key"] for item in result["contexts"]}, {"seed-0", "seed-2"})
 
     def test_unverified_numeric_gate_allows_protocol_identifiers_only(self):
         identifiers = (
