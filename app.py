@@ -2978,15 +2978,26 @@ async def enrich_persona_editorial_context(topic: dict, verified_facts: dict, da
     if cached:
         return cached
     provider = editorial_provider_config("GROK")
+    research_topic = {
+        key: topic.get(key)
+        for key in ("title", "core_claim", "material_delta", "audience_value", "source_topic_keys")
+        if topic.get(key)
+    }
+    research_daily = {
+        "context_date": daily_context.get("context_date"),
+        "market_state": str(daily_context.get("market_state", ""))[:400],
+        "event_clusters": str(daily_context.get("event_clusters", ""))[:400],
+        "debates": str(daily_context.get("debates", ""))[:400],
+    }
     prompt = (
         "你是中文 Crypto 编辑的实时研究助手。必须各使用一次 X Search 和 Web Search。"
         "用不超过 800 个中文字补齐：圈内前情、当前争议、最强反方、今天为何讨论，并附可追溯 URL。"
         "母池与搜索结果只用于理解语境，不能自动成为事实。不要写成帖子，不要给交易建议。\n\n"
-        f"题目：{json.dumps(topic, ensure_ascii=False)}\n"
+        f"题目：{json.dumps(research_topic, ensure_ascii=False)}\n"
         f"可写成事实的已核材料（仅这些）：{json.dumps(verified_facts, ensure_ascii=False)}\n"
-        f"已批准市场 Context（仅作背景）：{json.dumps(daily_context, ensure_ascii=False)}"
+        f"已批准市场 Context（仅作背景）：{json.dumps(research_daily, ensure_ascii=False)}"
     )
-    async with httpx.AsyncClient(timeout=180) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         from_date = (datetime.fromisoformat(str(daily_context["context_date"])).date() - timedelta(days=1)).isoformat() + "T00:00:00Z"
         response = await client.post(
             provider["base_url"] + "/responses",
@@ -3000,7 +3011,7 @@ async def enrich_persona_editorial_context(topic: dict, verified_facts: dict, da
                     {"type": "x_search", "from_date": from_date},
                     {"type": "web_search"},
                 ],
-                "max_output_tokens": 1200,
+                "max_output_tokens": 1000,
             },
         )
         response.raise_for_status()
