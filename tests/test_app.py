@@ -1058,6 +1058,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(
             [tool["type"] for tool in calls[0]["kwargs"]["json"]["tools"]], ["x_search", "web_search"]
         )
+        self.assertEqual(calls[0]["kwargs"]["json"]["max_output_tokens"], 1200)
 
         self.app_module.EDITORIAL_GROK_CONTEXT_CACHE.clear()
         missing_citation = {"output": [{"type": "x_search_call"}, {"type": "web_search_call"}, {

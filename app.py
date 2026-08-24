@@ -2979,9 +2979,9 @@ async def enrich_persona_editorial_context(topic: dict, verified_facts: dict, da
         return cached
     provider = editorial_provider_config("GROK")
     prompt = (
-        "你是中文 Crypto 编辑的实时研究助手。必须使用 X Search 和 Web Search。"
-        "母池与 X 搜索只证明讨论和观点，不能自动成为事实；请补齐圈内前情、争议、反方、今天为何讨论，"
-        "并附上可追溯 URL。不要写成帖子，不要给交易建议。\n\n"
+        "你是中文 Crypto 编辑的实时研究助手。必须各使用一次 X Search 和 Web Search。"
+        "用不超过 800 个中文字补齐：圈内前情、当前争议、最强反方、今天为何讨论，并附可追溯 URL。"
+        "母池与搜索结果只用于理解语境，不能自动成为事实。不要写成帖子，不要给交易建议。\n\n"
         f"题目：{json.dumps(topic, ensure_ascii=False)}\n"
         f"可写成事实的已核材料（仅这些）：{json.dumps(verified_facts, ensure_ascii=False)}\n"
         f"已批准市场 Context（仅作背景）：{json.dumps(daily_context, ensure_ascii=False)}"
@@ -3000,7 +3000,7 @@ async def enrich_persona_editorial_context(topic: dict, verified_facts: dict, da
                     {"type": "x_search", "from_date": from_date},
                     {"type": "web_search"},
                 ],
-                "max_output_tokens": 3000,
+                "max_output_tokens": 1200,
             },
         )
         response.raise_for_status()
@@ -3052,7 +3052,7 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
             },
             json={
                 "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}, "temperature": 0.8, "max_tokens": 3000,
+                "response_format": {"type": "json_object"}, "temperature": 0.8, "max_tokens": 5000,
             },
         )
         response.raise_for_status()
@@ -3124,7 +3124,7 @@ async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_
             },
             json={
                 "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}, "temperature": 0.2, "max_tokens": 3000,
+                "response_format": {"type": "json_object"}, "temperature": 0.2, "max_tokens": 5000,
             },
         )
         response.raise_for_status()
