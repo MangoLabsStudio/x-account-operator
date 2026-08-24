@@ -538,7 +538,7 @@ class AppTest(unittest.TestCase):
             self.assertEqual(statuses, ["WRITE", "WRITE"])
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 2)
 
-    def test_editorial_same_claim_has_one_winner_but_different_claims_can_coexist(self):
+    def test_editorial_same_public_topic_has_one_winner(self):
         topic = {
             "claim_key": "hot-event",
             "subject": "热点事件",
@@ -564,15 +564,48 @@ class AppTest(unittest.TestCase):
         ):
             self.run_editorial_pipeline(run_id)
 
-        self.assertEqual(generated.await_count, 2)
+        self.assertEqual(generated.await_count, 1)
         with self.app_module.db() as conn:
             decisions = [tuple(row) for row in conn.execute(
                 "SELECT p.slug,e.status,e.reason_code FROM persona_editorial_evaluations e JOIN personas p ON p.id=e.persona_id ORDER BY p.slug"
             ).fetchall()]
             self.assertIn(("acheng", "WRITE", "write"), decisions)
             self.assertIn(("ridehail-driver-zhao", "HOLD", "cross_persona_collision"), decisions)
-            self.assertIn(("college-student-linjia", "WRITE", "write"), decisions)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 2)
+            self.assertIn(("college-student-linjia", "HOLD", "cross_persona_collision"), decisions)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)
+
+    def test_public_topic_has_one_winner_even_when_evaluator_rewrites_claim_key(self):
+        topic = {
+            "claim_key": "one-public-topic", "subject": "热点事件", "title": "热点事件",
+            "core_claim": "公共题单", "eligible": True,
+        }
+        run_id = self.create_editorial_run("2026-08-23", topics=[topic])
+        generated = AsyncMock(return_value={"post": "公共题只保留一个人设的候选正文。"})
+
+        async def evaluator(persona, _context, _daily, topics, _history, _today_count):
+            suffix = "acheng" if persona["slug"] == "acheng" else "zhao"
+            return self.editorial_decision(
+                topics[0], "WRITE", claim_key=f"rewritten-{suffix}",
+                core_claim=f"{suffix} 的独立角度，但都来自同一公共题。",
+                score=5 if suffix == "acheng" else 4,
+            )
+
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true",
+            "XOPS_DAILY_POST_PERSONAS": "acheng,ridehail-driver-zhao",
+        }), patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator)
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            self.run_editorial_pipeline(run_id)
+
+        self.assertEqual(generated.await_count, 1)
+        with self.app_module.db() as conn:
+            rows = conn.execute(
+                "SELECT status,reason_code FROM persona_editorial_evaluations WHERE run_id=? ORDER BY id", (run_id,)
+            ).fetchall()
+            self.assertEqual(sum(row["status"] == "WRITE" for row in rows), 1)
+            self.assertIn(("HOLD", "cross_persona_collision"), [tuple(row) for row in rows])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 1)
 
     def test_editorial_replay_recovers_pending_write_without_re_evaluation(self):
         topic = {
@@ -822,6 +855,51 @@ class AppTest(unittest.TestCase):
             candidate_count = conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0]
         self.assertEqual(tuple(evaluation), ("HOLD", "grok_gemini_critic_reject", None))
         self.assertEqual(candidate_count, 0)
+
+    def test_formal_generation_uses_bounded_concurrency_without_duplicate_candidates(self):
+        context_date = self.app_module.shanghai_today()
+        run_id = self.create_editorial_run(context_date)
+        for index in range(4):
+            topic = {
+                "claim_key": f"parallel-{index}", "title": f"并发题目 {index}",
+                "core_claim": f"并发核心判断 {index}", "eligible": True,
+            }
+            self.insert_pending_editorial_write(
+                run_id, context_date, topic,
+                claim_key=f"parallel-claim-{index}", core_claim=f"并发核心判断 {index}",
+            )
+        active = peak = 0
+
+        async def grok(*_args):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.03)
+            active -= 1
+            return {"text": "并发测试背景。", "citations": [], "tool_usage": ["x_search", "web_search"], "model": "grok-test"}
+
+        writer = AsyncMock(return_value={
+            "text": "这是一条用于验证并发入库边界的完整测试正文，它保持具体判断且不添加外部事实，让测试只验证同一批正式生成不会重复插入候选。这里补足测试语境，确保长度门槛不会把并发边界测试误判成需要重写的内容。",
+            "facts_used_ids": [], "stance": "并发测试判断", "model": "gemini-test",
+        })
+        critic = AsyncMock(return_value={"verdict": "PASS", "reasons": [], "unsupported_claims": [], "rewrite_instruction": ""})
+        with patch.dict(os.environ, {"XOPS_EDITORIAL_GENERATION_CONCURRENCY": "2"}), patch.object(
+            self.app_module, "enrich_persona_editorial_context", AsyncMock(side_effect=grok)
+        ), patch.object(self.app_module, "write_persona_editorial_gemini", writer), patch.object(
+            self.app_module, "critique_persona_editorial_draft", critic
+        ):
+            asyncio.run(self.app_module.generate_pending_persona_editorial_candidates(run_id, context_date))
+            self.assertEqual(self.app_module.editorial_generation_concurrency(), 2)
+        self.assertEqual(peak, 2)
+        self.assertEqual(writer.await_count, 4)
+        with self.app_module.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 4)
+        with patch.dict(os.environ, {"XOPS_EDITORIAL_GENERATION_CONCURRENCY": "bad"}):
+            self.assertEqual(self.app_module.editorial_generation_concurrency(), 3)
+        with patch.dict(os.environ, {"XOPS_EDITORIAL_GENERATION_CONCURRENCY": "0"}):
+            self.assertEqual(self.app_module.editorial_generation_concurrency(), 1)
+        with patch.dict(os.environ, {"XOPS_EDITORIAL_GENERATION_CONCURRENCY": "9"}):
+            self.assertEqual(self.app_module.editorial_generation_concurrency(), 5)
 
     def test_editorial_verified_facts_never_promotes_free_form_or_opinion_basis(self):
         facts = self.app_module.editorial_verified_facts(
@@ -1655,17 +1733,25 @@ class AppTest(unittest.TestCase):
         self.assertIsInstance(json.loads(facts), dict)
 
     def test_editorial_writer_failure_does_not_block_later_candidates(self):
-        topic = {
+        first_topic = {
             "claim_key": "writer-failure", "subject": "失败隔离", "title": "失败隔离",
             "core_claim": "公共主张", "eligible": True,
         }
-        run_id = self.create_editorial_run("2026-08-13", topics=[topic])
+        second_topic = {
+            "claim_key": "writer-later", "subject": "后续候选", "title": "后续候选",
+            "core_claim": "另一条公共主张", "eligible": True,
+        }
+        run_id = self.create_editorial_run("2026-08-13", topics=[first_topic, second_topic])
 
         async def evaluator(persona, _context, _daily, topics, _history, _today_count):
-            return self.editorial_decision(
-                topics[0], "WRITE", claim_key=f"writer-{persona['slug']}",
-                core_claim=f"{persona['slug']} 的独立判断"
-            )
+            write_index = 0 if persona["slug"] == "acheng" else 1
+            return {
+                **self.editorial_decision(
+                    topics[write_index], "WRITE", claim_key=f"writer-{persona['slug']}",
+                    core_claim=f"{persona['slug']} 的独立判断"
+                ),
+                **self.editorial_decision(topics[1 - write_index], "IGNORE"),
+            }
 
         generated = AsyncMock(side_effect=[
             self.app_module.HTTPException(502, "first failed"), {"post": "第二条仍生成"},

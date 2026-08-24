@@ -2560,14 +2560,23 @@ def resolve_persona_editorial_collisions(run_id: int):
             (run_id,),
         ).fetchall()
         items = [dict(row) for row in rows]
+        public_topic_keys = {
+            item["id"]: str(json_value(item["topic_json"], {}).get("claim_key", "")).strip().lower()
+            if str(json_value(item["topic_json"], {}).get("scope", "public")) != "persona" else ""
+            for item in items
+        }
         links = {item["id"]: {item["id"]} for item in items}
         for index, item in enumerate(items):
             item_key = str(item["claim_key"]).strip().lower()
             item_claim = normalize_editorial_claim(item["core_claim"])
             for other in items[index + 1:]:
+                same_public_topic = (
+                    public_topic_keys[item["id"]]
+                    and public_topic_keys[item["id"]] == public_topic_keys[other["id"]]
+                )
                 same_key = item_key and item_key == str(other["claim_key"]).strip().lower()
                 same_claim = item_claim and item_claim == normalize_editorial_claim(other["core_claim"])
-                if same_key or same_claim:
+                if same_public_topic or same_key or same_claim:
                     links[item["id"]].add(other["id"])
                     links[other["id"]].add(item["id"])
         now = int(time.time())
@@ -2585,7 +2594,7 @@ def resolve_persona_editorial_collisions(run_id: int):
             if len(component) < 2:
                 continue
             matches = [by_id[evaluation_id] for evaluation_id in component]
-            matches.sort(key=lambda item: (-editorial_score(item), item["slug"]))
+            matches.sort(key=lambda item: (-editorial_score(item), item["slug"], -item["id"]))
             for item in matches[1:]:
                 losers.add(item["id"])
         for evaluation_id in losers:
@@ -3136,15 +3145,24 @@ async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_
     }
 
 
-async def generate_pending_persona_editorial_candidates(run_id: int, context_date: str):
-    retry_now = int(time.time())
-    with db() as conn:
-        run = conn.execute(
-            "SELECT status,raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
-        ).fetchone()
-        if not run or run["status"] != "approved":
-            return
-        rows = conn.execute(
+def editorial_generation_concurrency() -> int:
+    try:
+        return min(5, max(1, int(os.getenv("XOPS_EDITORIAL_GENERATION_CONCURRENCY", "3"))))
+    except ValueError:
+        return 3
+
+
+async def generate_pending_persona_editorial_candidates(run_id: int, context_date: str,
+                                                         _rows=None, _raw_cards=None):
+    if _rows is None:
+        retry_now = int(time.time())
+        with db() as conn:
+            run = conn.execute(
+                "SELECT status,raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if not run or run["status"] != "approved":
+                return
+            rows = conn.execute(
             """SELECT e.*,p.slug,p.name,p.draft FROM persona_editorial_evaluations e
                JOIN personas p ON p.id=e.persona_id
                WHERE e.run_id=? AND e.status='WRITE'
@@ -3159,8 +3177,19 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                )
                ORDER BY e.id""",
             (run_id, retry_now),
-        ).fetchall()
-        raw_cards = json_value(run["raw_cards"], {})
+            ).fetchall()
+            raw_cards = json_value(run["raw_cards"], {})
+        semaphore = asyncio.Semaphore(editorial_generation_concurrency())
+
+        async def generate_one(row):
+            async with semaphore:
+                await generate_pending_persona_editorial_candidates(
+                    run_id, context_date, [row], raw_cards
+                )
+
+        await asyncio.gather(*(generate_one(row) for row in rows))
+        return
+    rows, raw_cards = _rows, _raw_cards
     for row in rows:
         evaluation = dict(row)
         source = persona_editorial_candidate_source(evaluation["id"])
