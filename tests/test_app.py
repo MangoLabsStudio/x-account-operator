@@ -537,6 +537,62 @@ class AppTest(unittest.TestCase):
         self.assertEqual(queue[0]["body"], "只有真实候选会出现。")
         self.assertNotIn("queued", [item["status"] for item in queue])
 
+    def test_daily_posts_api_includes_review_only_initial_batch(self):
+        context_date = self.app_module.shanghai_today()
+        with self.app_module.db() as conn:
+            persona = conn.execute("SELECT id FROM personas WHERE slug='acheng'").fetchone()
+            now = int(time.time())
+            conn.execute(
+                """INSERT INTO post_candidates(
+                    persona_id,context_date,title,body,status,source,notes,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    persona["id"], context_date, "首批观点", "首批待审正文。", "needs_review",
+                    f"initial_batch:{context_date}:evergreen-01", "未发布", now, now,
+                ),
+            )
+        queue = self.client.get("/api/daily-posts").json()
+        latest = self.client.get("/api/daily-post")
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["body"], "首批待审正文。")
+        self.assertEqual(queue[0]["status"], "needs_review")
+        self.assertEqual(latest.status_code, 200)
+        self.assertEqual(latest.json()["source"], f"initial_batch:{context_date}:evergreen-01")
+
+    def test_initial_batch_import_is_review_only_and_idempotent(self):
+        from scripts import import_initial_drafts
+
+        batch_dir = Path(self.temp.name) / "batch"
+        batch_dir.mkdir()
+        items = []
+        for index in range(1, 4):
+            items.append({
+                "slot": f"news-{index:02d}", "kind": "news", "topic": f"时事 {index}",
+                "body": f"时事待审正文 {index}", "sources": ["https://example.com/news"],
+            })
+        for index in range(1, 8):
+            items.append({
+                "slot": f"evergreen-{index:02d}", "kind": "evergreen", "topic": f"观点 {index}",
+                "body": f"观点待审正文 {index}", "sources": [],
+            })
+        (batch_dir / "acheng.json").write_text(
+            json.dumps(items, ensure_ascii=False), encoding="utf-8"
+        )
+
+        first = import_initial_drafts.import_batch(batch_dir, self.app_module.shanghai_today())
+        second = import_initial_drafts.import_batch(batch_dir, self.app_module.shanghai_today())
+
+        self.assertEqual(first, {"personas": 1, "drafts": 10, "inserted": 10})
+        self.assertEqual(second["inserted"], 0)
+        with self.app_module.db() as conn:
+            rows = conn.execute(
+                "SELECT status,source,notes FROM post_candidates ORDER BY id"
+            ).fetchall()
+        self.assertEqual(len(rows), 10)
+        self.assertTrue(all(row["status"] == "needs_review" for row in rows))
+        self.assertTrue(all(row["source"].startswith("initial_batch:") for row in rows))
+        self.assertTrue(all(json.loads(row["notes"])["published"] is False for row in rows))
+
     def test_editorial_fingerprint_tracks_semantic_inputs_only(self):
         with self.app_module.db() as conn:
             persona = dict(conn.execute(

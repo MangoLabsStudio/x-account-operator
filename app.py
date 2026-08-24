@@ -4268,11 +4268,15 @@ def get_daily_post():
         row = conn.execute(
             """SELECT c.*,p.slug persona_slug,p.name persona_name
                FROM post_candidates c JOIN personas p ON p.id=c.persona_id
-               WHERE c.source LIKE 'persona_editorial:%' AND EXISTS (
-                   SELECT 1 FROM persona_editorial_evaluations e
-                   JOIN daily_context_runs r ON r.id=e.run_id
-                   WHERE ('persona_editorial:' || e.id)=c.source
-                     AND e.status='WRITE' AND r.status='approved'
+               WHERE c.status<>'superseded' AND (
+                   c.source LIKE 'initial_batch:%' OR (
+                       c.source LIKE 'persona_editorial:%' AND EXISTS (
+                           SELECT 1 FROM persona_editorial_evaluations e
+                           JOIN daily_context_runs r ON r.id=e.run_id
+                           WHERE ('persona_editorial:' || e.id)=c.source
+                             AND e.status='WRITE' AND r.status='approved'
+                       )
+                   )
                )
                ORDER BY c.context_date DESC,c.updated_at DESC LIMIT 1"""
         ).fetchone()
@@ -4297,12 +4301,15 @@ def get_daily_posts():
         rows = conn.execute(
             """SELECT c.*,p.slug persona_slug,p.name persona_name,p.avatar
                FROM post_candidates c JOIN personas p ON p.id=c.persona_id
-               WHERE c.context_date=?
-                 AND c.source LIKE 'persona_editorial:%' AND EXISTS (
-                     SELECT 1 FROM persona_editorial_evaluations e
-                     JOIN daily_context_runs r ON r.id=e.run_id
-                     WHERE ('persona_editorial:' || e.id)=c.source
-                       AND e.status='WRITE' AND r.status='approved'
+               WHERE c.context_date=? AND c.status<>'superseded' AND (
+                   c.source LIKE 'initial_batch:%' OR (
+                       c.source LIKE 'persona_editorial:%' AND EXISTS (
+                           SELECT 1 FROM persona_editorial_evaluations e
+                           JOIN daily_context_runs r ON r.id=e.run_id
+                           WHERE ('persona_editorial:' || e.id)=c.source
+                             AND e.status='WRITE' AND r.status='approved'
+                       )
+                   )
                  )
                ORDER BY c.updated_at DESC,c.id DESC""",
             (context_date,),
