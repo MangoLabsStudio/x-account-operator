@@ -73,7 +73,7 @@ XOPS_GROK_BASE_URL=https://www.micuapi.ai/v1
 XOPS_GROK_MODEL=grok-4.6
 XOPS_GEMINI_API_KEY=...
 XOPS_GEMINI_BASE_URL=https://www.micuapi.ai/v1
-XOPS_GEMINI_MODEL=gemini-3.1-pro-preview
+XOPS_GEMINI_MODEL=gemini-3.1-pro-preview-low
 XOPS_OPERATOR_TOKEN=...  # optional: protect all /api write requests
 ```
 

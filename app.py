@@ -1614,7 +1614,7 @@ def editorial_provider_config(provider: str):
         raise RuntimeError(f"未配置 {provider} 正式编辑模型")
     defaults = {
         "GROK": ("https://www.micuapi.ai/v1", "grok-4.6"),
-        "GEMINI": ("https://www.micuapi.ai/v1", "gemini-3.1-pro-preview"),
+        "GEMINI": ("https://www.micuapi.ai/v1", "gemini-3.1-pro-preview-low"),
     }
     base_url, model = defaults[provider.upper()]
     return {
