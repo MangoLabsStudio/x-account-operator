@@ -1,0 +1,11 @@
+.DS_Store
+.pytest_cache/
+.venv/
+__pycache__/
+data/
+generated/
+tests/
+deploy/
+assets/characters-archive/
+*.zip
+*.pyc

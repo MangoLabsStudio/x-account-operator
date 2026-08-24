@@ -1,0 +1,22 @@
+[Unit]
+Description=Mango X Account Operator
+After=network-online.target
+
+[Service]
+Type=simple
+User=xops
+Group=xops
+WorkingDirectory=/opt/x-account-operator
+EnvironmentFile=/etc/x-account-operator.env
+ExecStart=/opt/x-account-operator/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8788
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/x-account-operator
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

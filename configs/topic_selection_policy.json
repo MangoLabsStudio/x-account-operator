@@ -1,0 +1,107 @@
+{
+  "version": 2,
+  "principle": "先用母帖池热度确定今天谈什么，再按核心主张去重。同一热点可以拆成不同角度；研究结论要求实质增量，机会、人物、交易哲学和热点评论要求明确主题与当日语境，不能用空泛常识凑数。",
+  "selection_lanes": {
+    "research": "新事实、新数据关系或新行业判断；必须有实质增量。",
+    "opportunity": "当天可参与、可观察或可计算的机会；必须给出对象、条件或触发点，但不必代替读者算完全部路径。",
+    "editorial": "围绕当天热点的人物评价、交易哲学、财富观、争议或情绪表达；可以复用事件背景，但核心表达不能是常识或历史原话。"
+  },
+  "slate_guidance": {
+    "target": "通常保留 8–15 个互不重复的核心主张；证据不足时可以更少，但不能因为同一事件已写过一个角度就删除其他新角度。",
+    "mix": "优先覆盖研究、机会和评论三类。单一热点最多保留 3 个互不重叠的角度。",
+    "dedupe_unit": "去重单位是核心主张，不是事件、项目、币种或题材。"
+  },
+  "content_inspiration": {
+    "cadence": "单账号一天 3–5 条只是大致节奏，不是必须完成的配额。",
+    "rule": "不设热点、研究、语录、哲学或乐子的固定比例，也不按栏目轮换。先看这个人设当下对什么真的有话可说，再决定写什么。",
+    "sources": [
+      "当天热点、事实和观点",
+      "交易过程中的具体感受或反常识判断",
+      "人物评价、市场情绪和圈内乐子",
+      "经典交易者和投资者的公开方法论",
+      "财富观、交易哲学和与人设生活经验相符的小观察"
+    ],
+    "quality_bar": "必须有一个明确主题和自己的判断；想到什么写什么不等于随便写常识或万能鸡汤。",
+    "quote_rule": "只有拿到可核验原文与出处时才使用直接引语；否则只能转述方法论，不能制造名人语录。"
+  },
+  "evergreen_inspirations": [
+    {"key": "livermore-trend-and-patience", "label": "利弗莫尔：主趋势、耐心与过度交易"},
+    {"key": "buffett-price-value-temperament", "label": "巴菲特：价格、价值与情绪控制"},
+    {"key": "munger-inversion", "label": "芒格：反过来想与避免致命错误"},
+    {"key": "soros-sizing", "label": "索罗斯：胜率、赔率与仓位不对称"},
+    {"key": "howard-marks-cycles", "label": "霍华德·马克斯：周期、共识与风险感受"},
+    {"key": "taleb-antifragility", "label": "塔勒布：脆弱性、选择权与黑天鹅"}
+  ],
+  "required_gates": [
+    "必须来自当天母帖池的高讨论事实或观点，不能从冷门材料反向造题。",
+    "不能是圈内读者无需当天材料就能回答的常识。",
+    "不能重复任一账号或全团队历史已经表达过的核心主张；同一事件下的新角度不算重复。",
+    "新数字只有改变规模判断、因果关系、参与条件或原结论时，才算实质更新。",
+    "研究题必须包含新事实、新关系、新计算、新冲突或新机会中的至少一项。",
+    "评论题必须同时具备当日热点钩子、明确立场和非显而易见的表达，不得用永远正确的空话代替观点。",
+    "读完必须能改变读者的行动、项目判断、行业判断，或提供值得转发讨论的鲜明表达。"
+  ],
+  "reject_codes": {
+    "common_knowledge": "答案显而易见，圈内读者无需这篇内容。",
+    "historical_duplicate": "核心主张在单账号或团队历史中已经讲过。",
+    "number_only_update": "只有数字刷新，没有改变原有结论。",
+    "no_material_delta": "没有形成新的事实关系、计算、冲突或机会。",
+    "low_audience_value": "读完不会改变判断或行动。",
+    "insufficient_evidence": "事实与观点不足以支持明确结论。",
+    "low_attention": "没有达到当天母帖池讨论门槛。"
+  },
+  "material_delta": [
+    "新机制改变了价值、费用、权力或风险的归属。",
+    "新数据跨过阈值并改变了规模或趋势判断。",
+    "新证据推翻、削弱或明显强化了历史结论。",
+    "出现过去不存在的可执行机会、参与条件或失效条件。",
+    "同一事件出现新的利益冲突、反方证据或二阶影响。"
+  ],
+  "covered_claims": [
+    {
+      "claim_key": "hyperliquid-builder-codes-distribution",
+      "subject": "Hyperliquid Builder Codes",
+      "core_claim": "Hyperliquid 通过手续费分成让钱包和第三方前端成为交易分发渠道，并把自己向底层流动性基础设施推进。"
+    },
+    {
+      "claim_key": "tokenized-stocks-24h-access",
+      "subject": "代币化股票",
+      "core_claim": "用户即使没有完整股东权利，仍会为了二十四小时交易和链上可组合性购买代币化股票。"
+    },
+    {
+      "claim_key": "tokenized-stock-lp-basic-fees",
+      "subject": "代币化股票 LP",
+      "core_claim": "小资金提供代币化股票流动性主要赚交易手续费，是否值得参与取决于池子深度和成交量。"
+    },
+    {
+      "claim_key": "stablecoin-payments-cross-border-fees",
+      "subject": "稳定币支付",
+      "core_claim": "稳定币支付通过减少跨境手续费和结算时间，为游客与跨境商户提供更方便的支付通道。"
+    },
+    {
+      "claim_key": "btc-squeeze-then-spot",
+      "subject": "Bitcoin 市场结构",
+      "core_claim": "BTC 本轮上涨由空头挤压点火，随后由 ETF 等现货资金接棒，且温和资金费率说明杠杆尚未过热。"
+    },
+    {
+      "claim_key": "price-creates-posthoc-narrative",
+      "subject": "交易叙事",
+      "core_claim": "价格上涨后市场会补写宏观解释，并把事后叙事再次转化为追涨流动性。"
+    },
+    {
+      "claim_key": "hype-fees-plus-reserve-yield",
+      "subject": "HYPE 回购",
+      "core_claim": "HYPE 的买入烧毁将由交易费与 USDC 储备利息共同驱动，持续性取决于稳定币余额和协议收入。"
+    },
+    {
+      "claim_key": "hype-73-76-trade-plan",
+      "subject": "HYPE 短线",
+      "core_claim": "HYPE 第一段上涨后不适合追高，空仓应等待七十三至七十六美元回踩，并以七十三美元为失效条件。"
+    },
+    {
+      "claim_key": "sol-92-100-trade-plan",
+      "subject": "SOL 短线",
+      "core_claim": "SOL 九十四美元附近是突破回踩，九十二美元决定结构是否失效，重新站上百美元确认右侧动量。"
+    }
+  ]
+}

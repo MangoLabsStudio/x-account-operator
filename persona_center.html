@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>人设</title>
+  <style>
+    :root{--bg:#f6f7f9;--panel:#fff;--ink:#17191d;--muted:#6f7580;--line:#e3e6ea;--blue:#2167df;--soft:#eef4ff}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,textarea{font:inherit}.topbar{height:64px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px}.topbar strong{font-size:18px}.topbar nav{display:flex;gap:18px}.topbar a{color:var(--muted);text-decoration:none}.topbar a.active{color:var(--ink);font-weight:700}.layout{display:grid;grid-template-columns:280px minmax(0,820px);gap:28px;max-width:1160px;margin:0 auto;padding:28px}.people,.card,.intro{background:var(--panel);border:1px solid var(--line);border-radius:14px}.people{padding:16px;height:max-content;position:sticky;top:24px}.people-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.people-head h2{font-size:15px;margin:0}.count{color:var(--muted);font-size:12px}.search{width:100%;border:1px solid var(--line);border-radius:9px;padding:9px 11px;margin-bottom:10px;outline:none}.person{width:100%;border:0;background:transparent;border-radius:11px;padding:10px;display:flex;align-items:center;gap:10px;text-align:left;cursor:pointer}.person:hover{background:#f2f3f5}.person.active{background:var(--soft)}.avatar{width:42px;height:42px;border-radius:11px;object-fit:cover;background:#ddd}.person-copy{min-width:0;flex:1}.person-name{display:block;font-weight:700}.person-role{display:block;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.daily{color:var(--blue);font-size:11px;font-weight:700}.intro{padding:18px 20px;margin-bottom:16px;background:#f8fbff;border-color:#dbe7fb}.intro strong{display:block;font-size:16px;margin-bottom:3px}.intro p{margin:0;color:var(--muted)}.hero{display:flex;align-items:center;justify-content:space-between;gap:20px;background:#fff;border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px;position:sticky;top:12px;z-index:3;box-shadow:0 8px 24px rgba(20,30,50,.04)}.hero-main{display:flex;align-items:center;gap:14px}.hero img{width:58px;height:58px;border-radius:15px;object-fit:cover;background:#ddd}.hero h1{font-size:22px;margin:0}.hero p{margin:2px 0 0;color:var(--muted)}.save{border:0;border-radius:9px;background:var(--blue);color:#fff;font-weight:700;padding:10px 16px;cursor:pointer}.save:disabled{opacity:.55}.save-state{color:var(--muted);font-size:12px;margin-right:10px}.card{padding:22px;margin-bottom:16px}.card h2{font-size:17px;margin:0 0 3px}.desc{color:var(--muted);font-size:13px;margin:0 0 18px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:15px}.field{margin-bottom:15px}.field:last-child{margin-bottom:0}.field label{display:block;font-weight:650;margin-bottom:6px}.field input,.field textarea{width:100%;border:1px solid #dce0e5;border-radius:9px;background:#fff;padding:10px 11px;outline:none;color:var(--ink)}.field textarea{min-height:100px;resize:vertical}.field textarea.tall{min-height:160px}.field input:focus,.field textarea:focus{border-color:#8cb1ef;box-shadow:0 0 0 3px #edf4ff}details{border-top:1px solid var(--line);margin-top:18px;padding-top:14px}summary{cursor:pointer;font-weight:700;color:#414650}.advanced{padding-top:16px}.examples{display:grid;grid-template-columns:1fr 1fr;gap:15px}.good{border-left:3px solid #2d9b70!important}.bad{border-left:3px solid #d45c5c!important}.assets{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}.asset{aspect-ratio:1;border-radius:10px;overflow:hidden;background:#eee}.asset img{width:100%;height:100%;object-fit:cover}.empty{padding:20px;color:var(--muted);text-align:center}.toast{position:fixed;right:24px;bottom:24px;background:#16181d;color:#fff;padding:10px 14px;border-radius:9px;opacity:0;transform:translateY(8px);transition:.2s}.toast.show{opacity:1;transform:none}
+    @media(max-width:760px){.topbar{padding:0 16px}.layout{display:block;padding:16px}.people{position:static;margin-bottom:16px;white-space:nowrap;overflow-x:auto}.people-head,.search{display:none}.person{display:inline-flex;width:210px}.hero{position:static}.grid,.examples{grid-template-columns:1fr}.assets{grid-template-columns:repeat(3,1fr)}}
+  </style>
+</head>
+<body>
+  <header class="topbar"><strong>人设</strong><nav><a href="__BASE_URL__/">每日草稿</a><a class="active" href="__BASE_URL__/personas">人设</a><a href="__BASE_URL__/market">每日研究</a></nav></header>
+  <div class="layout">
+    <aside class="people">
+      <div class="people-head"><h2>选择人设</h2><span class="count" id="count"></span></div>
+      <input class="search" id="search" placeholder="搜索人设">
+      <div id="peopleList"></div>
+    </aside>
+    <main>
+      <section class="intro"><strong>这个页面只负责定义“这个人是谁、怎么说话”</strong><p>每天 08:15 为全部 10 个人设生成草稿；阿坤、老任、桃桃带素材候选，其余 7 人生成文字草稿。</p></section>
+      <header class="hero">
+        <div class="hero-main"><img id="heroAvatar" alt="人设头像"><div><h1 id="personaName">正在载入…</h1><p id="personaRole"></p></div></div>
+        <div><span class="save-state" id="saveState"></span><button class="save" id="saveBtn">保存人设</button></div>
+      </header>
+      <section class="card">
+        <h2>1. 这个人是谁</h2><p class="desc">角色的基本身份和生活背景。这里决定内容从什么视角出发。</p>
+        <div class="grid"><div class="field"><label>名字</label><input data-bind="identity.name"></div><div class="field"><label>角色</label><input data-bind="identity.role"></div></div>
+        <div class="field"><label>一句话介绍</label><input data-bind="identity.bio"></div>
+        <div class="field"><label>人物背景</label><textarea class="tall" data-bind="identity.profile"></textarea></div>
+        <div class="field"><label>人物的核心性格</label><textarea data-bind="identity.soul"></textarea></div>
+        <details><summary>更多身份边界</summary><div class="advanced grid"><div class="field"><label>知道什么、不知道什么</label><textarea data-bind="identity.knowledge_boundary"></textarea></div><div class="field"><label>市场认知水平</label><textarea data-bind="identity.market_cognition"></textarea></div><div class="field"><label>面对读者的角色</label><textarea data-bind="identity.market_role"></textarea></div></div></details>
+      </section>
+      <section class="card">
+        <h2>2. 这个人怎么说话</h2><p class="desc">写清楚口吻、句子习惯和不能出现的表达。越具体，生成结果越稳定。</p>
+        <div class="field"><label>整体说话方式</label><textarea class="tall" data-bind="voice.style_guide"></textarea></div>
+        <div class="grid"><div class="field"><label>语气</label><textarea data-bind="voice.tone"></textarea></div><div class="field"><label>句子和长度</label><textarea data-bind="voice.sentence_style"></textarea></div></div>
+        <div class="grid"><div class="field"><label>常用表达（每行一个）</label><textarea data-bind="voice.favorite_phrases"></textarea></div><div class="field"><label>禁用表达（每行一个）</label><textarea data-bind="voice.forbidden_phrases"></textarea></div></div>
+        <details><summary>更多写作规则</summary><div class="advanced grid"><div class="field"><label>第一人称与称呼</label><input data-bind="voice.first_person"></div><div class="field"><label>Emoji 习惯</label><input data-bind="voice.emoji"></div><div class="field"><label>开头规则</label><textarea data-bind="voice.opening_rules"></textarea></div><div class="field"><label>收尾规则</label><textarea data-bind="voice.ending_rules"></textarea></div><div class="field"><label>证据表达</label><textarea data-bind="voice.evidence_rules"></textarea></div><div class="field"><label>不确定信息怎么写</label><textarea data-bind="voice.uncertainty_rules"></textarea></div><div class="field"><label>行动边界</label><textarea data-bind="voice.market_action_boundary"></textarea></div><div class="field"><label>去 AI 味</label><textarea data-bind="voice.anti_patterns"></textarea></div></div></details>
+      </section>
+      <section class="card">
+        <h2>3. 平时写什么</h2><p class="desc">定义这个人长期关注的内容，不需要在这里安排发布任务。</p>
+        <div class="field"><label>内容方向与比例</label><textarea data-bind="content.content_mix"></textarea></div>
+        <div class="grid"><div class="field"><label>可以追的实时话题</label><textarea data-bind="content.realtime_topics"></textarea></div><div class="field"><label>不写的话题</label><textarea data-bind="content.forbidden_topics"></textarea></div></div>
+      </section>
+      <section class="card">
+        <h2>4. 好稿和坏稿示例</h2><p class="desc">直接给例子，比抽象规则更容易让模型理解。</p>
+        <div class="examples"><div class="field"><label>符合人设</label><textarea class="tall good" data-bind="examples.good"></textarea></div><div class="field"><label>不符合人设</label><textarea class="tall bad" data-bind="examples.bad"></textarea></div></div>
+      </section>
+      <section class="card">
+        <h2>现有图片素材</h2><p class="desc" id="assetCount"></p><div class="assets" id="assetGrid"></div>
+        <details><summary>图片风格设置</summary><div class="advanced grid"><div class="field"><label>拍摄方式</label><textarea data-bind="visual.camera"></textarea></div><div class="field"><label>整体质感</label><textarea data-bind="visual.style"></textarea></div><div class="field"><label>服装连续性</label><textarea data-bind="visual.wardrobe"></textarea></div><div class="field"><label>禁止出现</label><textarea data-bind="visual.negative"></textarea></div></div></details>
+      </section>
+    </main>
+  </div>
+  <div class="toast" id="toast"></div>
+  <script>
+    const base='__BASE_URL__';
+    let personas=[],current=null,draft=null,dirty=false;
+    const assetSlugs=['acheng','ridehail-driver-zhao','college-student-linjia'];
+    const $=selector=>document.querySelector(selector),$$=selector=>[...document.querySelectorAll(selector)];
+    const api=async(path,options={})=>{const response=await fetch(base+path,{cache:'no-store',headers:{'content-type':'application/json'},...options});if(!response.ok)throw new Error((await response.json()).detail||'请求失败');return response.json()};
+    const assetUrl=url=>url?base+url:'';
+    const esc=value=>String(value??'').replace(/[&<>"]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[char]));
+    const getPath=(object,path)=>path.split('.').reduce((value,key)=>value?.[key],object)??'';
+    const setPath=(object,path,value)=>{const keys=path.split('.');let target=object;keys.slice(0,-1).forEach(key=>target=target[key]??={});target[keys.at(-1)]=value};
+    function notify(text){const toast=$('#toast');toast.textContent=text;toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),1800)}
+    function markDirty(){dirty=true;$('#saveState').textContent='有未保存修改'}
+    function renderPeople(filter=''){const list=$('#peopleList');list.innerHTML='';const shown=personas.filter(person=>(person.display_name+person.role).toLowerCase().includes(filter.toLowerCase()));shown.forEach(person=>{const button=document.createElement('button');button.className='person'+(current?.id===person.id?' active':'');const queueType=assetSlugs.includes(person.slug)?'草稿＋配图':'文字草稿';button.innerHTML=`<img class="avatar" src="${assetUrl(person.avatar_url)}" alt=""><span class="person-copy"><span class="person-name">${esc(person.display_name)} <span class="daily">${queueType}</span></span><span class="person-role">${esc(person.role)}</span></span>`;button.onclick=()=>selectPersona(person.id);list.append(button)});$('#count').textContent=`${personas.length} 个`}
+    function fillForm(){$$('[data-bind]').forEach(input=>{input.value=getPath(draft,input.dataset.bind);input.oninput=()=>{setPath(draft,input.dataset.bind,input.value);markDirty()}})}
+    function renderAssets(){const assets=current.assets||[];$('#assetCount').textContent=assets.length?`已连接 ${assets.length} 张图片`:'还没有图片素材';const grid=$('#assetGrid');grid.innerHTML='';assets.slice(0,20).forEach(asset=>{const item=document.createElement('div');item.className='asset';item.title=asset.name;item.innerHTML=`<img loading="lazy" src="${assetUrl(asset.url)}" alt="${esc(asset.name)}">`;grid.append(item)});if(!assets.length)grid.innerHTML='<div class="empty">暂无素材</div>'}
+    function renderCurrent(){draft=structuredClone(current.draft);dirty=false;$('#saveState').textContent=assetSlugs.includes(current.slug)?'每日草稿＋配图':'每日文字草稿';$('#personaName').textContent=current.display_name;$('#personaRole').textContent=current.role;$('#heroAvatar').src=assetUrl(current.avatar_url);fillForm();renderAssets();renderPeople($('#search').value)}
+    async function selectPersona(id){if(dirty&&!confirm('当前修改还没保存，确定切换吗？'))return;current=await api(`/api/personas/${id}`);renderCurrent();window.scrollTo({top:0,behavior:'smooth'})}
+    async function save(){const button=$('#saveBtn');button.disabled=true;try{await api(`/api/personas/${current.id}`,{method:'PUT',body:JSON.stringify({data:draft})});dirty=false;current.draft=structuredClone(draft);current.display_name=draft.identity.name;current.role=draft.identity.role;$('#personaName').textContent=current.display_name;$('#personaRole').textContent=current.role;$('#saveState').textContent='已保存';await refreshList();renderPeople($('#search').value);notify('人设已保存')}catch(error){notify(error.message)}finally{button.disabled=false}}
+    async function refreshList(){personas=await api('/api/personas')}
+    $('#saveBtn').onclick=save;$('#search').oninput=event=>renderPeople(event.target.value);
+    window.addEventListener('beforeunload',event=>{if(dirty){event.preventDefault();event.returnValue=''}});
+    (async()=>{await refreshList();renderPeople();const first=personas.find(person=>person.slug==='acheng')||personas[0];if(first)await selectPersona(first.id)})().catch(error=>notify(error.message));
+  </script>
+</body>
+</html>

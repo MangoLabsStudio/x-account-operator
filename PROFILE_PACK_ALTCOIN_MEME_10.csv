@@ -1,0 +1,11 @@
+code,category,display_name,username_1,username_2,username_3,bio,content_focus,banner_copy
+ALT-01,山寨资讯,山寨简报,@AltcoinBriefX,@TheAltBrief,@AltcoinBriefing,"每天追踪山寨币催化剂、上币、解锁和异动。只看一手来源，不接付费吹票。非投资建议。","项目公告；上币；解锁；催化剂","发生了什么，为什么重要。"
+ALT-02,板块轮动,轮动观察,@RotationWatch,@AltRotationX,@RotationDesk,"盯 L1、DeFi、AI、RWA 和永续板块轮动。看相对强弱，也写清确认条件和失效位置。","板块热度；相对强弱；资金轮动；失效条件","跟强度，不跟故事。"
+ALT-03,链上流向,代币流向,@TokenFlowX,@TokenFlowDesk,@AltcoinFlows,"追踪山寨币链上流向、解锁、金库和交易所动向。数据优先；涉及持仓时主动披露。","钱包流向；交易所活动；金库；供应变化","跟着代币走。"
+ALT-04,山寨基本面,协议账本,@ProtocolPnL,@TokenPnL,@ProtocolValueX,"从收入、用户、代币经济和价值捕获看山寨币。写给愿意读完 ticker 背后数据的人。","收入；用户；代币经济；价值捕获","别只看 ticker。"
+ALT-05,山寨技术面,山寨看盘,@AltcoinTape,@AltTapeX,@TheAltcoinTape,"公开维护山寨币观察列表：价格、成交量、资金费率和关键位置。不承诺收益，不私信喊单。","观察列表；价格；成交量；资金费率；失效位置","看盘，不许愿。"
+MEME-01,梗币战壕,战壕夜班,@TrenchShift,@MemeTrenchShift,@ClockedInCT,"每天进梗币战壕，盯 Solana 新池子、流动性、持币结构和注意力。不收费喊单，不主动私信。","新池子；流动性；持币结构；注意力","还在战壕。"
+MEME-02,梗币数据,流动性警察,@MemeLiquidity,@MemeLiq,@MemeFlowDesk,"用流动性、持仓集中度和钱包流向看梗币。截图不是逻辑，数据比情绪重要。","流动性；持仓集中度；钱包流向","情绪也需要流动性。"
+MEME-03,梗币文化,梗币文化局,@CultureCoinWatch,@MemeCultureX,@CultureCoinDesk,"观察梗币文化、社区和叙事寿命。梗很重要，传播能力更重要。","文化；社区；传播；叙事寿命","梗币就是传播。"
+MEME-04,梗币技术面,Solana 梗币盘,@SolMemeTape,@SolanaMemeTape,@SolMemeWatch,"只看 Solana 梗币的市场结构、新池子和动量。观察列表附流动性和失效位置。","新池子；动量；成交量；关键位置","做动量，先定风险。"
+MEME-05,梗币风险,梗币避坑台,@MemeRiskDesk,@MemeRiskX,@RugCheckDesk,"快速检查梗币合约、流动性、持币结构和仿冒风险。点链接或交易前，先验证。","合约；流动性；持币结构；仿冒风险","交易前先核验。"

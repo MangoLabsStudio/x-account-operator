@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+.pytest_cache/
+.venv/
+
+# Local runtime state and generated content
+data/
+generated/
+deliverables/
+
+# Large local visual asset packs are managed outside Git
+assets/
+
+# Accidental local scratch files
+select count(*) from source_posts;

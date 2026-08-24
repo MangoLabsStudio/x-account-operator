@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Non-secret topic claim identifiers"
+regexTarget = "secret"
+regexes = [
+  '''^hype-73-76-trade-plan$''',
+  '''^sol-92-100-trade-plan$'''
+]

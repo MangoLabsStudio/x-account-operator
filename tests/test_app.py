@@ -1,0 +1,1273 @@
+import asyncio
+import importlib
+import json
+import os
+import tempfile
+import time
+import unittest
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
+
+from fastapi.testclient import TestClient
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
+class FakeAsyncClient:
+    def __init__(self, payload, calls):
+        self.payload = payload
+        self.calls = calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def post(self, *args, **kwargs):
+        self.calls.append({"args": args, "kwargs": kwargs})
+        return FakeResponse(self.payload)
+
+
+class AppTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        os.environ.update(
+            XOPS_DATA_DIR=self.temp.name,
+            XOPS_DAILY_CONTEXT_ENABLED="false",
+            XOPS_BASE_URL="http://127.0.0.1:8788",
+        )
+        import app
+        self.app_module = importlib.reload(app)
+        self.client = TestClient(self.app_module.app)
+        self.client.__enter__()
+
+    def tearDown(self):
+        self.client.__exit__(None, None, None)
+        self.temp.cleanup()
+
+    def wait_for_daily_run(self, context_date):
+        for _ in range(100):
+            response = self.client.get(f"/api/context/daily-runs/{context_date}")
+            if response.status_code == 200 and response.json()["status"] != "running":
+                return response
+            time.sleep(0.01)
+        self.fail(f"daily context run {context_date} did not finish")
+
+    def test_health_is_public(self):
+        response = self.client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["daily_context_enabled"])
+        self.assertEqual(response.json()["daily_context_run_time"], "08:15")
+
+    def test_dashboard_is_public(self):
+        self.assertEqual(self.client.get("/").status_code, 200)
+
+    def test_public_base_url_is_rendered_for_reverse_proxy(self):
+        os.environ["XOPS_BASE_URL"] = "https://siriuszzz-api.uk/xops"
+        for path in ("/personas", "/market"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("const base='https://siriuszzz-api.uk/xops'", response.text)
+            self.assertNotIn("__BASE_URL__", response.text)
+
+    def test_persona_center_loads_seeded_characters(self):
+        self.assertEqual(self.client.get("/personas").status_code, 200)
+        personas = self.client.get("/api/personas").json()
+        slugs = [persona["slug"] for persona in personas]
+        self.assertEqual(
+            set(slugs),
+            {
+                "acheng",
+                "ridehail-driver-zhao",
+                "college-student-linjia",
+                "atuo",
+                "axu",
+                "nanqiao",
+                "qiliang",
+                "aye",
+                "xiaoman",
+                "maili",
+            },
+        )
+        self.assertNotIn("office-worker-zhou", slugs)
+        self.assertNotIn("county-mom-xiaomei", slugs)
+        self.assertNotIn("cc0-source-selection", slugs)
+        student = next(persona for persona in personas if persona["slug"] == "college-student-linjia")
+        self.assertEqual(student["display_name"], "桃桃还没下课")
+        self.assertEqual(student["handle"], "@taotao_afterclass")
+
+        atuo = next(persona for persona in personas if persona["slug"] == "atuo")
+        self.assertEqual(atuo["display_name"], "阿拓Tuo")
+        self.assertEqual(atuo["handle"], "@atuo_xyz")
+        self.assertIn("atuo/avatar.png", atuo["avatar_url"])
+
+        crypto_names = {
+            persona["display_name"] for persona in personas if persona["slug"] in self.app_module.PERSONA_BIOS
+        }
+        self.assertEqual(
+            crypto_names,
+            {"阿拓Tuo", "AXU", "南桥研究所", "7Liang", "野生Aye", "小满 onchain", "Milly的交易手账"},
+        )
+
+        axu = next(persona for persona in personas if persona["slug"] == "axu")
+        axu_detail = self.client.get(f"/api/personas/{axu['id']}").json()
+        self.assertEqual(axu_detail["draft"]["config_revision"], 3)
+        self.assertIn("看结构，也看人群", axu_detail["draft"]["identity"]["bio"])
+        self.assertEqual(axu_detail["draft"]["voice"]["favorite_phrases"], "")
+        self.assertIn("不设固定句式", axu_detail["draft"]["voice"]["syntax_patterns"])
+        self.assertIn("不喊话", axu_detail["draft"]["voice"]["mobilization_style"])
+        self.assertIn("不代表持有该 NFT", axu_detail["draft"]["visual"]["source_note"])
+        self.assertEqual([asset["name"] for asset in axu_detail["assets"]], ["avatar"])
+
+    def test_post_candidates_start_empty_and_are_available_by_persona(self):
+        personas = self.client.get("/api/personas").json()
+        acheng = next(persona for persona in personas if persona["slug"] == "acheng")
+        self.assertEqual(
+            self.client.get(f"/api/personas/{acheng['id']}/post-candidates").json(), []
+        )
+        with self.app_module.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM daily_context_runs").fetchone()[0], 0)
+            now = int(time.time())
+            conn.execute(
+                """INSERT INTO post_candidates(
+                    persona_id,context_date,title,body,status,source,notes,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    acheng["id"],
+                    "2026-08-24",
+                    "新的候选内容",
+                    "来自重新抓取母池后生成的候选。",
+                    "needs_review",
+                    "daily_context_run",
+                    "未排期，未发布。",
+                    now,
+                    now,
+                ),
+            )
+        candidates = self.client.get(f"/api/personas/{acheng['id']}/post-candidates").json()
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["title"], "新的候选内容")
+        self.assertEqual(candidates[0]["source"], "daily_context_run")
+        latest = self.client.get("/api/daily-post").json()
+        self.assertEqual(latest["body"], "来自重新抓取母池后生成的候选。")
+        self.assertEqual(latest["persona_slug"], "acheng")
+
+    def test_daily_run_refreshes_one_persona_post_draft(self):
+        generated = AsyncMock(return_value={"post": "今天自动生成的 Post 草稿。"})
+        with patch.dict(
+            os.environ,
+            {"XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONA": "acheng"},
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            asyncio.run(
+                self.app_module.refresh_daily_post_draft(
+                    "2026-08-24",
+                    7,
+                    {
+                        "selected_topics": [{"title": "今天有什么值得讨论？", "eligible": True}],
+                        "opinion_cards": [{"text": "市场观点" * 3000, "handle": "hidden"}],
+                    },
+                    {"market_state": "今日市场状态", "sources": [{"handle": "hidden"}]},
+                )
+            )
+        request = generated.await_args.args[1]
+        self.assertLessEqual(len(request.facts), 8000)
+        self.assertNotIn("hidden", request.facts)
+        latest = self.client.get("/api/daily-post").json()
+        self.assertEqual(latest["body"], "今天自动生成的 Post 草稿。")
+        self.assertEqual(latest["title"], "今天有什么值得讨论？")
+        self.assertEqual(latest["persona_slug"], "acheng")
+
+    def test_daily_run_generates_ten_persona_queue(self):
+        generated = AsyncMock(
+            side_effect=[{"post": f"草稿 {index}"} for index in range(1, 11)]
+        )
+        cards = {
+            "selected_topics": [
+                {"title": "题目一"},
+                {"title": "题目二"},
+                {"title": "题目三"},
+            ]
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "XOPS_DAILY_POST_ENABLED": "true",
+                "XOPS_DAILY_POST_PERSONAS": (
+                    "acheng,ridehail-driver-zhao,college-student-linjia,atuo,axu,"
+                    "nanqiao,qiliang,aye,xiaoman,maili"
+                ),
+            },
+        ), patch.object(self.app_module, "generate_persona_post", generated):
+            asyncio.run(
+                self.app_module.refresh_daily_post_draft(
+                    "2026-08-24", 8, cards, {"market_state": "今日市场状态"}
+                )
+            )
+            queue = self.client.get("/api/daily-posts").json()
+        self.assertEqual(generated.await_count, 10)
+        self.assertEqual([item["persona_slug"] for item in queue], [
+            "acheng", "ridehail-driver-zhao", "college-student-linjia", "atuo",
+            "axu", "nanqiao", "qiliang", "aye", "xiaoman", "maili"
+        ])
+        self.assertEqual([item["body"] for item in queue], [
+            f"草稿 {index}" for index in range(1, 11)
+        ])
+        self.assertTrue(all(item["image_url"] for item in queue[:3]))
+        self.assertTrue(all(item["image_url"] is None for item in queue[3:]))
+
+    def test_persona_draft_and_published_version(self):
+        personas = self.client.get("/api/personas").json()
+        persona_id = personas[0]["id"]
+        persona = self.client.get(f"/api/personas/{persona_id}").json()
+        persona["draft"]["voice"]["tone"] = "真实、短句、不过度包装"
+
+        saved = self.client.put(
+            f"/api/personas/{persona_id}", json={"data": persona["draft"]}
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()["status"], "draft")
+
+        published = self.client.post(f"/api/personas/{persona_id}/publish")
+        self.assertEqual(published.status_code, 200)
+        self.assertEqual(published.json()["version"], 1)
+
+        refreshed = self.client.get(f"/api/personas/{persona_id}").json()
+        self.assertEqual(refreshed["status"], "published")
+        self.assertEqual(refreshed["versions"][0]["version"], 1)
+
+    def test_persona_prompt_preview_uses_voice(self):
+        persona = self.client.get("/api/personas/1").json()
+        response = self.client.post(
+            "/api/personas/1/prompt-preview", json={"data": persona["draft"]}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("文风与口风", response.json()["prompt"])
+        self.assertIn(persona["draft"]["voice"]["tone"], response.json()["prompt"])
+        self.assertIn("偶尔使用", persona["draft"]["voice"]["style_guide"])
+        self.assertIn("不设固定句式", response.json()["prompt"])
+        self.assertIn("兄弟们，这个可以冲了", response.json()["prompt"])
+        self.assertIn("禁止整段复用", response.json()["prompt"])
+
+    def test_generate_post_requires_facts(self):
+        response = self.client.post("/api/personas/1/generate-post", json={"facts": ""})
+        self.assertEqual(response.status_code, 422)
+
+    def test_context_crud_and_pack_assembly(self):
+        pump = self.client.get("/api/context/projects/pump-fun")
+        self.assertEqual(pump.status_code, 200)
+        self.assertIn("不包含实时", pump.json()["current_state"])
+
+        project = self.client.put(
+            "/api/context/projects/test-protocol",
+            json={
+                "name": "Test Protocol",
+                "aliases": ["TEST"],
+                "audience_baseline": "读者知道基础链上概念",
+                "native_context": "用户关注真实使用成本",
+                "market_structure": "流动性与估值分开看",
+                "recurring_debates": "收入能否持续",
+                "current_state": "运营者填写的当前状态",
+                "sources": [{"url": "https://example.com"}],
+            },
+        )
+        self.assertEqual(project.status_code, 200)
+        self.assertEqual(project.json()["aliases"], ["TEST"])
+
+        persona_context = self.client.put(
+            "/api/personas/1/context",
+            json={
+                "prior_views": "此前认为收入和代币捕获应分开验证。",
+                "watchlist": "Test Protocol",
+                "unresolved": "真实用户留存",
+                "forbidden_claims": "不得写成持仓",
+            },
+        )
+        self.assertEqual(persona_context.status_code, 200)
+
+        self.assertEqual(
+            self.client.post(
+                "/api/personas/1/context-packs",
+                json={"topic": "测试主题", "project_slugs": ["test-protocol"]},
+            ).status_code,
+            422,
+        )
+        daily = self.client.put(
+            "/api/context/daily/2026-08-24",
+            json={
+                "market_state": "市场在等待新催化。",
+                "event_clusters": "测试协议出现新讨论。",
+                "debates": "收入和估值是否匹配。",
+                "evidence": "输入来源显示活动上升。",
+                "unknowns": "留存尚未确认。",
+                "raw_feed": "RAW_AUTHOR_EXPERIENCE_SHOULD_NOT_REACH_PACK",
+                "sources": [{"url": "https://x.com/example"}],
+            },
+        )
+        self.assertEqual(daily.status_code, 200)
+
+        missing = self.client.post(
+            "/api/personas/1/context-packs",
+            json={"topic": "测试主题", "project_slugs": ["does-not-exist"]},
+        )
+        self.assertEqual(missing.status_code, 422)
+
+        pack = self.client.post(
+            "/api/personas/1/context-packs",
+            json={
+                "topic": "测试主题",
+                "project_slugs": ["test-protocol"],
+                "operator_notes": "只讨论收入持续性。",
+            },
+        )
+        self.assertEqual(pack.status_code, 200)
+        self.assertEqual(pack.json()["context_date"], "2026-08-24")
+        self.assertEqual(pack.json()["content"]["project_dossiers"][0]["slug"], "test-protocol")
+        self.assertEqual(pack.json()["content"]["discussion_topics"], [])
+        self.assertEqual(pack.json()["content"]["attention_topics"], [])
+        self.assertEqual(pack.json()["content"]["opportunity_questions"], [])
+        self.assertIsNone(pack.json()["content"]["selected_opportunity_question"])
+        self.assertEqual(pack.json()["content"]["editorial_questions"], [])
+        self.assertIsNone(pack.json()["content"]["selected_editorial_question"])
+        self.assertEqual(pack.json()["content"]["topic_attention"]["status"], "custom_or_niche")
+        self.assertIn("此前认为", pack.json()["content"]["account_continuity"]["prior_views"])
+        self.assertNotIn("raw_feed", pack.json()["content"]["daily_market"])
+        self.assertNotIn("RAW_AUTHOR_EXPERIENCE_SHOULD_NOT_REACH_PACK", json.dumps(pack.json()["content"]))
+        updated = self.client.put(
+            f"/api/context-packs/{pack.json()['id']}", json={"operator_notes": "不要写成推荐。"}
+        )
+        self.assertEqual(updated.json()["content"]["operator_notes"], "不要写成推荐。")
+        edited_content = updated.json()["content"]
+        edited_content["unknowns"] = "等待低热度窗口验证。"
+        edited = self.client.put(
+            f"/api/context-packs/{pack.json()['id']}", json=edited_content
+        )
+        self.assertEqual(edited.json()["content"]["unknowns"], "等待低热度窗口验证。")
+        invalid = self.client.put(
+            f"/api/context-packs/{pack.json()['id']}", json={"content": edited_content}
+        )
+        self.assertEqual(invalid.status_code, 422)
+
+    def test_context_pack_isolation_and_generation_prompt(self):
+        self.client.put(
+            "/api/context/daily/2026-08-24",
+            json={
+                "market_state": "Meme 交易活跃",
+                "unknowns": "持续性未知",
+                "raw_feed": "RAW_NOISE_MUST_NOT_REACH_PROMPT",
+            },
+        )
+        first = self.client.post(
+            "/api/personas/1/context-packs",
+            json={"topic": "Pump.fun", "project_slugs": ["pump-fun"]},
+        ).json()
+        second_persona = self.client.get("/api/personas").json()[1]["id"]
+        wrong = self.client.post(
+            f"/api/personas/{second_persona}/generate-post",
+            json={"context_pack_id": first["id"]},
+        )
+        self.assertEqual(wrong.status_code, 422)
+
+        calls = []
+        payload = {"choices": [{"message": {"content": "这是一条基于语境的观察。"}}]}
+        factory = lambda **_kwargs: FakeAsyncClient(payload, calls)
+        with patch.object(self.app_module, "llm_api_key", return_value="test"), patch.object(
+            self.app_module.httpx, "AsyncClient", factory
+        ):
+            response = self.client.post(
+                "/api/personas/1/generate-post",
+                json={"context_pack_id": first["id"], "facts": "补充事实"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["context_pack_id"], first["id"])
+        prompt = calls[0]["kwargs"]["json"]["messages"][0]["content"]
+        self.assertIn("每日市场状态", prompt)
+        self.assertIn("项目长期语境", prompt)
+        self.assertIn("账号连续性", prompt)
+        self.assertIn("未知与过期提示", prompt)
+        self.assertIn("读者机会题", prompt)
+        self.assertIn("观点 / 乐子题", prompt)
+        self.assertIn("当天可写讨论议题", prompt)
+        self.assertIn("当天父级热度地图", prompt)
+        self.assertIn("选题：\nPump.fun", prompt)
+        self.assertIn("Pump.fun", prompt)
+        self.assertIn("把因果链讲完整", prompt)
+        self.assertIn("不能用", prompt)
+        self.assertIn("无信息占位收尾", prompt)
+        self.assertIn("结尾必须交付当下成立的判断", prompt)
+        self.assertIn("再看正式文本", prompt)
+        self.assertNotIn("RAW_NOISE_MUST_NOT_REACH_PROMPT", prompt)
+
+    def test_generation_rejects_empty_waiting_language(self):
+        calls = []
+        payload = {"choices": [{"message": {"content": "我会关注，再看正式文本。"}}]}
+        factory = lambda **_kwargs: FakeAsyncClient(payload, calls)
+        with patch.object(self.app_module, "llm_api_key", return_value="test"), patch.object(
+            self.app_module.httpx, "AsyncClient", factory
+        ):
+            response = self.client.post(
+                "/api/personas/1/generate-post",
+                json={"facts": "项目刚公布一项明确费用调整。"},
+            )
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["detail"], "Post 缺少当前结论")
+        self.assertEqual(len(calls), 2)
+
+    def test_daily_synthesis_returns_unsaved_preview(self):
+        calls = []
+        content = json.dumps(
+            {
+                "market_state": "市场等待流动性方向。",
+                "event_clusters": "Pump.fun 讨论增加。",
+                "debates": "收入能否变成持久价值仍有分歧。",
+                "evidence": "原始信息中有链接和公开数据线索。",
+                "unknowns": "没有完整留存数据。",
+                "sources": [{"url": "https://x.com/example"}],
+            },
+            ensure_ascii=False,
+        )
+        payload = {"choices": [{"message": {"content": content}}]}
+        factory = lambda **_kwargs: FakeAsyncClient(payload, calls)
+        with patch.object(self.app_module, "llm_api_key", return_value="test"), patch.object(
+            self.app_module.httpx, "AsyncClient", factory
+        ):
+            response = self.client.post(
+                "/api/context/daily/2026-08-24/synthesize", json={"raw_feed": "一条母池推文"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["unknowns"], "没有完整留存数据。")
+        self.assertEqual(response.json()["date"], "2026-08-24")
+        self.assertEqual(self.client.get("/api/context/daily/2026-08-24").status_code, 404)
+        prompt = calls[0]["kwargs"]["json"]["messages"][0]["content"]
+        self.assertIn("确认事实、市场解读、分歧和未知", prompt)
+
+    def test_daily_card_synthesis_never_turns_opinions_into_facts(self):
+        calls = []
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "market_state": "BTC rallied after the announcement.",
+                                "event_clusters": "The protocol launched a new product.",
+                                "debates": [
+                                    {"topic": "Pump.fun", "view": "这轮讨论集中在收入是否能持续。"},
+                                    {"topic": "SGP-0003", "view": "这个冷门提案不该进入主线。"},
+                                ],
+                                "evidence": "Several traders said so.",
+                                "unknowns": "Unknown.",
+                                "sources": [{"url": "https://outside.example"}],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        cards = {
+            "fact_cards": [],
+            "opinion_cards": [{"text": "这只是本轮观点", "source_lists": ["crypto"]}],
+            "discussion_topics": [{"title": "Pump.fun｜交易活动", "unique_authors": 12, "post_count": 20}],
+            "attention_topics": [{"title": "Solana", "unique_authors": 40, "post_count": 80}],
+            "excluded_niche_topics": [{"title": "SGP-0003", "unique_authors": 2, "post_count": 2}],
+            "coverage": {"cross_validate": {"opinion_cards": 200}},
+        }
+        factory = lambda **_kwargs: FakeAsyncClient(payload, calls)
+        with patch.object(self.app_module, "llm_api_key", return_value="test"), patch.object(
+            self.app_module.httpx, "AsyncClient", factory
+        ):
+            synthesis = asyncio.run(self.app_module.synthesize_daily_cards("2026-08-24", cards))
+        self.assertIn("讨论面与注意力结构", synthesis["market_state"])
+        self.assertIn("筛出 200 条观点卡", synthesis["market_state"])
+        self.assertIn("使用其中 1 条受控样本", synthesis["market_state"])
+        self.assertNotIn("BTC rallied", synthesis["market_state"])
+        self.assertIn("未产出通过多源验证的事实卡", synthesis["evidence"])
+        self.assertIn("不能作为事实证据", synthesis["evidence"])
+        self.assertIn("24 小时母池讨论热度（非事实确认）", synthesis["event_clusters"])
+        self.assertIn("Pump.fun｜交易活动（12 位作者、20 条帖子）", synthesis["event_clusters"])
+        self.assertNotIn("Solana", synthesis["event_clusters"])
+        self.assertNotIn("protocol launched", synthesis["event_clusters"])
+        self.assertIn("Pump.fun", synthesis["debates"])
+        self.assertNotIn("SGP-0003", synthesis["debates"])
+        self.assertEqual(synthesis["sources"], [{"source_list": "crypto"}])
+        prompt = calls[0]["kwargs"]["json"]["messages"][0]["content"]
+        self.assertIn("所有字段必须使用中文", prompt)
+        self.assertIn("discussion_topics", prompt)
+        self.assertIn("父级市场地图", prompt)
+        self.assertIn("只有 discussion_topics 为空时", prompt)
+
+    def test_controlled_cards_keeps_top_twenty_discussion_and_attention_topics(self):
+        cards = self.app_module.controlled_cards(
+            [],
+            [],
+            {},
+            [{"title": f"热点 {index}", "key": f"hot-{index}", "unique_authors": index} for index in range(25)],
+            None,
+            [{"title": f"可写议题 {index}", "key": f"hot-{index}:listing", "unique_authors": index} for index in range(25)],
+        )
+        self.assertEqual(len(cards["discussion_topics"]), 20)
+        self.assertEqual(cards["discussion_topics"][0]["title"], "可写议题 0")
+        self.assertEqual(len(cards["attention_topics"]), 20)
+        self.assertEqual(cards["attention_topics"][0]["title"], "热点 0")
+
+    def test_topic_selection_policy_and_history_are_persisted(self):
+        policy = self.app_module.topic_selection_policy()
+        self.assertIn("历史", "".join(policy["required_gates"]))
+        self.assertEqual(policy["slate_guidance"]["dedupe_unit"], "去重单位是核心主张，不是事件、项目、币种或题材。")
+        self.assertIn("不设", policy["content_inspiration"]["rule"])
+        claims = self.app_module.recent_topic_claims()
+        self.assertIn(
+            "hyperliquid-builder-codes-distribution",
+            {item["claim_key"] for item in claims},
+        )
+
+    def test_screened_topics_reject_known_claim_and_keep_material_delta(self):
+        cards = {
+            "discussion_topics": [{"key": "hyperliquid:market_structure"}],
+            "claim_history": [
+                {
+                    "claim_key": "hyperliquid-builder-codes-distribution",
+                    "core_claim": "钱包成为交易分发渠道。",
+                }
+            ],
+        }
+        selected, rejected = self.app_module.bounded_selected_topics(
+            {
+                "selected_topics": [
+                    {
+                        "claim_key": "hyperliquid-builder-codes-distribution",
+                        "subject": "Hyperliquid",
+                        "title": "Builder Codes 让钱包成为分发渠道",
+                        "core_claim": "钱包成为交易分发渠道。",
+                        "content_type": "research",
+                        "kind": "competition",
+                        "source_topic_keys": ["hyperliquid:market_structure"],
+                        "fact_basis": "当天成交数据",
+                        "opinion_basis": "平台化观点",
+                        "material_delta": "只有数字更新",
+                        "audience_value": "理解平台战略",
+                        "why_now": "当天讨论",
+                        "persona_fit": ["atuo"],
+                    },
+                    {
+                        "claim_key": "hyperliquid-builder-margin-compression",
+                        "subject": "Hyperliquid",
+                        "title": "Builder 分成开始压低协议净收入",
+                        "core_claim": "新增分成使成交增长与协议净收入出现背离。",
+                        "content_type": "research",
+                        "kind": "unit_economics",
+                        "source_topic_keys": ["hyperliquid:market_structure"],
+                        "fact_basis": "成交与净收入变化",
+                        "opinion_basis": "飞轮可能被稀释",
+                        "material_delta": "新数据改变了收入增长判断",
+                        "audience_value": "重新评估价值归属",
+                        "why_now": "收入背离首次出现",
+                        "persona_fit": ["xiaoman"],
+                    },
+                ],
+                "rejected_topics": [],
+            },
+            cards,
+        )
+        self.assertEqual([item["claim_key"] for item in selected], ["hyperliquid-builder-margin-compression"])
+        self.assertEqual(rejected[0]["reason_code"], "historical_duplicate")
+
+    def test_screened_topic_can_use_high_quality_opinion_as_source(self):
+        cards = {
+            "discussion_topics": [],
+            "opinion_cards": [{"source_ref": "123", "text": "当天高质量观点"}],
+            "claim_history": [],
+        }
+        selected, rejected = self.app_module.bounded_selected_topics(
+            {
+                "selected_topics": [{
+                    "claim_key": "meme-daily-close",
+                    "subject": "Meme 交易",
+                    "title": "二段胜率低，日结比猜龙头更重要",
+                    "core_claim": "样本显示二段交易的赔率明显差于日内兑现。",
+                    "content_type": "opportunity",
+                    "kind": "trade_process",
+                    "source_topic_keys": ["opinion:123"],
+                    "fact_basis": "母池作者的两日样本",
+                    "opinion_basis": "日结优先",
+                    "material_delta": "新增样本给出赔率差异",
+                    "audience_value": "改变短线兑现纪律",
+                    "why_now": "当天 Meme 轮动加速",
+                    "persona_fit": ["aye"],
+                }],
+                "rejected_topics": [],
+            },
+            cards,
+        )
+        self.assertEqual([item["claim_key"] for item in selected], ["meme-daily-close"])
+        self.assertEqual(rejected, [])
+
+    def test_screened_editorial_can_use_evergreen_inspiration(self):
+        policy = self.app_module.topic_selection_policy()
+        selected, rejected = self.app_module.bounded_selected_topics(
+            {
+                "selected_topics": [{
+                    "claim_key": "livermore-overtrading",
+                    "subject": "交易耐心",
+                    "title": "真正难的不是看对，而是看对以后别乱动",
+                    "core_claim": "过度交易会让人主动丢掉原本正确的趋势判断。",
+                    "content_type": "editorial",
+                    "kind": "trading_philosophy",
+                    "source_topic_keys": ["evergreen:livermore-trend-and-patience"],
+                    "fact_basis": "公开方法论转述，不使用直接引语。",
+                    "opinion_basis": "耐心本身是交易能力。",
+                    "material_delta": "结合人设形成独立表达。",
+                    "audience_value": "重新理解过度交易。",
+                    "why_now": "人设当下确实有这个表达冲动。",
+                    "persona_fit": ["maili"],
+                }],
+                "rejected_topics": [],
+            },
+            {"topic_selection_policy": policy, "claim_history": []},
+        )
+        self.assertEqual([item["claim_key"] for item in selected], ["livermore-overtrading"])
+        self.assertEqual(rejected, [])
+
+    def test_opportunity_questions_are_deterministic_and_conservative(self):
+        topics = [
+            {"key": "rwa:tokenized_equities", "title": "RWA｜代币化股票与流动性", "mechanism": {"key": "tokenized_equities"}, "unique_authors": 4, "post_count": 6, "sample_posts": [{"text": "LP APY 200%"}]},
+            {"key": "bitcoin:market_structure", "title": "Bitcoin｜价格与市场结构", "mechanism": {"key": "market_structure"}, "unique_authors": 5, "post_count": 8},
+            {"key": "hyperliquid:revenue_buyback", "title": "Hyperliquid｜收入与回购", "mechanism": {"key": "revenue_buyback"}, "unique_authors": 3, "post_count": 5},
+            {"key": "stablecoin:stablecoin_payments", "title": "稳定币｜稳定币与支付", "mechanism": {"key": "stablecoin_payments"}, "unique_authors": 9, "post_count": 12},
+        ]
+        questions = self.app_module.build_opportunity_questions(topics)
+        self.assertEqual([item["kind"] for item in questions], ["liquidity_activity", "short_term_trade", "trend_position"])
+        self.assertEqual(questions[0]["source_topic_keys"], ["rwa:tokenized_equities"])
+        self.assertTrue(questions[0]["eligible"])
+        self.assertEqual(questions[0]["status"], "needs_live_research")
+        self.assertEqual(questions[0]["title"], "小资金 LP｜代币化股票池现在有没有活动可以冲？")
+        self.assertEqual(questions[1]["title"], "短线交易｜BTC 这波还有没有参与空间？")
+        self.assertEqual([item["priority"] for item in questions], [1, 2, 3])
+        self.assertIsInstance(questions[0]["research_brief"], list)
+
+    def test_editorial_questions_are_hot_specific_and_do_not_invent_people(self):
+        topics = [
+            {"key": "bitcoin:market_structure", "title": "Bitcoin｜价格与市场结构", "parent": {"title": "Bitcoin"}, "mechanism": {"key": "market_structure"}, "unique_authors": 8, "post_count": 12, "sample_posts": [{"source_ref": "btc-1", "text": "BTC price action"}]},
+            {"key": "rwa:tokenized_equities", "title": "RWA｜代币化股票与流动性", "parent": {"title": "RWA"}, "mechanism": {"key": "tokenized_equities"}, "unique_authors": 6, "post_count": 9},
+            {"key": "stablecoin:stablecoin_payments", "title": "稳定币｜稳定币与支付", "parent": {"title": "稳定币"}, "mechanism": {"key": "stablecoin_payments"}, "unique_authors": 3, "post_count": 5, "cross_list_count": 2},
+            {"key": "hyperliquid:revenue_buyback", "title": "Hyperliquid｜收入与回购", "parent": {"title": "Hyperliquid"}, "mechanism": {"key": "revenue_buyback"}, "unique_authors": 5, "post_count": 8, "public_actor": {"name": "基金会", "action_in_samples": True}},
+            {"key": "solana:market_structure", "title": "Solana｜价格与市场结构", "parent": {"title": "Solana"}, "mechanism": {"key": "market_structure"}, "unique_authors": 9, "post_count": 12},
+            {"key": "meme:meme_ecosystem", "title": "Meme｜生态", "mechanism": {"key": "meme_ecosystem"}, "unique_authors": 1, "post_count": 3},
+        ]
+        questions = self.app_module.build_editorial_questions(topics)
+        self.assertEqual(
+            [item["kind"] for item in questions],
+            ["trading_philosophy", "wealth_view", "ct_culture", "wealth_view", "public_strategy_read"],
+        )
+        self.assertIn("BTC", questions[0]["title"])
+        self.assertIn("突然觉得自己看懂了市场", questions[0]["title"])
+        self.assertIn("高 APY", questions[1]["title"])
+        self.assertIn("用户还需要知道自己用了 Crypto", questions[2]["title"])
+        self.assertIn("回购能力", questions[3]["title"])
+        self.assertEqual(questions[0]["source_sample_refs"], ["btc-1"])
+        self.assertEqual(questions[0]["status"], "editorial_ready")
+        self.assertTrue(questions[0]["eligible"])
+        self.assertNotIn("人物", " ".join(item["title"] for item in questions if item["kind"] != "public_strategy_read"))
+        self.assertEqual([item["priority"] for item in questions], [1, 2, 3, 4, 5])
+
+    def test_research_questions_are_hot_specific_varied_and_bounded(self):
+        topics = [
+            {"key": "rwa:tokenized_equities", "title": "RWA｜代币化股票与流动性", "mechanism": {"key": "tokenized_equities"}, "unique_authors": 6, "post_count": 9},
+            {"key": "stablecoin:stablecoin_payments", "title": "稳定币｜稳定币支付", "mechanism": {"key": "stablecoin_payments"}, "unique_authors": 5, "post_count": 8},
+            {"key": "hyperliquid:revenue_buyback", "title": "Hyperliquid｜收入与回购", "parent": {"title": "Hyperliquid"}, "mechanism": {"key": "revenue_buyback"}, "unique_authors": 5, "post_count": 8},
+            {"key": "bitcoin:market_structure", "title": "Bitcoin｜价格与市场结构", "parent": {"title": "Bitcoin"}, "mechanism": {"key": "market_structure"}, "unique_authors": 8, "post_count": 12},
+            {"key": "solana:fee_model", "title": "Solana｜费用模型", "parent": {"title": "Solana"}, "mechanism": {"key": "fee_model"}, "unique_authors": 4, "post_count": 6},
+            {"key": "rwa:regulation", "title": "RWA｜监管与准入", "mechanism": {"key": "regulation"}, "unique_authors": 3, "post_count": 5},
+            {"key": "cold:regulation", "title": "冷门｜监管与准入", "mechanism": {"key": "regulation"}, "unique_authors": 1, "post_count": 1},
+        ]
+        questions = self.app_module.build_research_questions(topics)
+        self.assertEqual(
+            [item["kind"] for item in questions],
+            ["industry_structure", "adoption", "competition", "adoption", "unit_economics", "valuation", "market_structure", "cycle", "unit_economics", "thesis_check", "thesis_check"],
+        )
+        self.assertEqual(questions[0]["title"], "行业研究｜代币化股票的流动性，到底靠什么撑起来？")
+        self.assertEqual(questions[0]["source_topic_keys"], ["rwa:tokenized_equities"])
+        self.assertEqual(questions[0]["status"], "needs_live_research")
+        self.assertTrue(questions[0]["eligible"])
+        self.assertEqual([item["priority"] for item in questions], list(range(1, 12)))
+        self.assertTrue(all(len(item["research_brief"]) >= 2 for item in questions))
+        self.assertTrue(all("冷门" not in item["title"] for item in questions))
+        self.assertEqual(set(item["kind"] for item in questions), set(self.app_module.RESEARCH_QUESTION_KINDS))
+        self.assertTrue(all(sum(item["kind"] == kind for item in questions) <= 2 for kind in self.app_module.RESEARCH_QUESTION_KINDS))
+
+    def test_research_questions_use_topic_specific_hype_and_sol_angles(self):
+        topics = [
+            {"key": "hyperliquid:market_structure", "title": "Hyperliquid｜价格与市场结构", "mechanism": {"key": "market_structure"}, "unique_authors": 6, "post_count": 6},
+            {"key": "solana:market_structure", "title": "Solana｜价格与市场结构", "mechanism": {"key": "market_structure"}, "unique_authors": 5, "post_count": 7},
+        ]
+        questions = self.app_module.build_research_questions(topics)
+        titles = [item["title"] for item in questions]
+        self.assertTrue(any("Builder Codes" in title and "改变了 Hyperliquid 哪一层" in title for title in titles))
+        self.assertTrue(any("SOL 的市场热度" in title for title in titles))
+        self.assertFalse(any("HYPE 这轮行情是谁在定价" in title for title in titles))
+
+    def test_research_titles_do_not_smuggle_in_unverified_market_claims(self):
+        topics = [
+            {"key": "rwa:tokenized_equities", "title": "RWA｜代币化股票与流动性", "mechanism": {"key": "tokenized_equities"}, "unique_authors": 6, "post_count": 9},
+            {"key": "stablecoin:stablecoin_payments", "title": "稳定币｜稳定币支付", "mechanism": {"key": "stablecoin_payments"}, "unique_authors": 5, "post_count": 8},
+            {"key": "hyperliquid:revenue_buyback", "title": "Hyperliquid｜收入与回购", "parent": {"title": "Hyperliquid"}, "mechanism": {"key": "revenue_buyback"}, "unique_authors": 5, "post_count": 8},
+            {"key": "bitcoin:market_structure", "title": "Bitcoin｜价格与市场结构", "parent": {"title": "Bitcoin"}, "mechanism": {"key": "market_structure"}, "unique_authors": 8, "post_count": 12},
+            {"key": "hyperliquid:market_structure", "title": "Hyperliquid｜价格与市场结构", "parent": {"title": "Hyperliquid"}, "mechanism": {"key": "market_structure"}, "unique_authors": 6, "post_count": 6},
+            {"key": "solana:market_structure", "title": "Solana｜价格与市场结构", "parent": {"title": "Solana"}, "mechanism": {"key": "market_structure"}, "unique_authors": 5, "post_count": 7},
+        ]
+        titles = [item["title"] for item in self.app_module.build_research_questions(topics)]
+        self.assertGreaterEqual(len(titles), 10)
+        self.assertTrue(all(
+            phrase not in title
+            for title in titles
+            for phrase in self.app_module.RESEARCH_TITLE_BANNED_PHRASES
+        ))
+        self.assertFalse(any("还是" in title for title in titles))
+        self.assertFalse(any("哪些公开数据" in title for title in titles))
+        self.assertFalse(any("分别在显示什么" in title for title in titles))
+
+    def test_old_daily_run_rebuilds_stale_research_titles(self):
+        topic = {
+            "key": "bitcoin:market_structure",
+            "title": "Bitcoin｜价格与市场结构",
+            "parent": {"title": "Bitcoin"},
+            "mechanism": {"key": "market_structure"},
+            "unique_authors": 8,
+            "post_count": 12,
+        }
+        row = {
+            "context_date": "2026-08-24",
+            "raw_manifest": "{}",
+            "raw_cards": json.dumps(
+                {
+                    "discussion_topics": [topic],
+                    "research_questions": [{"title": "市场结构｜BTC 这轮行情是谁在定价？"}],
+                },
+                ensure_ascii=False,
+            ),
+            "synthesis": json.dumps(
+                {"research_questions": [{"title": "市场结构｜BTC 这轮行情是谁在定价？"}]},
+                ensure_ascii=False,
+            ),
+        }
+        rebuilt = self.app_module.daily_context_run_dict(row)
+        titles = [item["title"] for item in rebuilt["raw_cards"]["research_questions"]]
+        self.assertNotIn("市场结构｜BTC 这轮行情是谁在定价？", titles)
+        self.assertEqual(titles, [item["title"] for item in rebuilt["synthesis"]["research_questions"]])
+
+    def test_daily_card_synthesis_scopes_model_output_to_this_run(self):
+        cards = {
+            "fact_cards": [{"representative_text": "本轮事实卡", "source_lists": ["list-a"]}],
+            "opinion_cards": [{"text": "本轮观点卡", "source_lists": ["list-b"]}],
+            "coverage": {},
+        }
+        synthesis = self.app_module.bounded_daily_card_synthesis(
+            {
+                "market_state": "The market moved.",
+                "event_clusters": "This event happened.",
+                "debates": "People disagree.",
+                "unknowns": "Unknown.",
+                "sources": [{"url": "https://outside.example"}],
+            },
+            cards,
+        )
+        self.assertTrue(synthesis["market_state"].startswith("本轮母池的讨论面与注意力结构："))
+        self.assertTrue(synthesis["event_clusters"].startswith("以下仅归纳本轮卡片提到的事件与话题："))
+        self.assertTrue(synthesis["debates"].startswith("以下仅归纳本轮卡片中的解读与分歧："))
+        self.assertIn("本轮有 1 条事实候选卡", synthesis["evidence"])
+        self.assertEqual(synthesis["sources"], [{"source_list": "list-a"}, {"source_list": "list-b"}])
+
+    def test_daily_context_run_is_idempotent_reviewable_and_independent_of_writes(self):
+        calls = []
+        run_date = self.app_module.shanghai_today()
+
+        def collect(_accounts, _db, output, **kwargs):
+            calls.append(("collect", kwargs["key"]))
+            Path(output).mkdir(parents=True, exist_ok=True)
+            return {"account_universe": 2, "accounts_fetched": 2, "posts_seen": 4}
+
+        def cross_validate(_db, output, **_kwargs):
+            output = Path(output)
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "fact_cards.json").write_text(
+                json.dumps({"cards": [{"status": "candidate", "representative_text": "事实卡", "author_count": 2}]}),
+                encoding="utf-8",
+            )
+            (output / "opinion_cards.json").write_text(
+                json.dumps(
+                    {
+                        "opinions": [
+                            {"text": f"观点卡 {index}", "score": 8}
+                            for index in range(130)
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output / "attention_topics.json").write_text(
+                json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "title": f"热点主题 {index}",
+                                "key": f"hot-{index}",
+                                "unique_authors": 10 - index % 3,
+                                "post_count": 20 - index % 5,
+                            }
+                            for index in range(25)
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (output / "discussion_topics.json").write_text(
+                json.dumps(
+                    {
+                        "hot": [
+                            {
+                                "title": f"热点主题 {index}｜具体机制",
+                                "key": f"hot-{index}:mechanism",
+                                "mechanism": {"key": "market_structure", "title": "价格与市场结构"},
+                                "unique_authors": 10 - index % 3,
+                                "post_count": 20 - index % 5,
+                            }
+                            for index in range(25)
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "source_posts": 4,
+                "fact_cards": 1,
+                "opinion_cards": 130,
+                "attention_topics": 25,
+                "discussion_topics": 25,
+            }
+
+        content = json.dumps(
+            {
+                "market_state": "市场有新事件。",
+                "event_clusters": "事件被讨论。",
+                "debates": "可持续性有分歧。",
+                "evidence": "来自事实卡。",
+                "unknowns": "覆盖有限。",
+                "sources": [],
+                "selected_topics": [
+                    {
+                        "claim_key": "new-opportunity",
+                        "subject": "热点主题 0",
+                        "title": "热点主题 0 出现新的参与条件",
+                        "core_claim": "新的参与条件改变了原有机会判断。",
+                        "content_type": "opportunity",
+                        "kind": "short_term_trade",
+                        "source_topic_keys": ["hot-0:mechanism"],
+                        "fact_basis": "事实卡",
+                        "opinion_basis": "观点卡",
+                        "material_delta": "新的条件改变了判断",
+                        "audience_value": "改变参与动作",
+                        "why_now": "今日讨论",
+                        "persona_fit": ["acheng"]
+                    },
+                    {
+                        "claim_key": "new-editorial",
+                        "subject": "热点主题 1",
+                        "title": "热点主题 1 的新分歧改变了市场解释",
+                        "core_claim": "新分歧推翻了旧解释。",
+                        "content_type": "editorial",
+                        "kind": "trading_philosophy",
+                        "source_topic_keys": ["hot-1:mechanism"],
+                        "fact_basis": "事实卡",
+                        "opinion_basis": "观点卡",
+                        "material_delta": "出现新的反方证据",
+                        "audience_value": "改变市场理解",
+                        "why_now": "今日讨论",
+                        "persona_fit": ["aye"]
+                    },
+                    {
+                        "claim_key": "new-research",
+                        "subject": "热点主题 2",
+                        "title": "热点主题 2 的收入归属已经改变",
+                        "core_claim": "新机制改变了收入归属。",
+                        "content_type": "research",
+                        "kind": "unit_economics",
+                        "source_topic_keys": ["hot-2:mechanism"],
+                        "fact_basis": "事实卡",
+                        "opinion_basis": "观点卡",
+                        "material_delta": "收入归属发生变化",
+                        "audience_value": "改变项目判断",
+                        "why_now": "今日讨论",
+                        "persona_fit": ["xiaoman"]
+                    }
+                ],
+                "rejected_topics": []
+            },
+            ensure_ascii=False,
+        )
+        payload = {"choices": [{"message": {"content": content}}]}
+        factory = lambda **_kwargs: FakeAsyncClient(payload, [])
+        sources = SimpleNamespace(collect=collect, cross_validate=cross_validate)
+        with patch.object(self.app_module, "market_sources_module", return_value=sources), patch.object(
+            self.app_module, "twitter241_api_key", return_value="runtime-key"
+        ), patch.object(self.app_module, "llm_api_key", return_value="test"), patch.object(
+            self.app_module.httpx, "AsyncClient", factory
+        ):
+            started = self.client.post(
+                f"/api/context/daily-runs/{run_date}/run"
+            )
+            self.assertTrue(started.json()["started"])
+            first = self.wait_for_daily_run(run_date)
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(first.json()["status"], "needs_review")
+            self.assertEqual(self.client.get(f"/api/context/daily/{run_date}").status_code, 404)
+            self.assertEqual(first.json()["raw_cards"]["fact_cards"][0]["representative_text"], "事实卡")
+            self.assertEqual(len(first.json()["raw_cards"]["opinion_cards"]), 130)
+            self.assertEqual(len(first.json()["raw_cards"]["discussion_topics"]), 20)
+            self.assertEqual(len(first.json()["raw_cards"]["opportunity_questions"]), 1)
+            self.assertEqual(len(first.json()["raw_cards"]["editorial_questions"]), 1)
+            self.assertEqual(len(first.json()["raw_cards"]["research_questions"]), 1)
+            self.assertEqual(len(first.json()["raw_cards"]["question_candidates"]["opportunity"]), 20)
+            self.assertEqual(len(first.json()["raw_cards"]["attention_topics"]), 20)
+            question_title = first.json()["raw_cards"]["opportunity_questions"][0]["title"]
+            editorial_title = first.json()["raw_cards"]["editorial_questions"][0]["title"]
+            research_title = first.json()["raw_cards"]["research_questions"][0]["title"]
+
+            duplicate = self.client.post(
+                f"/api/context/daily-runs/{run_date}/run"
+            )
+            self.assertFalse(duplicate.json()["started"])
+            self.assertEqual(len(calls), 1)
+
+            run_id = first.json()["id"]
+            reviewed = self.client.put(
+                f"/api/context/daily-runs/{run_date}/review",
+                json={"market_state": "人工修订", "sources": [{"url": "https://example.com"}]},
+            )
+            self.assertEqual(reviewed.status_code, 200)
+            self.assertEqual(reviewed.json()["synthesis"]["market_state"], "人工修订")
+            self.assertEqual(len(reviewed.json()["synthesis"]["opportunity_questions"]), 1)
+            self.assertEqual(len(reviewed.json()["synthesis"]["editorial_questions"]), 1)
+            self.assertEqual(len(reviewed.json()["synthesis"]["research_questions"]), 1)
+            approved = self.client.post(f"/api/context/daily-runs/{run_date}/approve")
+            self.assertEqual(approved.json()["status"], "approved")
+            after_approval = self.client.post(
+                f"/api/context/daily-runs/{run_date}/run"
+            )
+            self.assertEqual(after_approval.json()["status"], "approved")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                self.client.get(f"/api/context/daily/{run_date}").json()["market_state"], "人工修订"
+            )
+            pack = self.client.post(
+                "/api/personas/1/context-packs",
+                json={"topic": question_title},
+            ).json()
+            self.assertEqual(len(pack["content"]["attention_topics"]), 10)
+            self.assertEqual(len(pack["content"]["opportunity_questions"]), 1)
+            self.assertEqual(pack["content"]["topic_attention"]["status"], "hot")
+            self.assertEqual(pack["content"]["topic_attention"]["selection_source"], "discussion_topics")
+            self.assertEqual(pack["content"]["selected_opportunity_question"]["kind"], "short_term_trade")
+            self.assertEqual(len(pack["content"]["discussion_topics"]), 1)
+
+            selected_pack = self.client.post(
+                "/api/personas/1/context-packs",
+                json={"topic": question_title},
+            ).json()["content"]
+            self.assertEqual(selected_pack["selected_opportunity_question"]["title"], question_title)
+            self.assertEqual(len(selected_pack["opportunity_questions"]), 1)
+            self.assertEqual(len(selected_pack["discussion_topics"]), 1)
+
+            editorial_pack = self.client.post(
+                "/api/personas/1/context-packs",
+                json={"topic": editorial_title},
+            ).json()["content"]
+            self.assertEqual(editorial_pack["selected_editorial_question"]["title"], editorial_title)
+            self.assertEqual(editorial_pack["opportunity_questions"], [])
+            self.assertEqual(len(editorial_pack["editorial_questions"]), 1)
+            self.assertEqual(len(editorial_pack["discussion_topics"]), 1)
+            self.assertEqual(editorial_pack["topic_attention"]["status"], "hot")
+
+            research_pack = self.client.post(
+                "/api/personas/1/context-packs",
+                json={"topic": research_title},
+            ).json()["content"]
+            self.assertEqual(research_pack["selected_research_question"]["title"], research_title)
+            self.assertEqual(len(research_pack["research_questions"]), 1)
+            self.assertEqual(research_pack["opportunity_questions"], [])
+            self.assertEqual(research_pack["editorial_questions"], [])
+            self.assertEqual(research_pack["attention_topics"], [])
+            self.assertEqual(len(research_pack["discussion_topics"]), 1)
+
+    def test_daily_context_source_posts_returns_paginated_artifact_only_after_completion(self):
+        run_date = self.app_module.shanghai_today()
+        run, _ = self.app_module.create_daily_context_run(run_date, "manual")
+        pending = self.client.get(f"/api/context/daily-runs/{run_date}/source-posts")
+        self.assertEqual(pending.status_code, 404)
+        self.app_module.update_daily_context_run(run["id"], status="failed")
+
+        def collect(_accounts, _db, output, **_kwargs):
+            output = Path(output)
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-08-24T00:00:00+00:00",
+                        "since": "2026-08-23T00:00:00+00:00",
+                        "account_universe": 4684,
+                        "accounts_covered": 4680,
+                        "accounts_fetched": 4600,
+                        "accounts_skipped": 80,
+                        "accounts_failed": 4,
+                        "posts": [
+                            {
+                                "post_id": "post_one",
+                                "author_id": "anon_one",
+                                "handle": "",
+                                "text": "第一条原帖",
+                                "created_at": "2026-08-24T00:00:00+00:00",
+                                "url": "",
+                                "is_reply": False,
+                                "source_lists": ["crypto"],
+                                "internal_secret": "must not be exposed",
+                            },
+                            {
+                                "post_id": "post_two",
+                                "author_id": "anon_two",
+                                "handle": "",
+                                "text": "第二条原帖",
+                                "created_at": "2026-08-23T23:00:00+00:00",
+                                "url": "",
+                                "is_reply": True,
+                                "source_lists": ["crypto", "trading"],
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            return {"accounts_fetched": 1, "posts_seen": 2}
+
+        def cross_validate(_db, output, **_kwargs):
+            output = Path(output)
+            (output / "fact_cards.json").write_text(
+                json.dumps({"cards": [{"representative_text": "事实卡", "author_count": 2}]}),
+                encoding="utf-8",
+            )
+            (output / "opinion_cards.json").write_text(json.dumps({"opinions": []}), encoding="utf-8")
+            return {"source_posts": 2, "fact_cards": 1, "opinion_cards": 0}
+
+        payload = {"choices": [{"message": {"content": json.dumps({"unknowns": "覆盖有限。"})}}]}
+        factory = lambda **_kwargs: FakeAsyncClient(payload, [])
+        with patch.object(
+            self.app_module,
+            "market_sources_module",
+            return_value=SimpleNamespace(collect=collect, cross_validate=cross_validate),
+        ), patch.object(self.app_module, "twitter241_api_key", return_value="runtime-key"), patch.object(
+            self.app_module, "llm_api_key", return_value="test"
+        ), patch.object(self.app_module.httpx, "AsyncClient", factory):
+            self.client.post(f"/api/context/daily-runs/{run_date}/retry")
+            self.wait_for_daily_run(run_date)
+
+        page = self.client.get(f"/api/context/daily-runs/{run_date}/source-posts?limit=1&offset=1")
+        self.assertEqual(page.status_code, 200)
+        body = page.json()
+        self.assertEqual(body["total"], 2)
+        self.assertEqual(body["coverage"]["account_universe"], 4684)
+        self.assertEqual(body["posts"], [{
+            "post_id": "post_two",
+            "author_id": "anon_two",
+            "handle": "",
+            "text": "第二条原帖",
+            "created_at": "2026-08-23T23:00:00+00:00",
+            "url": "",
+            "is_reply": True,
+            "source_lists": ["crypto", "trading"],
+        }])
+        self.assertNotIn("internal_secret", self.client.get(
+            f"/api/context/daily-runs/{run_date}/source-posts"
+        ).text)
+
+    def test_daily_context_run_failure_keeps_manifest_and_can_retry(self):
+        run_date = self.app_module.shanghai_today()
+        def fail_collect(*_args, **_kwargs):
+            raise RuntimeError("Twitter241 unavailable")
+
+        with patch.object(
+            self.app_module,
+            "market_sources_module",
+            return_value=SimpleNamespace(collect=fail_collect, cross_validate=lambda *_args, **_kwargs: {}),
+        ), patch.object(self.app_module, "twitter241_api_key", return_value="runtime-key"):
+            started = self.client.post(
+                f"/api/context/daily-runs/{run_date}/run"
+            )
+            self.assertTrue(started.json()["started"])
+            failed = self.wait_for_daily_run(run_date)
+        self.assertEqual(failed.status_code, 200)
+        self.assertEqual(failed.json()["status"], "failed")
+        self.assertIn("Twitter241 unavailable", failed.json()["error"])
+        self.assertEqual(failed.json()["raw_manifest"]["failed_stage"], "setup")
+
+        def collect(_accounts, _db, output, **_kwargs):
+            Path(output).mkdir(parents=True, exist_ok=True)
+            return {"accounts_fetched": 1, "posts_seen": 1}
+
+        def cross_validate(_db, output, **_kwargs):
+            output = Path(output)
+            (output / "fact_cards.json").write_text(
+                json.dumps({"cards": [{"representative_text": "重跑后的事实", "author_count": 2}]}),
+                encoding="utf-8",
+            )
+            (output / "opinion_cards.json").write_text(json.dumps({"opinions": []}), encoding="utf-8")
+            return {"source_posts": 1, "fact_cards": 1, "opinion_cards": 0}
+
+        payload = {"choices": [{"message": {"content": json.dumps({"unknowns": "无卡片"})}}]}
+        factory = lambda **_kwargs: FakeAsyncClient(payload, [])
+        with patch.object(
+            self.app_module,
+            "market_sources_module",
+            return_value=SimpleNamespace(collect=collect, cross_validate=cross_validate),
+        ), patch.object(self.app_module, "twitter241_api_key", return_value="runtime-key"), patch.object(
+            self.app_module, "llm_api_key", return_value="test"
+        ), patch.object(self.app_module.httpx, "AsyncClient", factory):
+            self.client.post(f"/api/context/daily-runs/{run_date}/retry")
+            retried = self.wait_for_daily_run(run_date)
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(retried.json()["status"], "needs_review")
+
+    def test_daily_context_run_rejects_empty_cards_without_calling_llm(self):
+        run_date = self.app_module.shanghai_today()
+        def collect(_accounts, _db, output, **_kwargs):
+            Path(output).mkdir(parents=True, exist_ok=True)
+            return {"accounts_fetched": 1, "posts_seen": 1}
+
+        def cross_validate(_db, output, **_kwargs):
+            output = Path(output)
+            (output / "fact_cards.json").write_text(json.dumps({"cards": []}), encoding="utf-8")
+            (output / "opinion_cards.json").write_text(json.dumps({"opinions": []}), encoding="utf-8")
+            return {"source_posts": 1, "fact_cards": 0, "opinion_cards": 0}
+
+        with patch.object(
+            self.app_module,
+            "market_sources_module",
+            return_value=SimpleNamespace(collect=collect, cross_validate=cross_validate),
+        ), patch.object(self.app_module, "twitter241_api_key", return_value="runtime-key"), patch.object(
+            self.app_module, "synthesize_daily_cards", side_effect=AssertionError("LLM should not run")
+        ):
+            self.client.post(f"/api/context/daily-runs/{run_date}/run")
+            response = self.wait_for_daily_run(run_date)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "failed")
+        self.assertIn("未产出可用事实或观点卡", response.json()["error"])
+
+    def test_daily_context_scheduler_uses_shanghai_run_time(self):
+        class BeforeSchedule:
+            @classmethod
+            def now(cls, _timezone):
+                return datetime(2026, 8, 24, 8, 14, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        class AfterSchedule:
+            @classmethod
+            def now(cls, _timezone):
+                return datetime(2026, 8, 24, 8, 15, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        with patch.object(self.app_module, "daily_context_scheduler_enabled", return_value=True), patch.object(
+            self.app_module, "daily_context_schedule", return_value=(8, 15)
+        ), patch.object(self.app_module, "queue_daily_context") as queue, patch.object(
+            self.app_module, "datetime", BeforeSchedule
+        ):
+            asyncio.run(self.app_module.run_due_daily_context())
+            queue.assert_not_called()
+
+        with patch.object(self.app_module, "daily_context_scheduler_enabled", return_value=True), patch.object(
+            self.app_module, "daily_context_schedule", return_value=(8, 15)
+        ), patch.object(self.app_module, "queue_daily_context") as queue, patch.object(
+            self.app_module, "datetime", AfterSchedule
+        ):
+            asyncio.run(self.app_module.run_due_daily_context())
+            queue.assert_called_once_with("2026-08-24", "schedule")
+
+        response = self.client.post("/api/context/daily-runs/1999-01-01/run")
+        self.assertEqual(response.status_code, 422)
+        response = self.client.post("/api/context/daily-runs/1999-01-01/retry")
+        self.assertEqual(response.status_code, 422)
+
+    def test_daily_context_run_rejects_stale_cards_when_every_account_fetch_fails(self):
+        run_date = self.app_module.shanghai_today()
+        def collect(_accounts, _db, output, **_kwargs):
+            Path(output).mkdir(parents=True, exist_ok=True)
+            return {
+                "account_universe": 2,
+                "accounts_fetched": 0,
+                "accounts_skipped": 0,
+                "accounts_failed": 2,
+                "posts_seen": 0,
+            }
+
+        def cross_validate(_db, output, **_kwargs):
+            output = Path(output)
+            (output / "fact_cards.json").write_text(
+                json.dumps({"cards": [{"representative_text": "旧卡片"}]}), encoding="utf-8"
+            )
+            (output / "opinion_cards.json").write_text(json.dumps({"opinions": []}), encoding="utf-8")
+            return {"source_posts": 1, "fact_cards": 1, "opinion_cards": 0}
+
+        with patch.object(
+            self.app_module,
+            "market_sources_module",
+            return_value=SimpleNamespace(collect=collect, cross_validate=cross_validate),
+        ), patch.object(self.app_module, "twitter241_api_key", return_value="runtime-key"), patch.object(
+            self.app_module, "synthesize_daily_cards", side_effect=AssertionError("LLM should not run")
+        ):
+            self.client.post(f"/api/context/daily-runs/{run_date}/run")
+            response = self.wait_for_daily_run(run_date)
+        self.assertEqual(response.json()["status"], "failed")
+        self.assertIn("账号抓取全部失败", response.json()["error"])
+
+    def test_three_curated_asset_collections_are_ready(self):
+        personas = {persona["slug"]: persona for persona in self.client.get("/api/personas").json()}
+        expected = {
+            "acheng": 40,
+            "ridehail-driver-zhao": 40,
+            "college-student-linjia": 10,
+        }
+        for slug, count in expected.items():
+            persona = self.client.get(f"/api/personas/{personas[slug]['id']}").json()
+            self.assertEqual(len(persona["assets"]), count)
+            self.assertTrue(persona["asset_collection"]["ready"])
+
+        acheng_avatar = self.client.get(f"/api/personas/{personas['acheng']['id']}").json()["avatar_url"]
+        driver_avatar = self.client.get(f"/api/personas/{personas['ridehail-driver-zhao']['id']}").json()["avatar_url"]
+        self.assertIn("avatar-x-v4-natural-meituan.png", acheng_avatar)
+        self.assertIn("avatar-x-v3-natural.png", driver_avatar)
+
+        acheng = self.client.get(f"/api/personas/{personas['acheng']['id']}").json()
+        response = self.client.post(
+            f"/api/personas/{personas['acheng']['id']}/prompt-preview",
+            json={"data": acheng["draft"]},
+        )
+        self.assertIn("## 已连接素材", response.json()["prompt"])
+        self.assertIn("acheng:01-income-closeup.jpeg", response.json()["prompt"])
+
+        student = self.client.get(f"/api/personas/{personas['college-student-linjia']['id']}").json()
+        self.assertIn("real-reference-core-10", student["avatar_url"])
+        self.assertNotIn("状态：已排除", student["draft"]["identity"]["profile"])
+        self.assertEqual(student["draft"]["visual"]["master_prompt"], "")
+
+if __name__ == "__main__":
+    unittest.main()
