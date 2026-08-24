@@ -30,6 +30,17 @@ DAILY_CONTEXT_SOURCE_DB = DATA_DIR / "market_source_posts.sqlite3"
 DAILY_CONTEXT_TASKS: set[asyncio.Task] = set()
 EDITORIAL_GROK_CONTEXT_CACHE: dict[str, dict] = {}
 EDITORIAL_GROK_CONTEXT_CACHE_MAX = 64
+EDITORIAL_ANGLE_EXPANSION_REVISION = 1
+EDITORIAL_ANGLE_MAX_ATTEMPTS = 3
+EDITORIAL_ANGLE_FAMILIES = {
+    "opportunity": "opportunity",
+    "industry_evaluation": "research",
+    "project_evaluation": "research",
+    "market_cognition": "editorial",
+    "trading_philosophy": "editorial",
+    "people_or_community": "editorial",
+    "other": "editorial",
+}
 TOPIC_SELECTION_POLICY_PATH = APP_DIR / "configs" / "topic_selection_policy.json"
 
 PERSONA_META = {
@@ -1635,6 +1646,8 @@ async def synthesize_daily_cards(context_date: str, cards: dict):
         "必须按照 topic_selection_policy 逐条筛选，并把 claim_history 视为全账号已覆盖历史。"
         "热点不等于可写；数字刷新不等于观点更新。与历史主张语义相同且没有 material delta 的研究题必须拒绝。"
         "去重单位是核心主张，不是事件或项目：同一热点下互不重叠的研究、机会和评论角度可以分别保留。"
+        "selected_topics 在这里负责确定今天值得继续研究的母题和初始判断，不会直接进入人设写稿；"
+        "审批后还会先经过 Grok 实时研究与 Gemini 多角度展开，因此不要为了预填所有表达方向而制造常识题。"
         "评论题可以复用当天事件背景，但必须有鲜明立场和非显而易见的表达。"
         "圈内读者不需要当天材料也能回答的常识题必须拒绝。按 slate_guidance 形成足够丰富但不凑数的题单。\n"
         "selected_topics 每项必须包含 claim_key,subject,title,core_claim,content_type,kind,source_topic_keys,"
@@ -2379,6 +2392,250 @@ EDITORIAL_CLAIM_KEY = re.compile(r"^[a-z0-9][a-z0-9:_-]{2,119}$")
 EDITORIAL_EVALUATOR_REVISION = 2
 
 
+def editorial_public_topics(cards: dict):
+    stage = cards.get("editorial_angle_expansion", {}) if isinstance(cards, dict) else {}
+    if isinstance(stage, dict) and stage:
+        if stage.get("status") != "ready":
+            return []
+        topics = stage.get("expanded_topics", [])
+        return [item for item in topics if isinstance(item, dict) and item.get("claim_key")]
+    topics = cards.get("selected_topics", []) if isinstance(cards, dict) else []
+    return [item for item in topics if isinstance(item, dict) and item.get("claim_key")]
+
+
+def editorial_mother_topics(cards: dict):
+    """Collapse selected writing hints back to the approved subjects they came from."""
+    selected = cards.get("selected_topics", []) if isinstance(cards, dict) else []
+    discussions = {
+        str(item.get("key")): item for item in cards.get("discussion_topics", [])
+        if isinstance(item, dict) and item.get("key")
+    }
+    opinions = {
+        f"opinion:{item.get('source_ref')}": item for item in cards.get("opinion_cards", [])
+        if isinstance(item, dict) and item.get("source_ref")
+    }
+    facts = {}
+    for item in cards.get("fact_cards", []):
+        if not isinstance(item, dict):
+            continue
+        ref = item.get("source_ref") or item.get("representative_source_ref")
+        if ref:
+            facts[f"fact:{ref}"] = item
+    groups = {}
+    for topic in selected:
+        if not isinstance(topic, dict) or not topic.get("claim_key"):
+            continue
+        source_keys = [str(key) for key in topic.get("source_topic_keys", []) if str(key).strip()]
+        if not source_keys:
+            continue
+        seed_key = source_keys[0]
+        group = groups.setdefault(seed_key, {
+            "seed_key": seed_key,
+            "subject": str(topic.get("subject") or topic.get("title") or seed_key)[:200],
+            "title": str(topic.get("source_topic_title") or topic.get("subject") or topic.get("title") or seed_key)[:300],
+            "source_topic_keys": [],
+            "source_refs": [],
+            "parent_claim_keys": [],
+            "selection_hints": [],
+            "heat_evidence": [],
+            "source_context": [],
+        })
+        for key in source_keys:
+            if key not in group["source_topic_keys"]:
+                group["source_topic_keys"].append(key)
+        for ref in topic.get("source_refs", []):
+            ref = str(ref).strip()
+            if ref and ref not in group["source_refs"]:
+                group["source_refs"].append(ref)
+        if topic["claim_key"] not in group["parent_claim_keys"]:
+            group["parent_claim_keys"].append(str(topic["claim_key"]))
+        group["selection_hints"].append({
+            key: str(topic.get(key, ""))[:500]
+            for key in ("title", "core_claim", "material_delta", "audience_value", "why_now")
+            if topic.get(key)
+        })
+        why_now = str(topic.get("why_now", "")).strip()
+        if why_now and why_now not in group["heat_evidence"]:
+            group["heat_evidence"].append(why_now[:500])
+    for group in groups.values():
+        for key in group["source_topic_keys"]:
+            source = discussions.get(key) or opinions.get(key) or facts.get(key)
+            if not source:
+                continue
+            if key in discussions:
+                summary = {
+                    field: source.get(field)
+                    for field in ("key", "title", "unique_authors", "post_count", "parent", "mechanism")
+                    if source.get(field) not in (None, "", [], {})
+                }
+                samples = []
+                for sample in source.get("sample_posts", [])[:5]:
+                    if not isinstance(sample, dict):
+                        continue
+                    samples.append({
+                        field: sample.get(field)
+                        for field in ("source_ref", "text", "created_at", "like_count", "retweet_count")
+                        if sample.get(field) not in (None, "")
+                    })
+                if samples:
+                    summary["sample_posts"] = samples
+                group["source_context"].append(summary)
+                for ref in source.get("sample_refs", []):
+                    ref = str(ref).strip()
+                    if ref and ref not in group["source_refs"]:
+                        group["source_refs"].append(ref)
+                authors = source.get("unique_authors")
+                posts = source.get("post_count")
+                if authors or posts:
+                    group["heat_evidence"].append(f"母池讨论作者 {authors or 0}，原帖 {posts or 0}。")
+            else:
+                group["source_context"].append({
+                    field: source.get(field)
+                    for field in (
+                        "source_ref", "topic", "summary", "viewpoint", "representative_text",
+                        "claim", "stance", "status",
+                    )
+                    if source.get(field) not in (None, "", [], {})
+                })
+        group["source_refs"] = group["source_refs"][:30]
+        group["selection_hints"] = group["selection_hints"][:8]
+        group["heat_evidence"] = list(dict.fromkeys(group["heat_evidence"]))[:8]
+        group["source_context"] = group["source_context"][:8]
+    return list(groups.values())[:16]
+
+
+def editorial_angle_input_hash(mother_topics: list[dict], daily: dict):
+    payload = {
+        "revision": EDITORIAL_ANGLE_EXPANSION_REVISION,
+        "policy_version": topic_selection_policy().get("version"),
+        "mother_topics": mother_topics,
+        "daily": editorial_daily_input(daily),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_history: list[dict]):
+    if not isinstance(result, dict) or not isinstance(result.get("angles"), list) or not isinstance(
+        result.get("rejected_angles"), list
+    ):
+        raise ValueError("Gemini 多角度选题缺少 angles 或 rejected_angles 数组")
+    mothers = {str(item.get("seed_key")): item for item in mother_topics if item.get("seed_key")}
+    history_keys = {str(item.get("claim_key", "")).strip().lower() for item in claim_history}
+    history_claims = {
+        normalize_editorial_claim(item.get("core_claim")) for item in claim_history
+        if normalize_editorial_claim(item.get("core_claim"))
+    }
+    accepted, rejected, seen_keys, seen_claims = [], [], set(), set()
+
+    def reject(item, reason_code, reason):
+        rejected.append({
+            "parent_seed_key": str(item.get("parent_seed_key", ""))[:300],
+            "title": str(item.get("title", ""))[:300],
+            "core_claim": str(item.get("core_claim", ""))[:1000],
+            "reason_code": reason_code,
+            "reason": reason,
+        })
+
+    explicitly_rejected_mothers = set()
+    raw_rejected = result["rejected_angles"]
+    for item in raw_rejected[:40]:
+        if (
+            isinstance(item, dict) and item.get("reason_code")
+            and str(item.get("parent_seed_key", "")) in mothers
+        ):
+            explicitly_rejected_mothers.add(str(item["parent_seed_key"]))
+            reject(item, str(item["reason_code"])[:80], str(item.get("reason", "模型主动淘汰。"))[:500])
+    raw_angles = result["angles"]
+    for item in raw_angles[:64]:
+        if not isinstance(item, dict):
+            continue
+        parent_key = str(item.get("parent_seed_key", ""))
+        mother = mothers.get(parent_key)
+        if not mother:
+            reject(item, "invalid_parent", "角度没有对应本轮已批准母题。")
+            continue
+        claim_key = str(item.get("claim_key", "")).strip().lower()
+        family = str(item.get("angle_family", "")).strip()
+        required = (
+            "title", "core_claim", "specific_tension", "non_obvious_delta",
+            "audience_value", "why_worth_saying",
+        )
+        if not claim_key or not EDITORIAL_CLAIM_KEY.fullmatch(claim_key) or any(
+            not str(item.get(key, "")).strip() for key in required
+        ):
+            reject(item, "incomplete_angle", "缺少可执行的结论、冲突、增量或读者价值。")
+            continue
+        if family not in EDITORIAL_ANGLE_FAMILIES:
+            reject(item, "invalid_angle_family", "角度镜头不在允许范围内。")
+            continue
+        core_claim = str(item["core_claim"]).strip()
+        normalized = normalize_editorial_claim(core_claim)
+        if len(normalized) < 10 or any(phrase in core_claim for phrase in EMPTY_WAITING_PHRASES):
+            reject(item, "no_conclusion", "没有形成当前可成立的具体结论。")
+            continue
+        generic = {
+            normalize_editorial_claim(value) for value in (
+                "投资有风险", "风险和收益并存", "不要盲目跟风", "需要独立思考",
+                "耐心很重要", "控制仓位很重要", "做好自己的研究",
+            )
+        }
+        if normalized in generic:
+            reject(item, "common_knowledge", "只有人人都会同意的常识。")
+            continue
+        if claim_key in seen_keys or normalized in seen_claims:
+            reject(item, "semantic_duplicate", "与本轮另一角度表达同一个核心判断。")
+            continue
+        if claim_key in history_keys or normalized in history_claims:
+            reject(item, "historical_duplicate", "核心判断已经在团队历史中表达过。")
+            continue
+        if sum(accepted_item["parent_seed_key"] == parent_key for accepted_item in accepted) >= 5:
+            reject(item, "too_many_same_mother", "同一母题只保留最有价值的五个独立判断。")
+            continue
+        seen_keys.add(claim_key)
+        seen_claims.add(normalized)
+        content_type = EDITORIAL_ANGLE_FAMILIES[family]
+        accepted.append({
+            "id": f"{content_type}:angle:{claim_key}",
+            "claim_key": claim_key,
+            "parent_seed_key": parent_key,
+            "parent_claim_keys": mother.get("parent_claim_keys", []),
+            "subject": str(item.get("subject") or mother.get("subject") or mother.get("title"))[:200],
+            "title": str(item["title"]).strip()[:300],
+            "core_claim": core_claim[:1600],
+            "content_type": content_type,
+            "angle_family": family,
+            "specific_tension": str(item["specific_tension"]).strip()[:1000],
+            "non_obvious_delta": str(item["non_obvious_delta"]).strip()[:1000],
+            "material_delta": str(item["non_obvious_delta"]).strip()[:1000],
+            "audience_value": str(item["audience_value"]).strip()[:1000],
+            "why_worth_saying": str(item["why_worth_saying"]).strip()[:1000],
+            "why_now": str(item.get("why_now") or "；".join(mother.get("heat_evidence", [])))[:1000],
+            "statement_mode": "conditional" if item.get("statement_mode") == "conditional" else "opinion",
+            "persona_fit": item.get("persona_fit", []) if isinstance(item.get("persona_fit"), list) else [],
+            "source_topic_keys": mother.get("source_topic_keys", []),
+            "source_refs": mother.get("source_refs", []),
+            "source_topic_title": mother.get("title", ""),
+            "fact_basis": [],
+            "opinion_basis": [core_claim],
+            "question": core_claim,
+            "research_brief": [str(item["specific_tension"])[:500], str(item["non_obvious_delta"])[:500]],
+            "scope": "public",
+            "status": "needs_live_research",
+            "eligible": True,
+            "priority": len(accepted) + 1,
+        })
+        if len(accepted) == 24:
+            break
+    covered_mothers = explicitly_rejected_mothers | {
+        item["parent_seed_key"] for item in accepted
+    }
+    missing_mothers = set(mothers) - covered_mothers
+    if missing_mothers:
+        raise ValueError(f"Gemini 多角度选题未明确处理母题: {','.join(sorted(missing_mothers))}")
+    return accepted, rejected
+
+
 def validate_persona_editorial_decisions(result, topics: list[dict]):
     """Validate the evaluator's pure JSON output without inferring a claim for it."""
     raw = result.get("decisions", result) if isinstance(result, dict) else result
@@ -2481,6 +2738,8 @@ async def evaluate_persona_editorial(persona: dict, persona_context: dict, daily
         "status 只能 WRITE/HOLD/IGNORE；why_me 说明为什么该人设此刻有资格说；"
         "WRITE 必须有新的 claim_key 和非显而易见 core_claim。HOLD 是内部状态，不是正文，绝不以等待后续凑稿。"
         "逐题独立决定，可有多条 WRITE，也可以全部 HOLD 或 IGNORE；不设数量上下限。"
+        "公共 topic 已经通过母题多角度质量门；这里只判断哪个人设最适合说，不再临时发明新主题。"
+        "WRITE 必须保持该 angle 的判断边界，不能合并多个角度，也不能退化成常识。"
         "同一热点只有不同核心主张才值得写；不要复述常识、冷门机制或已覆盖的主张。"
         "approved_editorial_context 里，life_context 只有 first_person_allowed=true 的当前题目能支持具体亲历；"
         "thought_threads 只是观点种子，real_feedback 只是受众信号，素材只证明图片可用，三者都不能证明亲历。"
@@ -2734,10 +2993,12 @@ def current_editorial_input_payload(conn, evaluation: dict, context_date: str):
     daily = daily_context_dict(daily_row)
     daily["approval_revision"] = run["approval_revision"]
     cards = json_value(run["raw_cards"], {})
-    public_topics = [
-        item for item in cards.get("selected_topics", [])
-        if isinstance(item, dict) and item.get("claim_key")
-    ]
+    stage = cards.get("editorial_angle_expansion")
+    if isinstance(stage, dict) and stage:
+        current_angle_hash = editorial_angle_input_hash(editorial_mother_topics(cards), daily)
+        if stage.get("input_hash") != current_angle_hash:
+            return None
+    public_topics = editorial_public_topics(cards)
     topics = public_topics + build_persona_private_topics(editorial_context)
     return editorial_topic_input_payload(
         json_value(evaluation["topic_json"], {}),
@@ -2963,6 +3224,10 @@ def chat_completion_json(body: dict):
     content = body["choices"][0]["message"]["content"]
     if isinstance(content, list):
         content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    return text_json_object(content)
+
+
+def text_json_object(content):
     content = str(content).strip()
     if content.startswith("```"):
         content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -3034,6 +3299,304 @@ async def enrich_persona_editorial_context(topic: dict, verified_facts: dict, da
         EDITORIAL_GROK_CONTEXT_CACHE.pop(next(iter(EDITORIAL_GROK_CONTEXT_CACHE)))
     EDITORIAL_GROK_CONTEXT_CACHE[cache_key] = result
     return result
+
+
+async def research_editorial_angle_context_grok(mother_topics: list[dict], daily_context: dict):
+    """Research the approved mother slate once before any persona sees it."""
+    cache_key = "angles:" + hashlib.sha256(json.dumps(
+        {
+            "context_date": daily_context.get("context_date"),
+            "mother_topics": mother_topics,
+            "daily": editorial_daily_input(daily_context),
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    cached = EDITORIAL_GROK_CONTEXT_CACHE.get(cache_key)
+    if cached:
+        return cached
+    provider = editorial_provider_config("GROK")
+    compact_topics = []
+    for topic in mother_topics:
+        compact_topics.append({
+            "seed_key": topic.get("seed_key"),
+            "subject": topic.get("subject"),
+            "title": topic.get("title"),
+            "heat_evidence": topic.get("heat_evidence", [])[:5],
+            "selection_hints": topic.get("selection_hints", [])[:5],
+            "source_context": topic.get("source_context", [])[:5],
+        })
+    prompt = (
+        "你是中文 Crypto 内容团队的实时研究员。必须各使用一次 X Search 和 Web Search。"
+        "以下是已经由母帖池热度筛出的母题，不要写帖子，也不要分配人设。"
+        "请按 seed_key 补足圈内前情、今天真正争论的焦点、最强正反观点、项目或行业的二阶影响，"
+        "并指出哪些说法只是常识或已经说烂。允许某个母题没有新角度。"
+        "搜索结果只能作为语境，不能自动升级成可发布事实；附可追溯 URL。"
+        "只输出 JSON：{\"contexts\":[{\"seed_key\":\"...\",\"background\":\"...\","
+        "\"current_debate\":\"...\",\"strongest_for\":\"...\",\"strongest_against\":\"...\","
+        "\"second_order_effect\":\"...\",\"stale_or_common\":\"...\"}]}。"
+        "每个输入 seed_key 必须恰好出现一次；总长度控制在 3000 个中文字内。\n\n"
+        f"母题：{json.dumps(compact_topics, ensure_ascii=False)}\n"
+        f"已批准市场语境：{json.dumps(editorial_daily_input(daily_context), ensure_ascii=False)}"
+    )
+    async with httpx.AsyncClient(timeout=180) as client:
+        from_date = (
+            datetime.fromisoformat(str(daily_context["context_date"])).date() - timedelta(days=1)
+        ).isoformat() + "T00:00:00Z"
+        response = await client.post(
+            provider["base_url"] + "/responses",
+            headers={
+                "Authorization": f"Bearer {provider['key']}", "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            },
+            json={
+                "model": provider["model"], "input": prompt,
+                "tools": [
+                    {"type": "x_search", "from_date": from_date},
+                    {"type": "web_search"},
+                ],
+                "max_output_tokens": 4500,
+            },
+        )
+        response.raise_for_status()
+    text, citations, tool_usage = response_output_text_and_citations(response.json())
+    if not text:
+        raise RuntimeError("Grok 未返回母题研究 Context")
+    if {"x_search", "web_search"} - set(tool_usage) or not citations:
+        raise RuntimeError("Grok 母题研究未留下完整的 X/Web 搜索或引用证据")
+    payload = text_json_object(text)
+    contexts = payload.get("contexts")
+    if not isinstance(contexts, list):
+        raise RuntimeError("Grok 母题研究缺少 contexts 数组")
+    expected_keys = {str(item["seed_key"]) for item in mother_topics}
+    returned_keys = [
+        str(item.get("seed_key", "")) for item in contexts if isinstance(item, dict)
+    ]
+    if set(returned_keys) != expected_keys or len(returned_keys) != len(expected_keys):
+        raise RuntimeError("Grok 母题研究没有逐题覆盖全部 seed_key")
+    required_context = (
+        "background", "current_debate", "strongest_for", "strongest_against",
+        "second_order_effect", "stale_or_common",
+    )
+    if any(
+        any(not str(item.get(field, "")).strip() for field in required_context)
+        for item in contexts if isinstance(item, dict)
+    ):
+        raise RuntimeError("Grok 母题研究缺少可用的逐题争议语境")
+    result = {
+        "text": json.dumps({"contexts": contexts}, ensure_ascii=False)[:18000],
+        "contexts": contexts, "citations": citations, "tool_usage": tool_usage,
+        "model": provider["model"],
+    }
+    result["context_hash"] = hashlib.sha256(result["text"].encode("utf-8")).hexdigest()[:16]
+    if len(EDITORIAL_GROK_CONTEXT_CACHE) >= EDITORIAL_GROK_CONTEXT_CACHE_MAX:
+        EDITORIAL_GROK_CONTEXT_CACHE.pop(next(iter(EDITORIAL_GROK_CONTEXT_CACHE)))
+    EDITORIAL_GROK_CONTEXT_CACHE[cache_key] = result
+    return result
+
+
+async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_context: dict,
+                                           grok_context: dict, claim_history: list[dict]):
+    provider = editorial_provider_config("GEMINI")
+    prompt = (
+        "你是中文 Crypto 内容团队的选题主编。现在只做多角度选题，不写帖子、不分配人设。"
+        "只输出 JSON：{\"angles\":[...],\"rejected_angles\":[...]}。"
+        "每个母题输出 0 到 5 个真正互不替代的角度，总数最多 24；这是上限，不是配额。"
+        "可选 angle_family 只有 opportunity、industry_evaluation、project_evaluation、market_cognition、"
+        "trading_philosophy、people_or_community、other，不要求覆盖任何一类。"
+        "angles 每项必须包含 parent_seed_key,claim_key,subject,title,core_claim,angle_family,"
+        "specific_tension,non_obvious_delta,audience_value,why_worth_saying,why_now,statement_mode,persona_fit。"
+        "claim_key 只能用小写字母、数字、冒号、下划线或连字符。statement_mode 只能 opinion 或 conditional。"
+        "core_claim 必须是一句可争论、能直接说出口的明确结论，不能是问题、背景介绍、名词解释或等待后续。"
+        "同一母题下，只有核心判断发生变化才算不同角度；换标题、换措辞、换人设都不算。"
+        "圈内读者无需今天材料就会同意的常识、万能风险提示、空泛鸡汤、旧 Builder Codes 一类已覆盖主张，"
+        "必须放进 rejected_angles，不能为了显得丰富而保留。"
+        "机会角度必须存在正向参与或计算条件；如果结论只有别做、别追、风险很大，就不要生成。"
+        "行业、项目、认知和哲学角度也必须绑定这个母题的具体冲突，不能脱离当天语境讲大道理。"
+        "Grok 只提供语境；不得把其中数字、日期、价格或事件写成已确认事实。"
+        "rejected_angles 每项包含 parent_seed_key,title,core_claim,reason_code,reason。"
+        "每个输入母题必须至少有一条合格 angle，或在 rejected_angles 中用 no_worthwhile_angle 明确说明零产出；"
+        "漏掉母题会让整批失败重试。\n\n"
+        f"永久规则：{json.dumps(topic_selection_policy().get('angle_expansion', {}), ensure_ascii=False)}\n"
+        f"母题：{json.dumps(mother_topics, ensure_ascii=False)}\n"
+        f"已批准市场语境：{json.dumps(editorial_daily_input(daily_context), ensure_ascii=False)}\n"
+        f"Grok 实时语境：{json.dumps({'text': grok_context.get('text', ''), 'citations': grok_context.get('citations', [])}, ensure_ascii=False)}\n"
+        f"团队已覆盖主张：{json.dumps(editorial_claim_memory(claim_history), ensure_ascii=False)}"
+    )
+    async with httpx.AsyncClient(timeout=240) as client:
+        response = await client.post(
+            provider["base_url"] + "/chat/completions",
+            headers={
+                "Authorization": f"Bearer {provider['key']}", "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            },
+            json={
+                "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"}, "temperature": 0.55, "max_tokens": 8000,
+            },
+        )
+        response.raise_for_status()
+    result = chat_completion_json(response.json())
+    result["_model"] = provider["model"]
+    return result
+
+
+def persist_editorial_angle_expansion(run_id: int, expected_input_hash: str,
+                                        attempt_token: str, stage: dict):
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        run = conn.execute(
+            "SELECT status,context_date,raw_cards,approval_revision FROM daily_context_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        if not run or run["status"] != "approved":
+            return False
+        daily_row = conn.execute(
+            "SELECT * FROM daily_market_contexts WHERE context_date=?", (run["context_date"],)
+        ).fetchone()
+        if not daily_row:
+            return False
+        cards = json_value(run["raw_cards"], {})
+        current_daily = daily_context_dict(daily_row)
+        current_daily["approval_revision"] = run["approval_revision"]
+        current_hash = editorial_angle_input_hash(editorial_mother_topics(cards), current_daily)
+        if current_hash != expected_input_hash:
+            return False
+        current_stage = cards.get("editorial_angle_expansion", {})
+        if not isinstance(current_stage, dict) or current_stage.get("attempt_token") != attempt_token:
+            return False
+        cards["editorial_angle_expansion"] = stage
+        conn.execute(
+            "UPDATE daily_context_runs SET raw_cards=?,updated_at=? WHERE id=?",
+            (json.dumps(cards, ensure_ascii=False), int(time.time()), run_id),
+        )
+    return True
+
+
+async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict):
+    """Persist one mother-topic expansion before public topics reach persona evaluation."""
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        run = conn.execute(
+            "SELECT status,context_date,raw_cards,approval_revision FROM daily_context_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        if not run or run["status"] != "approved":
+            return None
+        current_cards = json_value(run["raw_cards"], {})
+        daily_row = conn.execute(
+            "SELECT * FROM daily_market_contexts WHERE context_date=?", (run["context_date"],)
+        ).fetchone()
+        if not daily_row:
+            return None
+        daily = daily_context_dict(daily_row)
+        daily["approval_revision"] = run["approval_revision"]
+        evaluation_count = conn.execute(
+            "SELECT COUNT(*) FROM persona_editorial_evaluations WHERE run_id=?", (run_id,)
+        ).fetchone()[0]
+        existing_stage = current_cards.get("editorial_angle_expansion")
+        if evaluation_count and not isinstance(existing_stage, dict):
+            return editorial_public_topics(current_cards)
+        mothers = editorial_mother_topics(current_cards)
+        input_hash = editorial_angle_input_hash(mothers, daily)
+        stage = (
+            existing_stage
+            if isinstance(existing_stage, dict) and existing_stage.get("input_hash") == input_hash
+            else {}
+        )
+        now = int(time.time())
+        if stage.get("status") == "ready":
+            return editorial_public_topics(current_cards)
+        if stage.get("status") == "exhausted" and int(stage.get("next_retry_at") or 0) > now:
+            return None
+        if stage.get("status") == "retry_wait" and int(stage.get("next_retry_at") or 0) > now:
+            return None
+        if stage.get("status") == "running" and int(stage.get("started_at") or 0) > now - 600:
+            return None
+        attempt_token = secrets.token_hex(12)
+        if not mothers:
+            current_cards["editorial_angle_expansion"] = {
+                "version": EDITORIAL_ANGLE_EXPANSION_REVISION,
+                "input_hash": input_hash,
+                "attempt_token": attempt_token,
+                "status": "ready",
+                "mother_topics": [],
+                "research": {},
+                "expanded_topics": [],
+                "rejected_angles": [],
+                "attempts": int(stage.get("attempts") or 0),
+                "generated_at": now,
+            }
+            conn.execute(
+                "UPDATE daily_context_runs SET raw_cards=?,updated_at=? WHERE id=?",
+                (json.dumps(current_cards, ensure_ascii=False), now, run_id),
+            )
+            return []
+        working = {
+            "version": EDITORIAL_ANGLE_EXPANSION_REVISION,
+            "input_hash": input_hash,
+            "attempt_token": attempt_token,
+            "status": "running",
+            "phase": (
+                "gemini"
+                if isinstance(stage.get("research"), dict) and stage["research"].get("text")
+                else "grok"
+            ),
+            "mother_topics": mothers,
+            "research": stage.get("research", {}),
+            "expanded_topics": [],
+            "rejected_angles": [],
+            "attempts": int(stage.get("attempts") or 0),
+            "started_at": now,
+            "next_retry_at": None,
+        }
+        current_cards["editorial_angle_expansion"] = working
+        conn.execute(
+            "UPDATE daily_context_runs SET raw_cards=?,updated_at=? WHERE id=?",
+            (json.dumps(current_cards, ensure_ascii=False), now, run_id),
+        )
+    try:
+        research = working["research"]
+        if not research:
+            research = await research_editorial_angle_context_grok(mothers, daily)
+            working["research"] = research
+            working["phase"] = "gemini"
+            working["started_at"] = int(time.time())
+            if not persist_editorial_angle_expansion(run_id, input_hash, attempt_token, working):
+                return None
+        history = recent_topic_claims()
+        result = await expand_editorial_angles_gemini(mothers, daily, research, history)
+        model = str(result.pop("_model", ""))
+        expanded, rejected = bounded_editorial_angles(result, mothers, history)
+    except (HTTPException, httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, RuntimeError) as error:
+        attempts = working["attempts"] + 1
+        exhausted = attempts >= EDITORIAL_ANGLE_MAX_ATTEMPTS
+        failed = {
+            **working,
+            "status": "exhausted" if exhausted else "retry_wait",
+            "attempts": attempts,
+            "next_retry_at": (
+                int(time.time()) + 1800
+                if exhausted else int(time.time()) + (30, 120, 600)[attempts - 1]
+            ),
+            "error": f"{type(error).__name__}: {error}"[:1000],
+            "updated_at": int(time.time()),
+        }
+        persist_editorial_angle_expansion(run_id, input_hash, attempt_token, failed)
+        return None
+    ready = {
+        **working,
+        "status": "ready",
+        "phase": "complete",
+        "expanded_topics": expanded,
+        "rejected_angles": rejected,
+        "provider_models": {"grok": research.get("model", ""), "gemini": model},
+        "next_retry_at": None,
+        "error": "",
+        "generated_at": int(time.time()),
+    }
+    return expanded if persist_editorial_angle_expansion(
+        run_id, input_hash, attempt_token, ready
+    ) else None
 
 
 async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_facts: dict,
@@ -3247,7 +3810,8 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             "claim_key", "subject", "title", "core_claim", "content_type", "material_delta",
             "audience_value", "why_now", "fact_basis", "opinion_basis", "source_topic_keys",
             "scope", "source_kind", "source_id", "source_refs", "angle", "asset_ids",
-            "first_person_allowed",
+            "first_person_allowed", "parent_seed_key", "parent_claim_keys", "angle_family",
+            "specific_tension", "non_obvious_delta", "why_worth_saying", "statement_mode",
         )
         compact_topic = {}
         for key in topic_fields:
@@ -3309,7 +3873,12 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                 )
             continue
         audit = {
-            "topic": {key: compact_topic.get(key, "") for key in ("claim_key", "title", "core_claim")},
+            "topic": {
+                key: compact_topic.get(key, "")
+                for key in (
+                    "claim_key", "parent_seed_key", "angle_family", "title", "core_claim",
+                )
+            },
             "verified_facts": verified_facts,
             "facts_used_ids": generated["facts_used_ids"],
             "stance": generated["stance"],
@@ -3435,10 +4004,6 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
     for run_row in runs:
         run = daily_context_run_dict(run_row)
         cards = run["raw_cards"] if isinstance(run["raw_cards"], dict) else {}
-        public_topics = [
-            item for item in cards.get("selected_topics", [])
-            if isinstance(item, dict) and item.get("claim_key")
-        ]
         with db() as conn:
             daily_row = conn.execute(
                 "SELECT * FROM daily_market_contexts WHERE context_date=?", (run["context_date"],)
@@ -3468,6 +4033,8 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
             continue
         daily = daily_context_dict(daily_row)
         daily["approval_revision"] = run.get("approval_revision", 0)
+        expanded_topics = await ensure_editorial_angle_expansion(run["id"], cards, daily)
+        public_topics = expanded_topics if expanded_topics is not None else []
         for persona_row in personas:
             persona = dict(persona_row)
             with db() as conn:
@@ -4168,6 +4735,39 @@ async def retry_daily_context_run(context_date: str):
     DAILY_CONTEXT_TASKS.add(task)
     task.add_done_callback(DAILY_CONTEXT_TASKS.discard)
     return get_daily_context_run(run_id)
+
+
+@app.post("/api/context/daily-runs/{context_date}/retry-angle-expansion")
+def retry_editorial_angle_expansion(context_date: str):
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM daily_context_runs WHERE context_date=?", (context_date,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Daily context run not found")
+        if row["status"] != "approved":
+            raise HTTPException(409, "Only an approved run can retry angle expansion")
+        cards = json_value(row["raw_cards"], {})
+        stage = cards.get("editorial_angle_expansion")
+        if not isinstance(stage, dict) or stage.get("status") not in {"retry_wait", "exhausted"}:
+            raise HTTPException(409, "Angle expansion is not waiting for retry")
+        cards["editorial_angle_expansion"] = {
+            **stage,
+            "status": "retry_wait",
+            "attempts": 0,
+            "next_retry_at": 0,
+            "error": "",
+            "updated_at": int(time.time()),
+        }
+        conn.execute(
+            "UPDATE daily_context_runs SET raw_cards=?,updated_at=? WHERE id=?",
+            (json.dumps(cards, ensure_ascii=False), int(time.time()), row["id"]),
+        )
+        updated = conn.execute(
+            "SELECT * FROM daily_context_runs WHERE id=?", (row["id"],)
+        ).fetchone()
+    return daily_context_run_dict(updated)
 
 
 @app.put("/api/context/daily-runs/{context_date}/review")

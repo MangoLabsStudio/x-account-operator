@@ -56,6 +56,7 @@ class AppTest(unittest.TestCase):
         self._real_enrich_persona_editorial_context = self.app_module.enrich_persona_editorial_context
         self._real_write_persona_editorial_gemini = self.app_module.write_persona_editorial_gemini
         self._real_critique_persona_editorial_draft = self.app_module.critique_persona_editorial_draft
+        self._real_ensure_editorial_angle_expansion = self.app_module.ensure_editorial_angle_expansion
         self.client = TestClient(self.app_module.app)
         self.client.__enter__()
 
@@ -83,6 +84,12 @@ class AppTest(unittest.TestCase):
         async def legacy_critic(*_args):
             return {"verdict": "PASS", "reasons": [], "rewrite_instruction": ""}
 
+        async def legacy_angle_expansion(_run_id, cards, _daily):
+            return [
+                item for item in cards.get("selected_topics", [])
+                if isinstance(item, dict) and item.get("claim_key")
+            ]
+
         self._default_post_generator = patch.object(
             self.app_module,
             "generate_persona_post",
@@ -91,12 +98,18 @@ class AppTest(unittest.TestCase):
         self._legacy_grok = patch.object(self.app_module, "enrich_persona_editorial_context", AsyncMock(side_effect=legacy_grok))
         self._legacy_gemini = patch.object(self.app_module, "write_persona_editorial_gemini", AsyncMock(side_effect=legacy_gemini))
         self._legacy_critic = patch.object(self.app_module, "critique_persona_editorial_draft", AsyncMock(side_effect=legacy_critic))
+        self._legacy_angle_expansion = patch.object(
+            self.app_module, "ensure_editorial_angle_expansion",
+            AsyncMock(side_effect=legacy_angle_expansion),
+        )
         self._default_post_generator.start()
         self._legacy_grok.start()
         self._legacy_gemini.start()
         self._legacy_critic.start()
+        self._legacy_angle_expansion.start()
 
     def tearDown(self):
+        self._legacy_angle_expansion.stop()
         self._legacy_critic.stop()
         self._legacy_gemini.stop()
         self._legacy_grok.stop()
@@ -179,6 +192,41 @@ class AppTest(unittest.TestCase):
             }
         }
 
+    @staticmethod
+    def mother_topic(claim_key="btc-mother", source_key="discussion:btc"):
+        return {
+            "claim_key": claim_key,
+            "subject": "Bitcoin",
+            "title": "BTC 资金结构",
+            "core_claim": "BTC 的资金结构值得继续展开。",
+            "content_type": "research",
+            "material_delta": "市场分歧从涨跌转向资金来源。",
+            "audience_value": "帮助读者判断这轮行情由谁推动。",
+            "why_now": "母池今天集中讨论资金结构。",
+            "source_topic_keys": [source_key],
+            "source_refs": ["x:btc:1"],
+            "source_topic_title": "BTC 资金结构",
+            "eligible": True,
+        }
+
+    @staticmethod
+    def expanded_angle(seed_key, claim_key, family="industry_evaluation", core_claim=None):
+        return {
+            "parent_seed_key": seed_key,
+            "claim_key": claim_key,
+            "subject": "Bitcoin",
+            "title": f"{claim_key} 的具体判断",
+            "core_claim": core_claim or f"{claim_key} 说明资金来源正在改变山寨币的筛选方式。",
+            "angle_family": family,
+            "specific_tension": "指数上涨与山寨币赚钱效应没有同步。",
+            "non_obvious_delta": "判断重点从 BTC 涨幅转向资金是否外溢。",
+            "audience_value": "改变读者选择交易对象的方式。",
+            "why_worth_saying": "同一轮上涨里不同资产的受益顺序并不相同。",
+            "why_now": "母池今天集中讨论资金结构。",
+            "statement_mode": "opinion",
+            "persona_fit": ["axu"],
+        }
+
     def insert_pending_editorial_write(self, run_id, context_date, topic, *, slug="acheng",
                                         claim_key="pending-claim", core_claim="待恢复的核心判断"):
         with self.app_module.db() as conn:
@@ -191,7 +239,9 @@ class AppTest(unittest.TestCase):
             run = conn.execute(
                 "SELECT raw_cards,approval_revision FROM daily_context_runs WHERE id=?", (run_id,)
             ).fetchone()
-            topics = self.app_module.json_value(run["raw_cards"], {}).get("selected_topics", [])
+            topics = self.app_module.editorial_public_topics(
+                self.app_module.json_value(run["raw_cards"], {})
+            )
             daily["approval_revision"] = run["approval_revision"]
             stable_history = self.app_module.editorial_stable_claim_history(conn, context_date)
             input_payload = self.app_module.editorial_topic_input_payload(
@@ -462,6 +512,371 @@ class AppTest(unittest.TestCase):
         with self.app_module.db() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM persona_editorial_evaluations").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 0)
+
+    def test_angle_expansion_persists_before_persona_evaluation(self):
+        parent = self.mother_topic()
+        run_id = self.create_editorial_run("2026-08-21", topics=[parent])
+        researched = {
+            "text": "BTC 资金来源与山寨币外溢仍有争议。",
+            "citations": ["https://example.com/btc"],
+            "tool_usage": ["x_search", "web_search"],
+            "model": "grok-test",
+        }
+        angles = {
+            "angles": [
+                self.expanded_angle("discussion:btc", "btc-industry-angle"),
+                self.expanded_angle(
+                    "discussion:btc", "btc-trading-angle", "trading_philosophy",
+                    "BTC 上涨时先判断资金会不会外溢，比照着指数追山寨币更重要。",
+                ),
+            ],
+            "rejected_angles": [],
+            "_model": "gemini-test",
+        }
+        seen = []
+
+        async def evaluator(_persona, _context, _daily, topics, _history, _today_count):
+            seen.extend(topics)
+            decisions = {}
+            for topic in topics:
+                if topic["claim_key"] == "btc-industry-angle":
+                    decisions.update(self.editorial_decision(
+                        topic, "WRITE", claim_key="acheng-btc-industry-angle",
+                        core_claim="这轮 BTC 上涨先改变的是山寨币筛选标准。",
+                    ))
+                else:
+                    decisions.update(self.editorial_decision(topic, "IGNORE"))
+            return decisions
+
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(
+            self.app_module, "ensure_editorial_angle_expansion",
+            new=self._real_ensure_editorial_angle_expansion,
+        ), patch.object(
+            self.app_module, "research_editorial_angle_context_grok",
+            AsyncMock(return_value=researched),
+        ) as grok, patch.object(
+            self.app_module, "expand_editorial_angles_gemini",
+            AsyncMock(return_value=angles),
+        ) as gemini, patch.object(
+            self.app_module, "evaluate_persona_editorial", AsyncMock(side_effect=evaluator),
+        ):
+            self.run_editorial_pipeline(run_id)
+
+        self.assertEqual(grok.await_count, 1)
+        self.assertEqual(gemini.await_count, 1)
+        self.assertEqual({item["claim_key"] for item in seen}, {"btc-industry-angle", "btc-trading-angle"})
+        with self.app_module.db() as conn:
+            cards = self.app_module.json_value(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()[0], {})
+        stage = cards["editorial_angle_expansion"]
+        self.assertEqual(stage["status"], "ready")
+        self.assertEqual(len(stage["expanded_topics"]), 2)
+        self.assertEqual(cards["selected_topics"][0]["claim_key"], "btc-mother")
+        for topic in stage["expanded_topics"]:
+            self.assertEqual(topic["source_topic_keys"], ["discussion:btc"])
+            self.assertEqual(topic["source_refs"], ["x:btc:1"])
+        with self.app_module.db() as conn:
+            evaluation = conn.execute(
+                "SELECT status,candidate_id FROM persona_editorial_evaluations WHERE claim_key='acheng-btc-industry-angle'"
+            ).fetchone()
+            self.assertEqual(evaluation["status"], "WRITE")
+            self.assertIsNotNone(evaluation["candidate_id"])
+
+    def test_angle_expansion_rejects_duplicate_common_knowledge_and_no_conclusion(self):
+        parent = self.mother_topic()
+        mothers = self.app_module.editorial_mother_topics({"selected_topics": [parent]})
+        accepted = self.expanded_angle("discussion:btc", "specific-angle")
+        duplicate = self.expanded_angle(
+            "discussion:btc", "duplicate-angle", core_claim=accepted["core_claim"],
+        )
+        common = self.expanded_angle(
+            "discussion:btc", "common-angle", "trading_philosophy", "投资有风险",
+        )
+        waiting = self.expanded_angle(
+            "discussion:btc", "waiting-angle", core_claim="这件事还要继续观察，等待更多信息。",
+        )
+        topics, rejected = self.app_module.bounded_editorial_angles(
+            {"angles": [accepted, duplicate, common, waiting], "rejected_angles": []}, mothers, [],
+        )
+        self.assertEqual([item["claim_key"] for item in topics], ["specific-angle"])
+        self.assertEqual(
+            {item["reason_code"] for item in rejected},
+            {"semantic_duplicate", "no_conclusion"},
+        )
+
+    def test_ready_angle_expansion_resumes_without_researching(self):
+        parent = self.mother_topic()
+        run_id = self.create_editorial_run("2026-08-21", topics=[parent])
+        researched = {
+            "text": "实时语境", "citations": ["https://example.com/btc"],
+            "tool_usage": ["x_search", "web_search"], "model": "grok-test",
+        }
+        angles = {
+            "angles": [self.expanded_angle("discussion:btc", "btc-resume-angle")],
+            "rejected_angles": [], "_model": "gemini-test",
+        }
+        evaluator = AsyncMock(side_effect=[RuntimeError("temporary evaluator failure"), {
+            "btc-resume-angle": self.editorial_decision(
+                {"claim_key": "btc-resume-angle"}, "IGNORE"
+            )["btc-resume-angle"]
+        }])
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(
+            self.app_module, "ensure_editorial_angle_expansion",
+            new=self._real_ensure_editorial_angle_expansion,
+        ), patch.object(
+            self.app_module, "research_editorial_angle_context_grok",
+            AsyncMock(return_value=researched),
+        ) as grok, patch.object(
+            self.app_module, "expand_editorial_angles_gemini",
+            AsyncMock(return_value=angles),
+        ) as gemini, patch.object(
+            self.app_module, "evaluate_persona_editorial", evaluator,
+        ):
+            self.run_editorial_pipeline(run_id)
+            self.run_editorial_pipeline(run_id)
+        self.assertEqual(grok.await_count, 1)
+        self.assertEqual(gemini.await_count, 1)
+        self.assertEqual(evaluator.await_count, 2)
+        with self.app_module.db() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM persona_editorial_evaluations WHERE run_id=?", (run_id,)
+            ).fetchone()[0], 1)
+
+    def test_angle_expansion_failure_retries_without_falling_back_to_mother_topic(self):
+        parent = self.mother_topic()
+        run_id = self.create_editorial_run("2026-08-21", topics=[parent])
+        researched = {
+            "text": "实时语境", "citations": ["https://example.com/btc"],
+            "tool_usage": ["x_search", "web_search"], "model": "grok-test",
+        }
+        research = AsyncMock(side_effect=[RuntimeError("temporary Grok failure"), researched])
+        expansion = AsyncMock(return_value={
+            "angles": [self.expanded_angle("discussion:btc", "btc-retried-angle")],
+            "rejected_angles": [], "_model": "gemini-test",
+        })
+        evaluator = AsyncMock(side_effect=lambda _persona, _context, _daily, topics, _history, _count: {
+            key: value
+            for topic in topics
+            for key, value in self.editorial_decision(topic, "IGNORE").items()
+        })
+        env = {"XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng"}
+        with patch.dict(os.environ, env), patch.object(
+            self.app_module, "ensure_editorial_angle_expansion",
+            new=self._real_ensure_editorial_angle_expansion,
+        ), patch.object(
+            self.app_module, "research_editorial_angle_context_grok", research,
+        ), patch.object(
+            self.app_module, "expand_editorial_angles_gemini", expansion,
+        ), patch.object(
+            self.app_module, "evaluate_persona_editorial", evaluator,
+        ):
+            self.run_editorial_pipeline(run_id)
+            with self.app_module.db() as conn:
+                cards = self.app_module.json_value(conn.execute(
+                    "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+                ).fetchone()[0], {})
+                self.assertEqual(cards["editorial_angle_expansion"]["status"], "retry_wait")
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM persona_editorial_evaluations WHERE run_id=?", (run_id,)
+                ).fetchone()[0], 0)
+                cards["editorial_angle_expansion"]["next_retry_at"] = 0
+                conn.execute(
+                    "UPDATE daily_context_runs SET raw_cards=? WHERE id=?",
+                    (json.dumps(cards, ensure_ascii=False), run_id),
+                )
+            self.run_editorial_pipeline(run_id)
+        self.assertEqual(research.await_count, 2)
+        self.assertEqual(expansion.await_count, 1)
+        self.assertEqual(evaluator.await_count, 1)
+
+    def test_angle_expansion_allows_explicit_zero_without_filling_lenses(self):
+        mothers = self.app_module.editorial_mother_topics({
+            "selected_topics": [self.mother_topic()]
+        })
+        topics, rejected = self.app_module.bounded_editorial_angles({
+            "angles": [],
+            "rejected_angles": [{
+                "parent_seed_key": "discussion:btc",
+                "title": "BTC 资金结构",
+                "core_claim": "",
+                "reason_code": "no_worthwhile_angle",
+                "reason": "今天没有比已有讨论更进一步的结论。",
+            }],
+        }, mothers, [])
+        self.assertEqual(topics, [])
+        self.assertEqual(rejected[0]["reason_code"], "no_worthwhile_angle")
+
+    def test_invalid_angle_response_retries_and_reuses_research(self):
+        parent = self.mother_topic()
+        context_date = "2026-08-21"
+        run_id = self.create_editorial_run(context_date, topics=[parent])
+        with self.app_module.db() as conn:
+            run = conn.execute(
+                "SELECT approval_revision FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            daily = self.app_module.daily_context_dict(conn.execute(
+                "SELECT * FROM daily_market_contexts WHERE context_date=?", (context_date,)
+            ).fetchone())
+        daily["approval_revision"] = run["approval_revision"]
+        research = AsyncMock(return_value={
+            "text": "实时语境", "citations": ["https://example.com/btc"],
+            "tool_usage": ["x_search", "web_search"], "model": "grok-test",
+        })
+        expansion = AsyncMock(side_effect=[{}, {
+            "angles": [self.expanded_angle("discussion:btc", "btc-valid-after-retry")],
+            "rejected_angles": [], "_model": "gemini-test",
+        }])
+        with patch.object(
+            self.app_module, "research_editorial_angle_context_grok", research,
+        ), patch.object(
+            self.app_module, "expand_editorial_angles_gemini", expansion,
+        ):
+            self.assertIsNone(asyncio.run(self._real_ensure_editorial_angle_expansion(
+                run_id, {"selected_topics": [parent]}, daily,
+            )))
+            response = self.client.post(
+                f"/api/context/daily-runs/{context_date}/retry-angle-expansion"
+            )
+            self.assertEqual(response.status_code, 200)
+            topics = asyncio.run(self._real_ensure_editorial_angle_expansion(
+                run_id, {"selected_topics": [parent]}, daily,
+            ))
+        self.assertEqual([item["claim_key"] for item in topics], ["btc-valid-after-retry"])
+        self.assertEqual(research.await_count, 1)
+        self.assertEqual(expansion.await_count, 2)
+
+    def test_concurrent_angle_expansion_has_one_provider_owner(self):
+        parent = self.mother_topic()
+        context_date = "2026-08-21"
+        run_id = self.create_editorial_run(context_date, topics=[parent])
+        with self.app_module.db() as conn:
+            run = conn.execute(
+                "SELECT approval_revision FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            daily = self.app_module.daily_context_dict(conn.execute(
+                "SELECT * FROM daily_market_contexts WHERE context_date=?", (context_date,)
+            ).fetchone())
+        daily["approval_revision"] = run["approval_revision"]
+
+        async def slow_research(*_args):
+            await asyncio.sleep(0.03)
+            return {
+                "text": "实时语境", "citations": ["https://example.com/btc"],
+                "tool_usage": ["x_search", "web_search"], "model": "grok-test",
+            }
+
+        research = AsyncMock(side_effect=slow_research)
+        expansion = AsyncMock(return_value={
+            "angles": [self.expanded_angle("discussion:btc", "btc-single-owner")],
+            "rejected_angles": [], "_model": "gemini-test",
+        })
+
+        async def run_two():
+            return await asyncio.gather(*(
+                self._real_ensure_editorial_angle_expansion(
+                    run_id, {"selected_topics": [parent]}, daily,
+                ) for _ in range(2)
+            ))
+
+        with patch.object(
+            self.app_module, "research_editorial_angle_context_grok", research,
+        ), patch.object(
+            self.app_module, "expand_editorial_angles_gemini", expansion,
+        ):
+            results = asyncio.run(run_two())
+        self.assertEqual(sum(result is not None for result in results), 1)
+        self.assertEqual(research.await_count, 1)
+        self.assertEqual(expansion.await_count, 1)
+
+    def test_stale_angle_stage_cannot_generate_pending_write(self):
+        parent = self.mother_topic()
+        context_date = "2026-08-21"
+        run_id = self.create_editorial_run(context_date, topics=[parent])
+        with self.app_module.db() as conn:
+            run = conn.execute(
+                "SELECT approval_revision FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            daily = self.app_module.daily_context_dict(conn.execute(
+                "SELECT * FROM daily_market_contexts WHERE context_date=?", (context_date,)
+            ).fetchone())
+        daily["approval_revision"] = run["approval_revision"]
+        researched = {
+            "text": "实时语境", "citations": ["https://example.com/btc"],
+            "tool_usage": ["x_search", "web_search"], "model": "grok-test",
+        }
+        expanded = self.expanded_angle("discussion:btc", "btc-stale-angle")
+        with patch.object(
+            self.app_module, "research_editorial_angle_context_grok",
+            AsyncMock(return_value=researched),
+        ), patch.object(
+            self.app_module, "expand_editorial_angles_gemini",
+            AsyncMock(return_value={
+                "angles": [expanded], "rejected_angles": [], "_model": "gemini-test",
+            }),
+        ):
+            topics = asyncio.run(self._real_ensure_editorial_angle_expansion(
+                run_id, {"selected_topics": [parent]}, daily,
+            ))
+        evaluation_id = self.insert_pending_editorial_write(
+            run_id, context_date, topics[0], claim_key="stale-write",
+            core_claim="旧角度不应在新 revision 下继续生成。",
+        )
+        with self.app_module.db() as conn:
+            conn.execute(
+                "UPDATE daily_context_runs SET approval_revision=approval_revision+1 WHERE id=?",
+                (run_id,),
+            )
+        writer = AsyncMock(side_effect=AssertionError("stale stage must stop before Grok"))
+        with patch.object(self.app_module, "enrich_persona_editorial_context", writer):
+            asyncio.run(self.app_module.generate_pending_persona_editorial_candidates(
+                run_id, context_date,
+            ))
+        writer.assert_not_awaited()
+        with self.app_module.db() as conn:
+            row = conn.execute(
+                "SELECT status,reason_code,candidate_id FROM persona_editorial_evaluations WHERE id=?",
+                (evaluation_id,),
+            ).fetchone()
+        self.assertEqual((row["status"], row["reason_code"], row["candidate_id"]), (
+            "HOLD", "input_changed_before_generation", None,
+        ))
+
+    def test_existing_evaluated_run_keeps_legacy_public_topics(self):
+        context_date = "2026-08-21"
+        parent = self.mother_topic()
+        run_id = self.create_editorial_run(context_date, topics=[parent])
+        evaluation_id = self.insert_pending_editorial_write(
+            run_id, context_date, parent, claim_key="legacy-angle", core_claim="旧运行已经完成评估。",
+        )
+        research = AsyncMock(side_effect=AssertionError("legacy run must not expand"))
+        with self.app_module.db() as conn:
+            before_hash = conn.execute(
+                "SELECT topic_input_hash FROM persona_editorial_evaluations WHERE id=?", (evaluation_id,)
+            ).fetchone()[0]
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(
+            self.app_module, "ensure_editorial_angle_expansion",
+            new=self._real_ensure_editorial_angle_expansion,
+        ), patch.object(
+            self.app_module, "research_editorial_angle_context_grok", research,
+        ):
+            self.run_editorial_pipeline(run_id)
+        research.assert_not_awaited()
+        with self.app_module.db() as conn:
+            row = conn.execute(
+                "SELECT topic_input_hash FROM persona_editorial_evaluations WHERE id=?", (evaluation_id,)
+            ).fetchone()
+            cards = self.app_module.json_value(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()[0], {})
+        self.assertEqual(row[0], before_hash)
+        self.assertNotIn("editorial_angle_expansion", cards)
 
     def test_editorial_decisions_only_write_and_never_fill_a_quota(self):
         run_id = self.create_editorial_run("2026-08-22")
@@ -1072,6 +1487,65 @@ class AppTest(unittest.TestCase):
                     {"title": "热点", "scope": "public"},
                     {"schema": "facts_used_ids", "facts": [], "requires_fact_ids": False},
                     {"context_date": "2026-08-24"},
+                ))
+
+    def test_grok_angle_research_must_cover_every_mother_seed(self):
+        mothers = [
+            {"seed_key": "seed-a", "subject": "A", "title": "A"},
+            {"seed_key": "seed-b", "subject": "B", "title": "B"},
+        ]
+
+        def payload(contexts):
+            return {
+                "output": [
+                    {"type": "x_search_call"}, {"type": "web_search_call"},
+                    {"type": "message", "content": [{
+                        "type": "output_text",
+                        "text": json.dumps({"contexts": contexts}, ensure_ascii=False),
+                        "annotations": [{"url": "https://example.com/official"}],
+                    }]},
+                ],
+            }
+
+        complete = [{
+            "seed_key": key,
+            "background": f"{key} 背景",
+            "current_debate": "当前争议",
+            "strongest_for": "最强支持理由",
+            "strongest_against": "最强反对理由",
+            "second_order_effect": "二阶影响",
+            "stale_or_common": "已经说烂的常识",
+        } for key in ("seed-a", "seed-b")]
+        self.app_module.EDITORIAL_GROK_CONTEXT_CACHE.clear()
+        with patch.dict(os.environ, {"XOPS_GROK_API_KEY": "test-key"}), patch.object(
+            self.app_module.httpx, "AsyncClient",
+            return_value=FakeAsyncClient(payload(complete), []),
+        ):
+            result = asyncio.run(self.app_module.research_editorial_angle_context_grok(
+                mothers, {"context_date": "2026-08-24"},
+            ))
+        self.assertEqual({item["seed_key"] for item in result["contexts"]}, {"seed-a", "seed-b"})
+
+        self.app_module.EDITORIAL_GROK_CONTEXT_CACHE.clear()
+        with patch.dict(os.environ, {"XOPS_GROK_API_KEY": "test-key"}), patch.object(
+            self.app_module.httpx, "AsyncClient",
+            return_value=FakeAsyncClient(payload(complete[:1]), []),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "逐题覆盖"):
+                asyncio.run(self.app_module.research_editorial_angle_context_grok(
+                    mothers, {"context_date": "2026-08-24"},
+                ))
+
+        incomplete = [dict(item) for item in complete]
+        incomplete[1]["current_debate"] = ""
+        self.app_module.EDITORIAL_GROK_CONTEXT_CACHE.clear()
+        with patch.dict(os.environ, {"XOPS_GROK_API_KEY": "test-key"}), patch.object(
+            self.app_module.httpx, "AsyncClient",
+            return_value=FakeAsyncClient(payload(incomplete), []),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "缺少可用"):
+                asyncio.run(self.app_module.research_editorial_angle_context_grok(
+                    mothers, {"context_date": "2026-08-24"},
                 ))
 
     def test_unverified_numeric_gate_allows_protocol_identifiers_only(self):

@@ -14,10 +14,12 @@ Open `https://x-account-operator-api-production.up.railway.app/`.
 
 1. 母池抓取、交叉验证和人工审核形成正式公共市场 Context；未审核的自动草稿不能进入写作。
 2. 每个人设都维护一份 Editorial Context 草稿与一份已批准版。草稿可随时修改，但只有已批准版会进入输入 fingerprint。
-3. 公共热点与该人设状态为 `ready` 的私有题合流，再由该人设独立给出 `WRITE`、`HOLD` 或 `IGNORE`。
-4. 系统仲裁跨人设的相同核心主张：同一事件可有不同结论；只有换了口吻的同一结论只保留最自然的人设。
-5. 每个 `WRITE` 先由 Grok 用 X Search 与 Web Search 补齐市场语境和引用；Gemini 只能把批准事实卡（或批准生活事实）写成事实，再由 Gemini 主编复核。首稿被拒只允许按理由重写一次；仍不通过则 `HOLD`，不产生候选稿。提供方、解析或搜索证据失败会保留 `WRITE` 以便重试，不会撤掉旧候选。
-6. 同日只要正式输入 fingerprint 发生实质变化（包括公共 Context 更新或人设 Editorial Context 重批），就可增量评估；无变化不补稿。人设 Context 的新批准版会先撤销该人当天旧候选。
+3. 选中的公共题先按来源合并回母题。Grok 对整批母题做一次 X/Web 实时研究，Gemini 再展开 0–N 个互不替代的机会、行业评价、项目评价、认知、交易哲学或社区角度；这些是可选镜头，不是配额。
+4. 角度必须有具体对象、具体冲突、非显而易见的增量和读者价值。常识、同义改写、无结论内容直接淘汰；没有值得说的角度时，零产出是合法结果。
+5. 合格公共角度与该人设状态为 `ready` 的私有题合流，再由该人设独立给出 `WRITE`、`HOLD` 或 `IGNORE`。
+6. 系统仲裁跨人设的相同核心主张：同一事件可有不同结论；只有换了口吻的同一结论只保留最自然的人设。
+7. 每个 `WRITE` 再由 Grok 用 X Search 与 Web Search 补齐该角度的市场语境和引用；Gemini 只能把批准事实卡（或批准生活事实）写成事实，再由 Gemini 主编复核。首稿被拒只允许按理由重写一次；仍不通过则 `HOLD`，不产生候选稿。提供方、解析或搜索证据失败会保留 `WRITE` 以便重试，不会撤掉旧候选。
+8. 同日只要正式输入 fingerprint 发生实质变化（包括公共 Context 更新或人设 Editorial Context 重批），就可增量评估；无变化不补稿。人设 Context 的新批准版会先撤销该人当天旧候选。
 
 没有固定 10 条、3–5 条或轮转栏目配额；当天可以是 0 条。自动流程不发布、不排期，也不操作 X 账号。候选稿只使用正式批准的公共 Context 与该人设正式批准的 Editorial Context。Grok 搜索只作背景；正式事实只能来自批准输入。队列只接收带 `persona_editorial_grok_gemini:<evaluation-id>` 来源和审计记录的候选，历史批量稿与旧编辑稿不会进入队列。
 
@@ -45,7 +47,7 @@ Open `https://x-account-operator-api-production.up.railway.app/`.
 
 `configs/topic_selection_policy.json` is the permanent selection authority.
 
-The daily flow is: mother-pool heat → facts and opinions → public candidate questions → formal public Context + approved persona private topics → persona evaluation → claim arbitration → Grok context → Gemini draft → Gemini critic → human review.
+The daily flow is: mother-pool heat → facts and opinions → approved mother topics → Grok topic context → Gemini angle expansion and quality gate → approved persona private topics → persona evaluation → claim arbitration → Grok draft context → Gemini draft → Gemini critic → human review.
 
 - Heat only decides what to research. It does not make a topic publishable.
 - A refreshed number is not a new topic unless it changes the conclusion, scale, mechanism, participation condition, or invalidation condition.
@@ -54,6 +56,7 @@ The daily flow is: mother-pool heat → facts and opinions → public candidate 
 - 每个人设先判断自己是否会注意到、是否有知识边界内的独特主张、与已有内容相比是否有新增价值；不能满足则 `HOLD` 或 `IGNORE`。
 - 选题并非按人设顺序分配，`WRITE` 也不是发布指令。
 - `/market` shows both selected topics and rejected topics with reasons.
+- `POST /api/context/daily-runs/{date}/retry-angle-expansion` immediately releases a failed angle stage after API credit, rate-limit, or provider recovery; otherwise three short retries are followed by a 30-minute cooldown retry.
 
 ## Daily mother-pool scheduler
 
