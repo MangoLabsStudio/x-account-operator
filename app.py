@@ -503,6 +503,8 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_post_candidates_persona
             ON post_candidates(persona_id, context_date DESC);
+            CREATE INDEX IF NOT EXISTS idx_post_candidates_fifo
+            ON post_candidates(persona_id, status, created_at, id);
             CREATE TABLE IF NOT EXISTS topic_claim_history (
                 id INTEGER PRIMARY KEY,
                 claim_key TEXT NOT NULL UNIQUE,
@@ -4262,27 +4264,55 @@ async def generate_persona_post(persona_id: int, request: PostGenerationIn):
     return {"post": post, "context_pack_id": request.context_pack_id}
 
 
-@app.get("/api/daily-post")
-def get_daily_post():
-    with db() as conn:
-        row = conn.execute(
-            """SELECT c.*,p.slug persona_slug,p.name persona_name
-               FROM post_candidates c JOIN personas p ON p.id=c.persona_id
-               WHERE c.status<>'superseded' AND (
-                   c.source LIKE 'initial_batch:%' OR (
-                       c.source LIKE 'persona_editorial:%' AND EXISTS (
-                           SELECT 1 FROM persona_editorial_evaluations e
-                           JOIN daily_context_runs r ON r.id=e.run_id
-                           WHERE ('persona_editorial:' || e.id)=c.source
-                             AND e.status='WRITE' AND r.status='approved'
-                       )
+def queued_post_rows(conn):
+    return conn.execute(
+        """SELECT c.*,p.slug persona_slug,p.name persona_name,p.avatar
+           FROM post_candidates c JOIN personas p ON p.id=c.persona_id
+           WHERE c.status='needs_review' AND (
+               c.source LIKE 'initial_batch:%' OR (
+                   c.source LIKE 'persona_editorial:%' AND EXISTS (
+                       SELECT 1 FROM persona_editorial_evaluations e
+                       JOIN daily_context_runs r ON r.id=e.run_id
+                       WHERE ('persona_editorial:' || e.id)=c.source
+                         AND e.status='WRITE' AND r.status='approved'
                    )
                )
-               ORDER BY c.context_date DESC,c.updated_at DESC LIMIT 1"""
+           )
+           ORDER BY c.persona_id,c.created_at,c.id"""
+    ).fetchall()
+
+
+@app.post("/api/post-candidates/{candidate_id}/published")
+def mark_post_candidate_published(candidate_id: int):
+    with db() as conn:
+        candidate = conn.execute(
+            "SELECT id,persona_id,status FROM post_candidates WHERE id=?", (candidate_id,)
         ).fetchone()
-    if not row:
+        if not candidate:
+            raise HTTPException(404, "Post candidate not found")
+        if candidate["status"] == "published":
+            return {"id": candidate_id, "status": "published"}
+        if candidate["status"] != "needs_review":
+            raise HTTPException(409, "Post candidate is not publishable")
+        head = next(
+            (row for row in queued_post_rows(conn) if row["persona_id"] == candidate["persona_id"]),
+            None,
+        )
+        if not head or head["id"] != candidate_id:
+            raise HTTPException(409, "Post candidate is not the current queue head")
+        conn.execute(
+            "UPDATE post_candidates SET status='published',updated_at=? WHERE id=?",
+            (int(time.time()), candidate_id),
+        )
+    return {"id": candidate_id, "status": "published"}
+
+
+@app.get("/api/daily-post")
+def get_daily_post():
+    posts = get_daily_posts()
+    if not posts:
         raise HTTPException(404, "Daily Post draft not found")
-    return dict(row)
+    return min(posts, key=lambda item: (item["created_at"], item["id"]))
 
 
 def daily_post_asset_url(slug: str, _context_date: str, asset_id: str = ""):
@@ -4296,42 +4326,56 @@ def daily_post_asset_url(slug: str, _context_date: str, asset_id: str = ""):
 
 @app.get("/api/daily-posts")
 def get_daily_posts():
-    context_date = shanghai_today()
     with db() as conn:
-        rows = conn.execute(
-            """SELECT c.*,p.slug persona_slug,p.name persona_name,p.avatar
-               FROM post_candidates c JOIN personas p ON p.id=c.persona_id
-               WHERE c.context_date=? AND c.status<>'superseded' AND (
-                   c.source LIKE 'initial_batch:%' OR (
-                       c.source LIKE 'persona_editorial:%' AND EXISTS (
-                           SELECT 1 FROM persona_editorial_evaluations e
-                           JOIN daily_context_runs r ON r.id=e.run_id
-                           WHERE ('persona_editorial:' || e.id)=c.source
-                             AND e.status='WRITE' AND r.status='approved'
-                       )
-                   )
-                 )
-               ORDER BY c.updated_at DESC,c.id DESC""",
-            (context_date,),
-        ).fetchall()
+        queued = queued_post_rows(conn)
+    heads = {}
+    remaining = {}
+    for row in queued:
+        persona_id = row["persona_id"]
+        remaining[persona_id] = remaining.get(persona_id, 0) + 1
+        heads.setdefault(persona_id, row)
     return [
         {
             **dict(row),
-            "position": position,
+            "position": 1,
+            "remaining": remaining[row["persona_id"]],
             "image_url": daily_post_asset_url(
-                row["persona_slug"], context_date, row["asset_id"]
+                row["persona_slug"], row["context_date"], row["asset_id"]
             ),
             "image_note": (
                 "已批准素材候选；发布前确认图片与正文匹配。"
                 if row["asset_id"] else "本条未选择图片素材。"
             ),
         }
-        for position, row in enumerate(rows, 1)
+        for row in heads.values()
     ]
 
 
 INDEX_HTML = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>每日 Post 草稿队列</title>
-<style>body{font:15px/1.7 system-ui;max-width:1080px;margin:36px auto;padding:0 18px;color:#18181b;background:#f7f8fa}header{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:22px}h1{margin:0;font-size:26px}header p{margin:3px 0 0;color:#71717a}nav{display:flex;gap:16px}a{color:#2563eb;text-decoration:none}.queue{display:grid;gap:18px}.card{display:grid;grid-template-columns:180px 1fr;background:#fff;border:1px solid #e2e4e8;border-radius:14px;overflow:hidden}.image{width:100%;height:100%;min-height:220px;object-fit:cover;background:#eceef1}.content{padding:20px;white-space:pre-wrap}.meta{color:#71717a;font-size:13px;margin-bottom:8px}.title{font-weight:750;margin-bottom:10px}.note{color:#8a641b;font-size:12px;margin-top:14px}.queued{padding:28px;color:#71717a}.empty-image{display:grid;place-items:center;background:#eceef1;color:#8b9098}@media(max-width:680px){header{display:block}nav{margin-top:12px}.card{grid-template-columns:1fr}.image{height:260px}}</style>
-<header><div><h1>每日 Post 草稿队列</h1><p>仅展示已通过人设编辑判断的真实草稿；无可写题时不补位。</p></div><nav><a href="__BASE_URL__/personas">人设</a><a href="__BASE_URL__/market">每日研究</a></nav></header>
-<main id="result" class="queue"><div class="queued">正在读取今天的队列…</div></main>
-<script>const base='__BASE_URL__',result=document.querySelector('#result');fetch(base+'/api/daily-posts').then(r=>r.json()).then(items=>{result.innerHTML='';if(!items.length){result.textContent='今天暂无通过编辑判断的草稿。';return}items.forEach(x=>{const card=document.createElement('article');card.className='card';if(x.image_url){const img=document.createElement('img');img.className='image';img.src=base+x.image_url;img.alt=x.persona_name+' 素材候选';card.append(img)}else{const empty=document.createElement('div');empty.className='empty-image';empty.textContent='暂无素材';card.append(empty)}const content=document.createElement('div');content.className='content';const meta=document.createElement('div');meta.className='meta';meta.textContent=`队列 ${x.position} · ${x.context_date} · ${x.persona_name}`;content.append(meta);const title=document.createElement('div');title.className='title';title.textContent=x.title;content.append(title);const body=document.createElement('div');body.textContent=x.body;content.append(body);const note=document.createElement('div');note.className='note';note.textContent=x.image_note;content.append(note);card.append(content);result.append(card)})}).catch(e=>{result.textContent=e.message})</script>"""
+<style>body{font:15px/1.7 system-ui;max-width:1080px;margin:36px auto;padding:0 18px;color:#18181b;background:#f7f8fa}header{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:22px}h1{margin:0;font-size:26px}header p{margin:3px 0 0;color:#71717a}nav{display:flex;gap:16px}a{color:#2563eb;text-decoration:none}.queue{display:grid;gap:18px}.card{display:grid;grid-template-columns:180px 1fr;background:#fff;border:1px solid #e2e4e8;border-radius:14px;overflow:hidden}.image{width:100%;height:100%;min-height:220px;object-fit:cover;background:#eceef1}.content{padding:20px;white-space:pre-wrap}.meta{color:#71717a;font-size:13px;margin-bottom:8px}.title{font-weight:750;margin-bottom:10px}.note{color:#8a641b;font-size:12px;margin-top:14px}.done{margin-top:14px;border:0;border-radius:9px;padding:9px 14px;background:#18181b;color:#fff;cursor:pointer}.done:disabled{opacity:.55;cursor:wait}.queued{padding:28px;color:#71717a}.empty-image{display:grid;place-items:center;background:#eceef1;color:#8b9098}@media(max-width:680px){header{display:block}nav{margin-top:12px}.card{grid-template-columns:1fr}.image{height:260px}}</style>
+<header><div><h1>Post 草稿队列</h1><p>每个人设只显示当前一条；标记已发后自动显示下一条。</p></div><nav><a href="__BASE_URL__/personas">人设</a><a href="__BASE_URL__/market">每日研究</a></nav></header>
+<main id="result" class="queue"><div class="queued">正在读取队列…</div></main>
+<script>
+const base='__BASE_URL__',result=document.querySelector('#result');
+async function load(){
+  try{
+    const response=await fetch(base+'/api/daily-posts'),items=await response.json();
+    result.innerHTML='';
+    if(!items.length){result.textContent='队列已清空。';return}
+    items.forEach(x=>{
+      const card=document.createElement('article');card.className='card';
+      if(x.image_url){const img=document.createElement('img');img.className='image';img.src=base+x.image_url;img.alt=x.persona_name+' 素材候选';card.append(img)}
+      else{const empty=document.createElement('div');empty.className='empty-image';empty.textContent='暂无素材';card.append(empty)}
+      const content=document.createElement('div');content.className='content';
+      const meta=document.createElement('div');meta.className='meta';meta.textContent=`${x.persona_name} · 队列还剩 ${x.remaining} 条 · ${x.context_date}`;content.append(meta);
+      const title=document.createElement('div');title.className='title';title.textContent=x.title;content.append(title);
+      const body=document.createElement('div');body.textContent=x.body;content.append(body);
+      const note=document.createElement('div');note.className='note';note.textContent=x.image_note;content.append(note);
+      const done=document.createElement('button');done.className='done';done.textContent='已发，下一条';
+      done.onclick=async()=>{done.disabled=true;done.textContent='处理中…';try{const marked=await fetch(base+`/api/post-candidates/${x.id}/published`,{method:'POST'});if(!marked.ok){const error=await marked.json();throw new Error(error.detail||'更新失败')}await load()}catch(error){done.disabled=false;done.textContent='已发，下一条';alert(error.message)}};
+      content.append(done);card.append(content);result.append(card);
+    });
+  }catch(error){result.textContent=error.message}
+}
+load();
+</script>"""

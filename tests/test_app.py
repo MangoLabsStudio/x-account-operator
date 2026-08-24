@@ -559,6 +559,62 @@ class AppTest(unittest.TestCase):
         self.assertEqual(latest.status_code, 200)
         self.assertEqual(latest.json()["source"], f"initial_batch:{context_date}:evergreen-01")
 
+    def test_persona_queues_advance_one_post_at_a_time(self):
+        context_date = self.app_module.shanghai_today()
+        with self.app_module.db() as conn:
+            personas = {
+                row["slug"]: row["id"]
+                for row in conn.execute(
+                    "SELECT id,slug FROM personas WHERE slug IN ('acheng','atuo')"
+                ).fetchall()
+            }
+            now = int(time.time())
+            first = conn.execute(
+                """INSERT INTO post_candidates(
+                    persona_id,context_date,title,body,status,source,notes,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (personas["acheng"], "2026-08-23", "阿成一", "阿成第一条。", "needs_review",
+                 "initial_batch:2026-08-23:news-01", "", now, now),
+            ).lastrowid
+            second = conn.execute(
+                """INSERT INTO post_candidates(
+                    persona_id,context_date,title,body,status,source,notes,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (personas["acheng"], context_date, "阿成二", "阿成第二条。", "needs_review",
+                 f"initial_batch:{context_date}:news-02", "", now, now),
+            ).lastrowid
+            conn.execute(
+                """INSERT INTO post_candidates(
+                    persona_id,context_date,title,body,status,source,notes,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (personas["atuo"], context_date, "阿拓一", "阿拓第一条。", "needs_review",
+                 f"initial_batch:{context_date}:news-01", "", now, now),
+            )
+
+        queue = self.client.get("/api/daily-posts").json()
+        self.assertEqual(len(queue), 2)
+        current = {item["persona_slug"]: item for item in queue}
+        self.assertEqual(current["acheng"]["id"], first)
+        self.assertEqual(current["acheng"]["remaining"], 2)
+        self.assertEqual(current["atuo"]["remaining"], 1)
+
+        skipped = self.client.post(f"/api/post-candidates/{second}/published")
+        self.assertEqual(skipped.status_code, 409)
+        marked = self.client.post(f"/api/post-candidates/{first}/published")
+        self.assertEqual(marked.json(), {"id": first, "status": "published"})
+
+        queue = self.client.get("/api/daily-posts").json()
+        current = {item["persona_slug"]: item for item in queue}
+        self.assertEqual(current["acheng"]["id"], second)
+        self.assertEqual(current["acheng"]["remaining"], 1)
+        self.assertNotEqual(self.client.get("/api/daily-post").json()["id"], first)
+        self.assertEqual(self.client.post(f"/api/post-candidates/{first}/published").status_code, 200)
+        with self.app_module.db() as conn:
+            self.assertEqual(
+                conn.execute("SELECT status FROM post_candidates WHERE id=?", (first,)).fetchone()[0],
+                "published",
+            )
+
     def test_initial_batch_import_is_review_only_and_idempotent(self):
         from scripts import import_initial_drafts
 
