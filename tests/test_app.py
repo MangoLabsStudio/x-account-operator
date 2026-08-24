@@ -1074,6 +1074,25 @@ class AppTest(unittest.TestCase):
                     {"context_date": "2026-08-24"},
                 ))
 
+    def test_unverified_numeric_gate_allows_protocol_identifiers_only(self):
+        identifiers = (
+            "TermMax S1 和 x402 都是具体对象，L2 也是协议语境中的标识。这里讨论的是参与方式和产品结构，"
+            "没有把价格、比例、日期或数量写成已经确认的市场事实，因此仍然可以进入主编审核。"
+        )
+        self.assertNotIn(
+            "无已核事实时出现数字、日期或价格式断言",
+            self.app_module.deterministic_editorial_style_failures(
+                identifiers, {"first_person_allowed": False}, {"facts": []}
+            ),
+        )
+        numeric_claim = identifiers + " 这个活动的 APY 是 12%。"
+        self.assertIn(
+            "无已核事实时出现数字、日期或价格式断言",
+            self.app_module.deterministic_editorial_style_failures(
+                numeric_claim, {"first_person_allowed": False}, {"facts": []}
+            ),
+        )
+
     def test_published_legacy_candidate_is_never_superseded_or_replaced(self):
         context_date = self.app_module.shanghai_today()
         topic = {"claim_key": "published-legacy", "title": "旧稿", "eligible": True}

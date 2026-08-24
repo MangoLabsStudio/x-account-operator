@@ -2852,6 +2852,11 @@ SAFE_FIRST_PERSON_OPINION_LEADS = (
     "我倾向于", "我倾向", "我更关心", "在我看来",
 )
 
+UNVERIFIED_NUMERIC_ASSERTION_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:[$¥￥]\s*)?\d+(?:[.,]\d+)*(?:\s*(?:%|美元|美金|元|万|亿|小时|天|周|月|年|倍|bp|bps))?(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
 
 def unauthorized_first_person_experience(post: str, writer_context: dict):
     if writer_context.get("first_person_allowed"):
@@ -3040,7 +3045,8 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
         "{\"text\":\"...\",\"facts_used_ids\":[\"fact:...\"],\"stance\":\"...\"}。\n"
         "唯一可作为确定事实、数字或日期的材料是 verified_facts（已批准事实依据）；Grok 内容只用于理解前情、圈内争议和语言语境。"
         "X 上重复出现的说法仍只是观点。必须给清楚判断和现实后果，不写研报、免责声明、标题、来源列表或观察清单。"
-        "若 verified_facts.facts 为空，不得写日期、数字或已被确认的事实；只能写明确标出的观点、解释或判断。"
+        "若 verified_facts.facts 为空，不得写日期、价格、比例、数量或已被确认的事实；只能写明确标出的观点、解释或判断。"
+        "TermMax S1、x402、L2 这类项目或协议标识可以照常写，它们不属于数字断言。"
         "题目里的具体对象必须直接点名；没有已核事实时，把机制或催化写成明确的条件句，随后给出现在能执行的正向选择，"
         "不能用‘某个平台/某个活动’躲开对象，也不能以‘再等等、继续观察’收尾。"
         "不写“结论很明确/本质上/值得注意的是/核心逻辑/不是X而是Y/一方面另一方面”。"
@@ -3099,7 +3105,7 @@ def deterministic_editorial_style_failures(post: str, writer_context: dict, veri
         failures.append("用等待或观察句替代当前结论")
     if unauthorized_first_person_experience(text, writer_context):
         failures.append("虚构或未授权的第一人称经历")
-    if verified_facts is not None and not verified_facts.get("facts") and re.search(r"\d", text):
+    if verified_facts is not None and not verified_facts.get("facts") and UNVERIFIED_NUMERIC_ASSERTION_RE.search(text):
         failures.append("无已核事实时出现数字、日期或价格式断言")
     boilerplate = ("结论很明确", "我的结论很简单", "我的结论很直白", "本质上", "值得注意的是", "核心逻辑", "一方面", "另一方面", "显而易见", "大家都知道")
     if any(phrase in text for phrase in boilerplate) or re.search(r"^\s*不是.{1,30}而是", text):
@@ -3120,7 +3126,8 @@ async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_
         "把 Grok 背景或未提供材料写成事实、虚构人设经历、没有明确判断，均 REJECT。PASS 必须是有信息量、"
         "有明确主题、像这个人设会说的话的帖子。只允许 verified_facts 成为事实；facts_used_ids 必须是其子集，"
         "且有 verified_facts 时不可为空。题目中的项目或资产名称本身，以及明确使用‘如果/只要/前提是’表达的条件判断，"
-        "不应误判为已经发生的事实；但条件句里夹带的数字、日期或已发生事件仍须 verified_facts。\n\n"
+        "不应误判为已经发生的事实；TermMax S1、x402、L2 这类项目标识也不属于数字断言，"
+        "但条件句里夹带的价格、比例、日期、数量或已发生事件仍须 verified_facts。\n\n"
         f"永久成稿门槛：{json.dumps(topic_selection_policy().get('draft_quality_gates', []), ensure_ascii=False)}\n"
         f"人设：{json.dumps(persona, ensure_ascii=False)}\n题目：{json.dumps(topic, ensure_ascii=False)}\n"
         f"verified_facts：{json.dumps(verified_facts, ensure_ascii=False)}\n"
