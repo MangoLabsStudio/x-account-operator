@@ -8,8 +8,20 @@ data/
 generated/
 deliverables/
 
-# Large local visual asset packs are managed outside Git
-assets/
+# Large local visual asset packs are managed outside Git. Only the small
+# publishable web sets ship with the service.
+assets/*
+!assets/characters/
+assets/characters/*
+!assets/characters/acheng/
+!assets/characters/ridehail-driver-zhao/
+!assets/characters/college-student-linjia/
+assets/characters/acheng/*
+!assets/characters/acheng/publishable-web/
+assets/characters/ridehail-driver-zhao/*
+!assets/characters/ridehail-driver-zhao/publishable-web/
+assets/characters/college-student-linjia/*
+!assets/characters/college-student-linjia/publishable-web/
 
 # Accidental local scratch files
 select count(*) from source_posts;
