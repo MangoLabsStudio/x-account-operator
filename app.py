@@ -31,7 +31,7 @@ TOPIC_SELECTION_POLICY_PATH = APP_DIR / "configs" / "topic_selection_policy.json
 PERSONA_META = {
     "acheng": ("阿成", "外卖员"),
     "ridehail-driver-zhao": ("赵师傅", "网约车司机"),
-    "college-student-linjia": ("林佳", "成年女大学生"),
+    "college-student-linjia": ("桃桃还没下课", "成年女大学生"),
     "atuo": ("阿拓Tuo", "Crypto 增长 / 交易"),
     "axu": ("AXU", "市场结构 / 数据"),
     "nanqiao": ("南桥研究所", "AI × Crypto 产品"),
@@ -89,29 +89,29 @@ EMPTY_WAITING_PHRASES = (
 
 ASSET_COLLECTIONS = {
     "acheng": {
-        "name": "阿成真实核心素材 40 张",
-        "folder": "acheng-consistent-core-40",
-        "expected_count": 40,
-        "usage": "内部选题和配图参考；不得把原作者的订单、收入或经历写成阿成本人亲历。",
+        "name": "阿成可发布场景图 3 张",
+        "folder": "publishable-web",
+        "expected_count": 3,
+        "usage": "原创 AI 虚拟角色配图；公开账号需在 Bio 或置顶说明 AI 虚拟角色。",
     },
     "ridehail-driver-zhao": {
-        "name": "老赵真实场景参考 40 张",
-        "folder": "real-reference-core-40",
-        "expected_count": 40,
-        "usage": "内部选题和配图参考；不得把原司机的流水、乘客或行程写成老赵本人亲历。",
+        "name": "老赵可发布场景图 3 张",
+        "folder": "publishable-web",
+        "expected_count": 3,
+        "usage": "原创 AI 虚拟角色配图；公开账号需在 Bio 或置顶说明 AI 虚拟角色。",
     },
     "college-student-linjia": {
-        "name": "女大学生日常素材 10 张",
-        "folder": "real-reference-core-10",
-        "expected_count": 10,
-        "usage": "仅使用这组已确认的生活照；不得补造学校、地点、姓名或照片之外的亲历事实。",
+        "name": "桃桃可发布生活素材 4 张",
+        "folder": "publishable-web",
+        "expected_count": 4,
+        "usage": "用户已确认拥有公开使用授权；只按画面配图，不据照片补造学校、地点或经历。",
     },
 }
 
 PERSONA_AVATAR_OVERRIDES = {
     "acheng": "acheng/avatar-x-v4-natural-meituan.png",
     "ridehail-driver-zhao": "ridehail-driver-zhao/avatar-x-v3-natural.png",
-    "college-student-linjia": "college-student-linjia/real-reference-core-10/04-outdoor-black-skirt.jpg",
+    "college-student-linjia": "college-student-linjia/publishable-web/04-outdoor-black-skirt.jpg",
     "atuo": "atuo/avatar.png",
     "axu": "axu/avatar.png",
     "nanqiao": "nanqiao/avatar.png",
@@ -721,6 +721,7 @@ def seed_personas():
             if not folder.is_dir():
                 continue
             draft, avatar = persona_seed(slug, folder)
+            collection = ASSET_COLLECTIONS.get(slug)
             conn.execute(
                 """INSERT OR IGNORE INTO personas(slug,name,role,avatar,draft,status,current_version,updated_at)
                    VALUES(?,?,?,?,?,'draft',0,?)""",
@@ -740,13 +741,26 @@ def seed_personas():
             ).fetchone()
             current = json.loads(row["draft"])
             old_student_profile = current.get("identity", {}).get("profile", "")
+            if slug == "college-student-linjia" and row["name"] != draft["identity"]["name"]:
+                current["identity"]["name"] = draft["identity"]["name"]
+                conn.execute(
+                    "UPDATE personas SET name=?,draft=?,updated_at=? WHERE slug=?",
+                    (draft["identity"]["name"], json.dumps(current, ensure_ascii=False), int(time.time()), slug),
+                )
             if slug == "college-student-linjia" and (
                 "状态：已排除" in old_student_profile or "## 母图 Prompt" in old_student_profile
             ):
-                current["identity"]["profile"] = draft["identity"]["profile"]
+                if draft["identity"]["profile"]:
+                    current["identity"]["profile"] = draft["identity"]["profile"]
                 current["visual"] = draft["visual"]
                 conn.execute(
                     "UPDATE personas SET draft=?,status='draft',updated_at=? WHERE slug=?",
+                    (json.dumps(current, ensure_ascii=False), int(time.time()), slug),
+                )
+            if collection and current.get("visual", {}).get("asset_collection") != collection["name"]:
+                current["visual"] = draft["visual"]
+                conn.execute(
+                    "UPDATE personas SET draft=?,updated_at=? WHERE slug=?",
                     (json.dumps(current, ensure_ascii=False), int(time.time()), slug),
                 )
             if current.get("config_revision") != PERSONA_CONFIG_REVISION:
@@ -4336,10 +4350,12 @@ def get_daily_posts():
     result = []
     for row in queued:
         persona_id = row["persona_id"]
+        public_profile = PERSONA_PUBLIC_PROFILE.get(row["persona_slug"], {})
         positions[persona_id] = positions.get(persona_id, 0) + 1
         result.append(
             {
                 **dict(row),
+                "persona_name": public_profile.get("display_name", row["persona_name"]),
                 "position": positions[persona_id],
                 "remaining": remaining[persona_id],
                 "is_head": positions[persona_id] == 1,

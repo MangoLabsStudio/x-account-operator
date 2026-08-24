@@ -34,6 +34,8 @@ def read_batch(batch_dir: Path):
                 raise ValueError(f"{path.name} has an empty topic or body")
             if not isinstance(item.get("sources", []), list):
                 raise ValueError(f"{path.name} sources must be an array")
+            if "asset_id" in item and not isinstance(item["asset_id"], str):
+                raise ValueError(f"{path.name} asset_id must be a string")
         batch[path.stem] = items
     return batch
 
@@ -42,6 +44,7 @@ def import_batch(batch_dir: Path, context_date: str):
     batch = read_batch(batch_dir)
     app.init_db()
     inserted = 0
+    updated = 0
     now = int(time.time())
     with app.db() as conn:
         personas = {
@@ -52,16 +55,30 @@ def import_batch(batch_dir: Path, context_date: str):
         if missing:
             raise ValueError(f"unknown personas: {', '.join(missing)}")
         for slug, items in batch.items():
+            valid_asset_ids = {asset["id"] for asset in app.persona_assets(slug)}
             for item in items:
+                asset_id = item.get("asset_id", "").strip()
+                if asset_id and asset_id not in valid_asset_ids:
+                    raise ValueError(f"{slug} has invalid asset_id: {asset_id}")
+                source = f"initial_batch:{context_date}:{item['slot']}"
+                existing = conn.execute(
+                    "SELECT asset_id FROM post_candidates WHERE persona_id=? AND context_date=? AND source=?",
+                    (personas[slug], context_date, source),
+                ).fetchone()
                 before = conn.total_changes
                 conn.execute(
                     """INSERT INTO post_candidates(
                         persona_id,context_date,title,body,status,source,asset_id,notes,created_at,updated_at
                     ) VALUES(?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(persona_id,context_date,source) DO NOTHING""",
+                    ON CONFLICT(persona_id,context_date,source) DO UPDATE SET
+                        asset_id=excluded.asset_id,
+                        updated_at=excluded.updated_at
+                    WHERE post_candidates.status='needs_review'
+                      AND post_candidates.asset_id=''
+                      AND excluded.asset_id<>''""",
                     (
                         personas[slug], context_date, item["topic"].strip(), item["body"].strip(),
-                        "needs_review", f"initial_batch:{context_date}:{item['slot']}", "",
+                        "needs_review", source, asset_id,
                         json.dumps({
                             "batch": batch_dir.name,
                             "kind": item["kind"],
@@ -71,8 +88,17 @@ def import_batch(batch_dir: Path, context_date: str):
                         now, now,
                     ),
                 )
-                inserted += conn.total_changes - before
-    return {"personas": len(batch), "drafts": sum(map(len, batch.values())), "inserted": inserted}
+                changed = conn.total_changes - before
+                if existing is None:
+                    inserted += changed
+                else:
+                    updated += changed
+    return {
+        "personas": len(batch),
+        "drafts": sum(map(len, batch.values())),
+        "inserted": inserted,
+        "updated": updated,
+    }
 
 
 def main():

@@ -4,6 +4,7 @@
     "kind": "news",
     "topic": "BTC这段能看，但别拿生活缓冲去追",
     "body": "BTC从8月17日开盘约62900美元，涨到21日盘中79500美元，24日18:51在77635美元附近。几天里走出这么一段，最容易让人觉得再不上车就晚了。可对普通人来说，追涨花掉的不是一笔闲钱，而是下个月房租、还款和突发开销的缓冲。我的结论很简单：这波趋势可以研究，能承受波动的钱才谈参与；要靠它填生活缺口的钱，不该在急涨后拿去赌下一根阳线。",
+    "asset_id": "ridehail-driver-zhao:15-late-night-waiting-selfie.jpg",
     "sources": [
       "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=8",
       "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
@@ -33,6 +34,7 @@
     "kind": "evergreen",
     "topic": "流水好看，不等于这一天真的赚得多",
     "body": "很多人看服务行业的流水，只看最后那一串数字，容易把营收当成收入。空驶、能源、车辆折旧、平台抽成、吃饭和等待，全都不是凭空消失的。更要紧的是时间：一段看着单价不错的安排，如果把两头等待和回程都算进去，时薪可能并不高。账算得细不是把日子过得抠，是不让表面的热闹替自己下结论。流水能说明忙过，不能单独说明这份忙值不值。",
+    "asset_id": "ridehail-driver-zhao:04-shade-waiting-selfie.jpg",
     "sources": []
   },
   {
@@ -47,6 +49,7 @@
     "kind": "evergreen",
     "topic": "高峰单价再高，也不一定是一份高质量的工作",
     "body": "高峰时段的价格往往最好看，所以很多人只盯着那几个小时。但一份工作值不值，不能只看最贵的那一单，还得看高峰前后要付多少等待、通勤、调度和体力成本。把所有精力都挤在最拥堵的地方，未必比把节奏排顺更划算。行业里最容易犯的错，就是用峰值单价安慰自己，忽略全天的净收入和可持续性。短时冲高没有问题，把它当成常态，账就容易失真。",
+    "asset_id": "ridehail-driver-zhao:10-after-traffic-selfie.jpg",
     "sources": []
   },
   {
