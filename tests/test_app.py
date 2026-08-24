@@ -1548,6 +1548,36 @@ class AppTest(unittest.TestCase):
                     mothers, {"context_date": "2026-08-24"},
                 ))
 
+    def test_grok_angle_research_splits_large_slates_into_small_batches(self):
+        mothers = [
+            {"seed_key": f"seed-{index}", "subject": str(index), "title": str(index)}
+            for index in range(7)
+        ]
+
+        async def research_batch(batch, _daily):
+            contexts = [{"seed_key": item["seed_key"]} for item in batch]
+            text = json.dumps({"contexts": contexts}, ensure_ascii=False)
+            return {
+                "text": text,
+                "contexts": contexts,
+                "citations": [f"https://example.com/{batch[0]['seed_key']}"],
+                "tool_usage": ["x_search", "web_search"],
+                "model": "grok-test",
+            }
+
+        batches = AsyncMock(side_effect=research_batch)
+        with patch.object(
+            self.app_module, "research_editorial_angle_context_grok_batch", batches,
+        ):
+            result = asyncio.run(self.app_module.research_editorial_angle_context_grok(
+                mothers, {"context_date": "2026-08-24"},
+            ))
+        self.assertEqual([len(call.args[0]) for call in batches.await_args_list], [3, 3, 1])
+        self.assertEqual({item["seed_key"] for item in result["contexts"]}, {
+            item["seed_key"] for item in mothers
+        })
+        self.assertEqual(result["batches"], 3)
+
     def test_unverified_numeric_gate_allows_protocol_identifiers_only(self):
         identifiers = (
             "TermMax S1 和 x402 都是具体对象，L2 也是协议语境中的标识。这里讨论的是参与方式和产品结构，"

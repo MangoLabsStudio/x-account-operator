@@ -3301,8 +3301,7 @@ async def enrich_persona_editorial_context(topic: dict, verified_facts: dict, da
     return result
 
 
-async def research_editorial_angle_context_grok(mother_topics: list[dict], daily_context: dict):
-    """Research the approved mother slate once before any persona sees it."""
+async def research_editorial_angle_context_grok_batch(mother_topics: list[dict], daily_context: dict):
     cache_key = "angles:" + hashlib.sha256(json.dumps(
         {
             "context_date": daily_context.get("context_date"),
@@ -3392,6 +3391,42 @@ async def research_editorial_angle_context_grok(mother_topics: list[dict], daily
         EDITORIAL_GROK_CONTEXT_CACHE.pop(next(iter(EDITORIAL_GROK_CONTEXT_CACHE)))
     EDITORIAL_GROK_CONTEXT_CACHE[cache_key] = result
     return result
+
+
+async def research_editorial_angle_context_grok(mother_topics: list[dict], daily_context: dict):
+    """Research the approved slate in small batches before any persona sees it."""
+    batches = [mother_topics[index:index + 3] for index in range(0, len(mother_topics), 3)]
+    if len(batches) == 1:
+        return await research_editorial_angle_context_grok_batch(batches[0], daily_context)
+    semaphore = asyncio.Semaphore(2)
+
+    async def research_batch(batch):
+        async with semaphore:
+            return await research_editorial_angle_context_grok_batch(batch, daily_context)
+
+    results = await asyncio.gather(
+        *(research_batch(batch) for batch in batches), return_exceptions=True
+    )
+    errors = [result for result in results if isinstance(result, Exception)]
+    if errors:
+        raise RuntimeError(f"Grok 母题分批研究失败: {errors[0]}") from errors[0]
+    contexts, citations, tool_usage = [], [], set()
+    for result in results:
+        contexts.extend(result["contexts"])
+        for citation in result.get("citations", []):
+            if citation not in citations:
+                citations.append(citation)
+        tool_usage.update(result.get("tool_usage", []))
+    text = json.dumps({"contexts": contexts}, ensure_ascii=False)
+    return {
+        "text": text,
+        "contexts": contexts,
+        "citations": citations[:24],
+        "tool_usage": sorted(tool_usage),
+        "model": results[0].get("model", ""),
+        "context_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+        "batches": len(batches),
+    }
 
 
 async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_context: dict,
