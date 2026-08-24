@@ -592,11 +592,12 @@ class AppTest(unittest.TestCase):
             )
 
         queue = self.client.get("/api/daily-posts").json()
-        self.assertEqual(len(queue), 2)
-        current = {item["persona_slug"]: item for item in queue}
-        self.assertEqual(current["acheng"]["id"], first)
-        self.assertEqual(current["acheng"]["remaining"], 2)
-        self.assertEqual(current["atuo"]["remaining"], 1)
+        self.assertEqual(len(queue), 3)
+        acheng_queue = [item for item in queue if item["persona_slug"] == "acheng"]
+        self.assertEqual([item["id"] for item in acheng_queue], [first, second])
+        self.assertEqual([item["position"] for item in acheng_queue], [1, 2])
+        self.assertEqual([item["is_head"] for item in acheng_queue], [True, False])
+        self.assertTrue(all(item["remaining"] == 2 for item in acheng_queue))
 
         skipped = self.client.post(f"/api/post-candidates/{second}/published")
         self.assertEqual(skipped.status_code, 409)
@@ -604,9 +605,11 @@ class AppTest(unittest.TestCase):
         self.assertEqual(marked.json(), {"id": first, "status": "published"})
 
         queue = self.client.get("/api/daily-posts").json()
-        current = {item["persona_slug"]: item for item in queue}
-        self.assertEqual(current["acheng"]["id"], second)
-        self.assertEqual(current["acheng"]["remaining"], 1)
+        acheng_queue = [item for item in queue if item["persona_slug"] == "acheng"]
+        self.assertEqual([item["id"] for item in acheng_queue], [second])
+        self.assertEqual(acheng_queue[0]["position"], 1)
+        self.assertTrue(acheng_queue[0]["is_head"])
+        self.assertEqual(acheng_queue[0]["remaining"], 1)
         self.assertNotEqual(self.client.get("/api/daily-post").json()["id"], first)
         self.assertEqual(self.client.post(f"/api/post-candidates/{first}/published").status_code, 200)
         with self.app_module.db() as conn:
