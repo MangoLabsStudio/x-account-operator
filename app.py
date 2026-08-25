@@ -2691,7 +2691,7 @@ def validate_persona_editorial_decisions(result, topics: list[dict]):
         decision = decisions[topic_key]
         if (
             decision["status"] == "HOLD"
-            and decision["reason_code"] == "editorial_hold"
+            and str(item.get("reason_code", "")).strip() == "editorial_hold"
             and str(allowed[topic_key].get("scope", "public")) != "persona"
             and decision["why_me"]
             and min(decision[key] for key in ("notice", "authority", "tension", "marginal_value")) >= 3
@@ -2757,6 +2757,8 @@ async def evaluate_persona_editorial(persona: dict, persona_context: dict, daily
         "每个输入 topic 必须恰好有一项，topic_claim_key 必须等于输入的 claim_key。"
         "逐题独立判断：notice/authority/tension/marginal_value 均为 0-5 整数；"
         "status 只能 WRITE/HOLD/IGNORE；why_me 说明为什么该人设此刻有资格说；"
+        "HOLD 必须显式输出 reason_code：软性犹豫用 editorial_hold；事实冲突用 fact_conflict；"
+        "人设禁区用 forbidden_claim；历史重复用 historical_duplicate；证据不足用 unsupported。"
         "WRITE 必须有新的 claim_key 和非显而易见 core_claim。HOLD 是内部状态，不是正文，绝不以等待后续凑稿。"
         "逐题独立决定，可有多条 WRITE，也可以全部 HOLD 或 IGNORE；不设数量上下限。"
         "公共 topic 已经通过母题多角度质量门；这里只判断哪个人设最适合说，不再临时发明新主题。"

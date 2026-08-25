@@ -1936,6 +1936,7 @@ class AppTest(unittest.TestCase):
                 "topic_claim_key": "public-angle", "status": "HOLD",
                 "notice": 4, "authority": 4, "tension": 3, "marginal_value": 3,
                 "why_me": "该人设有明确的观察位置。",
+                "reason_code": "editorial_hold",
             },
             {
                 "topic_claim_key": "private-angle", "status": "HOLD",
@@ -1975,6 +1976,18 @@ class AppTest(unittest.TestCase):
 
         self.assertEqual(result["conflicted-angle"]["status"], "HOLD")
         self.assertEqual(result["conflicted-angle"]["reason_code"], "fact_conflict")
+
+    def test_high_fit_hold_without_explicit_reason_is_not_promoted(self):
+        topic = {
+            "claim_key": "implicit-rejection", "core_claim": "缺少拒绝原因时保持 HOLD。", "scope": "public",
+        }
+        result = self.app_module.validate_persona_editorial_decisions({"decisions": [{
+            "topic_claim_key": "implicit-rejection", "status": "HOLD",
+            "notice": 5, "authority": 5, "tension": 5, "marginal_value": 5,
+            "why_me": "人设匹配，但事实存在冲突。", "rationale": "已核材料存在冲突。",
+        }]}, [topic])
+
+        self.assertEqual(result["implicit-rejection"]["status"], "HOLD")
 
     def test_marginal_threshold_only_filters_low_value_after_five_posts(self):
         def decision(value):
