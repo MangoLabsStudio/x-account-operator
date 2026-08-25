@@ -1922,6 +1922,64 @@ class AppTest(unittest.TestCase):
             ),
         )
 
+    def test_high_fit_public_hold_is_promoted_without_forcing_low_fit_topics(self):
+        public = {
+            "claim_key": "public-angle", "core_claim": "这个公共角度已经通过质量门。",
+            "scope": "public",
+        }
+        private = {
+            "claim_key": "private-angle", "core_claim": "私人角度仍尊重编辑判断。",
+            "scope": "persona",
+        }
+        result = self.app_module.validate_persona_editorial_decisions({"decisions": [
+            {
+                "topic_claim_key": "public-angle", "status": "HOLD",
+                "notice": 4, "authority": 4, "tension": 3, "marginal_value": 3,
+                "why_me": "该人设有明确的观察位置。",
+            },
+            {
+                "topic_claim_key": "private-angle", "status": "HOLD",
+                "notice": 5, "authority": 5, "tension": 5, "marginal_value": 5,
+                "why_me": "私人题不自动升格。",
+            },
+        ]}, [public, private])
+
+        self.assertEqual(result["public-angle"]["status"], "WRITE")
+        self.assertEqual(result["public-angle"]["claim_key"], "public-angle")
+        self.assertEqual(result["public-angle"]["core_claim"], public["core_claim"])
+        self.assertEqual(result["public-angle"]["reason_code"], "score_promoted")
+        self.assertEqual(result["private-angle"]["status"], "HOLD")
+
+    def test_high_fit_hold_promotion_still_requires_real_authority(self):
+        topic = {
+            "claim_key": "macro-angle", "core_claim": "宏观判断需要匹配的人设。", "scope": "public",
+        }
+        result = self.app_module.validate_persona_editorial_decisions({"decisions": [{
+            "topic_claim_key": "macro-angle", "status": "HOLD",
+            "notice": 5, "authority": 2, "tension": 5, "marginal_value": 5,
+            "why_me": "只能泛泛评论。",
+        }]}, [topic])
+
+        self.assertEqual(result["macro-angle"]["status"], "HOLD")
+
+    def test_marginal_threshold_only_filters_low_value_after_five_posts(self):
+        def decision(value):
+            return {
+                "status": "WRITE", "marginal_value": value,
+                "notice": 3, "authority": 3, "tension": 3,
+            }
+
+        before_five = {"topic": decision(2)}
+        at_five = {"weak": decision(2), "useful": decision(3)}
+
+        self.app_module.apply_editorial_marginal_threshold(before_five, 4)
+        self.app_module.apply_editorial_marginal_threshold(at_five, 5)
+
+        self.assertEqual(before_five["topic"]["status"], "WRITE")
+        self.assertEqual(at_five["weak"]["status"], "HOLD")
+        self.assertEqual(at_five["weak"]["reason_code"], "insufficient_marginal_value")
+        self.assertEqual(at_five["useful"]["status"], "WRITE")
+
     def test_editorial_claim_history_downgrades_duplicate_write(self):
         decisions = {
             "topic": {

@@ -2389,7 +2389,7 @@ def editorial_score(item: dict):
 
 
 EDITORIAL_CLAIM_KEY = re.compile(r"^[a-z0-9][a-z0-9:_-]{2,119}$")
-EDITORIAL_EVALUATOR_REVISION = 2
+EDITORIAL_EVALUATOR_REVISION = 3
 
 
 def editorial_public_topics(cards: dict):
@@ -2688,6 +2688,21 @@ def validate_persona_editorial_decisions(result, topics: list[dict]):
             "open_loop": str(item.get("open_loop", "")).strip(),
             "topic_claim_key": topic_key,
         }
+        decision = decisions[topic_key]
+        if (
+            decision["status"] == "HOLD"
+            and str(allowed[topic_key].get("scope", "public")) != "persona"
+            and decision["why_me"]
+            and min(decision[key] for key in ("notice", "authority", "tension", "marginal_value")) >= 3
+            and editorial_score(decision) >= 14
+        ):
+            decision.update({
+                "status": "WRITE",
+                "claim_key": topic_key,
+                "core_claim": str(allowed[topic_key].get("core_claim", "")).strip(),
+                "reason_code": "score_promoted",
+                "rationale": "公共角度已通过质量门，且该人设四项适配评分均不低于 3。",
+            })
     for topic in topics:
         key = str(topic.get("claim_key", ""))
         if key not in decisions:
@@ -2720,7 +2735,7 @@ def apply_editorial_claim_history(persona_id: int, decisions: dict, claim_histor
 
 
 def apply_editorial_marginal_threshold(decisions: dict, today_count: int):
-    minimum = 5 if today_count >= 5 else 4 if today_count >= 3 else 0
+    minimum = 3 if today_count >= 5 else 0
     if not minimum:
         return decisions
     for decision in decisions.values():
@@ -2744,6 +2759,8 @@ async def evaluate_persona_editorial(persona: dict, persona_context: dict, daily
         "WRITE 必须有新的 claim_key 和非显而易见 core_claim。HOLD 是内部状态，不是正文，绝不以等待后续凑稿。"
         "逐题独立决定，可有多条 WRITE，也可以全部 HOLD 或 IGNORE；不设数量上下限。"
         "公共 topic 已经通过母题多角度质量门；这里只判断哪个人设最适合说，不再临时发明新主题。"
+        "公共 topic 若四项评分均不低于 3 且没有明确事实冲突，应优先 WRITE；"
+        "不要仅以还需更多数据、已有讨论或不是最完美人选为由 HOLD。"
         "WRITE 必须保持该 angle 的判断边界，不能合并多个角度，也不能退化成常识。"
         "同一热点只有不同核心主张才值得写；不要复述常识、冷门机制或已覆盖的主张。"
         "approved_editorial_context 里，life_context 只有 first_person_allowed=true 的当前题目能支持具体亲历；"
@@ -3467,6 +3484,9 @@ async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_contex
         "claim_key 只能用小写字母、数字、冒号、下划线或连字符。statement_mode 只能 opinion 或 conditional。"
         "core_claim 必须是一句可争论、能直接说出口的明确结论，不能是问题、背景介绍、名词解释或等待后续。"
         "同一母题下，只有核心判断发生变化才算不同角度；换标题、换措辞、换人设都不算。"
+        "历史重复只指 claim_key 或核心结论实质相同；同一项目、同一币种、同一事件或同属一个宏观叙事，"
+        "不能单独作为 covered_claim。母题里的 selection_hints 若包含不同因果、参与条件、反方证据或二阶影响，"
+        "应分别判断，不要因为题材相同直接合并。"
         "圈内读者无需今天材料就会同意的常识、万能风险提示、空泛鸡汤、旧 Builder Codes 一类已覆盖主张，"
         "必须放进 rejected_angles，不能为了显得丰富而保留。"
         "机会角度必须存在正向参与或计算条件；如果结论只有别做、别追、风险很大，就不要生成。"
