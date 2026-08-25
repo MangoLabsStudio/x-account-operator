@@ -2987,7 +2987,7 @@ class AppTest(unittest.TestCase):
         run_date = self.app_module.shanghai_today()
 
         def collect(_accounts, _db, output, **kwargs):
-            calls.append(("collect", kwargs["key"]))
+            calls.append(("collect", kwargs["key"], kwargs["resume_hours"]))
             Path(output).mkdir(parents=True, exist_ok=True)
             return {"run_id": "run-current", "account_universe": 2, "accounts_fetched": 2, "posts_seen": 4}
 
@@ -3144,7 +3144,7 @@ class AppTest(unittest.TestCase):
                 f"/api/context/daily-runs/{run_date}/run"
             )
             self.assertFalse(duplicate.json()["started"])
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls, [("collect", "runtime-key", 0)])
             self.assertEqual(validation_run_ids, ["run-current"])
 
             run_id = first.json()["id"]
@@ -3299,6 +3299,7 @@ class AppTest(unittest.TestCase):
 
     def test_daily_context_run_failure_keeps_manifest_and_can_retry(self):
         run_date = self.app_module.shanghai_today()
+        retry_resume_hours = []
         def fail_collect(*_args, **_kwargs):
             raise RuntimeError("Twitter241 unavailable")
 
@@ -3318,6 +3319,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(failed.json()["raw_manifest"]["failed_stage"], "setup")
 
         def collect(_accounts, _db, output, **_kwargs):
+            retry_resume_hours.append(_kwargs["resume_hours"])
             Path(output).mkdir(parents=True, exist_ok=True)
             return {"run_id": "run-retry", "accounts_fetched": 1, "posts_seen": 1}
 
@@ -3343,6 +3345,7 @@ class AppTest(unittest.TestCase):
             retried = self.wait_for_daily_run(run_date)
         self.assertEqual(retried.status_code, 200)
         self.assertEqual(retried.json()["status"], "needs_review")
+        self.assertEqual(retry_resume_hours, [20])
 
     def test_daily_context_run_rejects_empty_cards_without_calling_llm(self):
         run_date = self.app_module.shanghai_today()

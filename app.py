@@ -4194,6 +4194,11 @@ async def execute_daily_context_run(run_id: int):
         paths["root"].mkdir(parents=True, exist_ok=True)
         sources = market_sources_module()
         key = twitter241_api_key()
+        resume_hours = (
+            int(os.getenv("XOPS_DAILY_CONTEXT_RESUME_HOURS", "20"))
+            if run["trigger"] == "retry"
+            else 0
+        )
         collect_result = await asyncio.to_thread(
             sources.collect,
             paths["accounts"],
@@ -4202,7 +4207,7 @@ async def execute_daily_context_run(run_id: int):
             key=key,
             hours=int(os.getenv("XOPS_DAILY_CONTEXT_HOURS", "30")),
             workers=int(os.getenv("XOPS_DAILY_CONTEXT_WORKERS", "8")),
-            resume_hours=int(os.getenv("XOPS_DAILY_CONTEXT_RESUME_HOURS", "20")),
+            resume_hours=resume_hours,
         )
         source_run_id = str(collect_result.get("run_id") or "").strip()
         if not source_run_id:
