@@ -1,13 +1,20 @@
+import json
+import tempfile
+import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 import sqlite3
+from unittest.mock import patch
 
 from market_sources.collect_big_source_posts import (
     MOTHER_POOL_PATH,
     _mother_pool_path,
+    collect,
     fetch_account,
     init_db,
     parse_posts,
 )
+from market_sources.cross_validate_source_posts import cross_validate
 
 
 SINCE = datetime(2026, 8, 23, tzinfo=timezone.utc)
@@ -128,3 +135,67 @@ def test_rejects_non_mother_pool_path(tmp_path):
         assert "唯一总信息源母池" in str(error)
     else:
         raise AssertionError("expected a forced mother-pool path error")
+
+
+class ResumedRunSnapshotTest(unittest.TestCase):
+    def test_skipped_account_reuses_only_its_latest_successful_run_posts(self):
+        account = {"user_id": "42", "handle": "source_handle", "source_lists": ["mother-pool"]}
+        fetched_post = {
+            "post_id": "fresh-1",
+            "author_id": "42",
+            "handle": "source_handle",
+            "text": "Coinbase launched tokenized equities on Base today with new trading access.",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "url": "https://x.com/source_handle/status/fresh-1",
+            "is_reply": False,
+            "is_retweet": False,
+            "is_quote": False,
+            "metrics": {},
+            "source_lists": ["mother-pool"],
+        }
+        stale_post = {
+            **fetched_post,
+            "post_id": "stale-1",
+            "text": "STALE_WINDOW_SENTINEL Coinbase launched an old tokenized equities event.",
+            "created_at": "2026-08-20T00:00:00+00:00",
+            "url": "https://x.com/source_handle/status/stale-1",
+        }
+        fetch_result = {
+            "posts": [fetched_post, stale_post],
+            "pages_fetched": 1,
+            "retries": 0,
+            "watermark_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = root / "sources.sqlite3"
+            output = root / "cards"
+            with patch(
+                "market_sources.collect_big_source_posts.load_accounts",
+                return_value=[account],
+            ), patch(
+                "market_sources.collect_big_source_posts.fetch_account",
+                return_value=fetch_result,
+            ) as fetch:
+                first = collect(Path("ignored.json"), db_path, output, key="runtime-key", workers=1)
+                second = collect(Path("ignored.json"), db_path, output, key="runtime-key", workers=1)
+
+            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(first["posts_new"], 2)
+            self.assertEqual(second["accounts_skipped"], 1)
+            self.assertEqual(second["posts_seen"], 1)
+            self.assertEqual(second["posts_new"], 0)
+            self.assertEqual(second["posts_reused"], 1)
+            second_snapshot = Path(second["snapshot_dir"])
+            self.assertEqual(
+                [post["post_id"] for post in json.loads((second_snapshot / "latest.json").read_text())["posts"]],
+                ["fresh-1"],
+            )
+            self.assertNotIn(
+                "STALE_WINDOW_SENTINEL",
+                (second_snapshot / "latest.json").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                cross_validate(db_path, second_snapshot, run_id=second["run_id"])["source_posts"],
+                1,
+            )

@@ -1,13 +1,134 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
 
+from market_sources.collect_big_source_posts import init_db
 from market_sources.cross_validate_source_posts import (
     build_attention_topics,
     build_discussion_topics,
+    cross_validate,
     evaluate_opinion,
 )
+from market_sources.run_daily import run_daily
+
+
+def insert_run_post(db, run_id: str, post_id: str, author_id: str, text: str) -> None:
+    db.execute(
+        """INSERT INTO source_posts(
+            post_id,author_id,handle,text,created_at,url,is_reply,source_lists,is_retweet,is_quote,metrics
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            post_id,
+            author_id,
+            author_id,
+            text,
+            datetime.now(timezone.utc).isoformat(),
+            f"https://x.com/{author_id}/status/{post_id}",
+            0,
+            '["crypto"]',
+            0,
+            0,
+            "{}",
+        ),
+    )
+    db.execute("INSERT INTO source_post_runs(run_id,post_id) VALUES(?,?)", (run_id, post_id))
+
+
+class RunSnapshotValidationTest(unittest.TestCase):
+    def test_cross_validate_reads_only_requested_run_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = root / "sources.sqlite3"
+            output = root / "cards"
+            with sqlite3.connect(db_path) as db:
+                init_db(db)
+                for index in range(2):
+                    insert_run_post(
+                        db,
+                        "old-run",
+                        f"old-{index}",
+                        f"old-author-{index}",
+                        "OLD_SHARED_SENTINEL Coinbase launched tokenized equities on Base today.",
+                    )
+                    insert_run_post(
+                        db,
+                        "new-run",
+                        f"new-{index}",
+                        f"new-author-{index}",
+                        "NEW_SNAPSHOT_SENTINEL Coinbase launched tokenized equities on Base today.",
+                    )
+                db.commit()
+
+            result = cross_validate(db_path, output, run_id="new-run")
+            fact_payload = json.loads((output / "fact_cards.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["run_id"], "new-run")
+            self.assertEqual(result["source_posts"], 2)
+            self.assertEqual(fact_payload["run_id"], "new-run")
+            self.assertEqual(fact_payload["source_post_count"], 2)
+            self.assertEqual(
+                {item["source_ref"] for item in fact_payload["cards"][0]["evidence"]},
+                {"new-0", "new-1"},
+            )
+            self.assertNotIn(
+                "OLD_SHARED_SENTINEL",
+                "".join(path.read_text(encoding="utf-8") for path in output.glob("*.json")),
+            )
+
+    def test_cross_validate_empty_run_does_not_fallback_to_shared_posts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = root / "sources.sqlite3"
+            output = root / "cards"
+            with sqlite3.connect(db_path) as db:
+                init_db(db)
+                insert_run_post(
+                    db,
+                    "old-run",
+                    "old-1",
+                    "old-author",
+                    "BTC launched an old shared event today.",
+                )
+                db.commit()
+
+            result = cross_validate(db_path, output, run_id="empty-new-run")
+
+            self.assertEqual(result["source_posts"], 0)
+            self.assertEqual(
+                json.loads((output / "fact_cards.json").read_text(encoding="utf-8"))["source_post_count"],
+                0,
+            )
+            self.assertEqual(
+                json.loads((output / "opinion_cards.json").read_text(encoding="utf-8"))["source_post_count"],
+                0,
+            )
+
+    def test_run_daily_forwards_collection_run_id(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def validate(_db, output, **kwargs):
+                calls.append((Path(output), kwargs["run_id"]))
+                return {"run_id": kwargs["run_id"], "source_posts": 0}
+
+            with patch(
+                "market_sources.run_daily.collect",
+                return_value={"run_id": "new-run", "snapshot_dir": str(root / "snapshot")},
+            ), patch("market_sources.run_daily.cross_validate", side_effect=validate):
+                run_daily(
+                    db_path=root / "db.sqlite3",
+                    output_dir=root / "output",
+                    key="runtime-key",
+                )
+
+            self.assertEqual(calls, [(root / "snapshot", "new-run")])
 
 
 def row(text: str, *, is_reply: bool = False) -> dict:

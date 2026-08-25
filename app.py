@@ -4204,7 +4204,11 @@ async def execute_daily_context_run(run_id: int):
             workers=int(os.getenv("XOPS_DAILY_CONTEXT_WORKERS", "8")),
             resume_hours=int(os.getenv("XOPS_DAILY_CONTEXT_RESUME_HOURS", "20")),
         )
+        source_run_id = str(collect_result.get("run_id") or "").strip()
+        if not source_run_id:
+            raise RuntimeError("抓取结果缺少 run_id")
         snapshot_output = Path(collect_result.get("snapshot_dir", paths["output"]))
+        manifest["source_run_id"] = source_run_id
         manifest["output"] = str(snapshot_output)
         manifest["stages"]["collect"] = collect_result
         update_daily_context_run(run_id, raw_manifest=json.dumps(manifest, ensure_ascii=False))
@@ -4213,6 +4217,7 @@ async def execute_daily_context_run(run_id: int):
             sources.cross_validate,
             paths["source_db"],
             snapshot_output,
+            run_id=source_run_id,
             hours=int(os.getenv("XOPS_DAILY_CONTEXT_HOURS", "30")),
         )
         manifest["stages"]["cross_validate"] = validation_result

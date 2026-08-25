@@ -2983,14 +2983,16 @@ class AppTest(unittest.TestCase):
 
     def test_daily_context_run_is_idempotent_reviewable_and_independent_of_writes(self):
         calls = []
+        validation_run_ids = []
         run_date = self.app_module.shanghai_today()
 
         def collect(_accounts, _db, output, **kwargs):
             calls.append(("collect", kwargs["key"]))
             Path(output).mkdir(parents=True, exist_ok=True)
-            return {"account_universe": 2, "accounts_fetched": 2, "posts_seen": 4}
+            return {"run_id": "run-current", "account_universe": 2, "accounts_fetched": 2, "posts_seen": 4}
 
         def cross_validate(_db, output, **_kwargs):
+            validation_run_ids.append(_kwargs["run_id"])
             output = Path(output)
             output.mkdir(parents=True, exist_ok=True)
             (output / "fact_cards.json").write_text(
@@ -3143,6 +3145,7 @@ class AppTest(unittest.TestCase):
             )
             self.assertFalse(duplicate.json()["started"])
             self.assertEqual(len(calls), 1)
+            self.assertEqual(validation_run_ids, ["run-current"])
 
             run_id = first.json()["id"]
             reviewed = self.client.put(
@@ -3252,7 +3255,7 @@ class AppTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            return {"accounts_fetched": 1, "posts_seen": 2}
+            return {"run_id": "run-source-posts", "accounts_fetched": 1, "posts_seen": 2}
 
         def cross_validate(_db, output, **_kwargs):
             output = Path(output)
@@ -3316,7 +3319,7 @@ class AppTest(unittest.TestCase):
 
         def collect(_accounts, _db, output, **_kwargs):
             Path(output).mkdir(parents=True, exist_ok=True)
-            return {"accounts_fetched": 1, "posts_seen": 1}
+            return {"run_id": "run-retry", "accounts_fetched": 1, "posts_seen": 1}
 
         def cross_validate(_db, output, **_kwargs):
             output = Path(output)
@@ -3345,7 +3348,7 @@ class AppTest(unittest.TestCase):
         run_date = self.app_module.shanghai_today()
         def collect(_accounts, _db, output, **_kwargs):
             Path(output).mkdir(parents=True, exist_ok=True)
-            return {"accounts_fetched": 1, "posts_seen": 1}
+            return {"run_id": "run-empty-cards", "accounts_fetched": 1, "posts_seen": 1}
 
         def cross_validate(_db, output, **_kwargs):
             output = Path(output)
@@ -3403,6 +3406,7 @@ class AppTest(unittest.TestCase):
         def collect(_accounts, _db, output, **_kwargs):
             Path(output).mkdir(parents=True, exist_ok=True)
             return {
+                "run_id": "run-all-failed",
                 "account_universe": 2,
                 "accounts_fetched": 0,
                 "accounts_skipped": 0,

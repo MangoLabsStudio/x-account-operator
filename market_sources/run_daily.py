@@ -27,7 +27,15 @@ def run_daily(
         workers=workers,
         resume_hours=resume_hours,
     )
-    validation = cross_validate(db_path, Path(collection.get("snapshot_dir", output_dir)), hours=hours)
+    run_id = str(collection.get("run_id") or "").strip()
+    if not run_id:
+        raise RuntimeError("抓取结果缺少 run_id")
+    validation = cross_validate(
+        db_path,
+        Path(collection.get("snapshot_dir", output_dir)),
+        run_id=run_id,
+        hours=hours,
+    )
     return {"collection": collection, "validation": validation}
 
 

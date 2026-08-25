@@ -220,6 +220,26 @@ def _load_fetch_state(db: sqlite3.Connection) -> dict[str, sqlite3.Row]:
     return {str(row["author_id"]): row for row in db.execute("SELECT * FROM source_fetches")}
 
 
+def _reuse_latest_successful_posts(
+    db: sqlite3.Connection, run_id: str, author_id: str, since: datetime
+) -> int:
+    previous = db.execute(
+        """SELECT run_id FROM source_fetch_attempts
+           WHERE author_id=? AND status='ok' ORDER BY run_id DESC LIMIT 1""",
+        (author_id,),
+    ).fetchone()
+    if not previous:
+        return 0
+    cursor = db.execute(
+        """INSERT OR IGNORE INTO source_post_runs(run_id,post_id)
+           SELECT ?,r.post_id FROM source_post_runs r
+           JOIN source_posts p ON p.post_id=r.post_id
+           WHERE r.run_id=? AND p.author_id=? AND p.created_at>=?""",
+        (run_id, previous["run_id"], author_id, since.isoformat()),
+    )
+    return cursor.rowcount
+
+
 def _bootstrap_legacy_public_ids(db: sqlite3.Connection, accounts: list[dict]) -> None:
     """Migrate the prior local anonymous cache without calling the API again."""
     for account in accounts:
@@ -261,7 +281,7 @@ def _write_outputs(db: sqlite3.Connection, output_dir: Path, run_id: str, stats:
     (output_dir / "failures.json").write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
     lines = ["# 每日大表信息源（运行快照）", "", f"运行：{run_id}",
              f"时间窗：{stats['window_start']} 至 {stats['window_end']}",
-             f"母池：{stats['account_universe']}｜首屏已覆盖：{stats['accounts_skipped']}｜本轮续抓成功：{stats['accounts_fetched']}｜失败：{stats['accounts_failed']}｜覆盖率：{stats['coverage_rate']:.2%}｜新增：{stats['posts_new']}", ""]
+             f"母池：{stats['account_universe']}｜首屏已覆盖：{stats['accounts_skipped']}｜本轮续抓成功：{stats['accounts_fetched']}｜失败：{stats['accounts_failed']}｜覆盖率：{stats['coverage_rate']:.2%}｜新增：{stats['posts_new']}｜断点复用：{stats['posts_reused']}", ""]
     if failures:
         lines += ["## 失败账号", ""] + [f"- @{item['handle'] or item['author_id']}：{item['error']}" for item in failures] + [""]
     for post in posts:
@@ -283,7 +303,8 @@ def collect(
     run_id = f"{now.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     snapshot_dir = output_dir / "runs" / run_id
     stats = {"run_id": run_id, "account_universe": len(accounts), "accounts_fetched": 0, "accounts_skipped": 0,
-             "accounts_failed": 0, "posts_seen": 0, "posts_new": 0, "window_start": since.isoformat(), "window_end": now.isoformat()}
+             "accounts_failed": 0, "posts_seen": 0, "posts_new": 0, "posts_reused": 0,
+             "window_start": since.isoformat(), "window_end": now.isoformat()}
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as db:
         init_db(db)
@@ -297,12 +318,22 @@ def collect(
             previous = state.get(str(account["user_id"]))
             if previous and previous["status"] == "ok" and previous["fetched_at"] and datetime.fromisoformat(previous["fetched_at"]).astimezone(timezone.utc) >= recent_cutoff:
                 if previous["watermark_at"]:
+                    reused = _reuse_latest_successful_posts(
+                        db, run_id, str(account["user_id"]), since
+                    )
+                    stats["posts_seen"] += reused
+                    stats["posts_reused"] += reused
                     stats["accounts_skipped"] += 1
                     continue
                 if str(account["user_id"]) not in legacy_truncated:
                     # The verified all-account first pass is already complete; turn it into a watermark
                     # instead of charging a second full 4,684-account run.
                     db.execute("UPDATE source_fetches SET watermark_at=? WHERE author_id=?", (previous["fetched_at"], account["user_id"]))
+                    reused = _reuse_latest_successful_posts(
+                        db, run_id, str(account["user_id"]), since
+                    )
+                    stats["posts_seen"] += reused
+                    stats["posts_reused"] += reused
                     stats["accounts_skipped"] += 1
                     continue
                 pending.append((account, None, True))
