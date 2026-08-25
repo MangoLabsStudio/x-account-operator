@@ -3215,9 +3215,9 @@ class AppTest(unittest.TestCase):
         self.app_module.update_daily_context_run(run["id"], status="failed")
 
         def collect(_accounts, _db, output, **_kwargs):
-            output = Path(output)
-            output.mkdir(parents=True, exist_ok=True)
-            (output / "latest.json").write_text(
+            snapshot = Path(output) / "runs" / "run-source-posts"
+            snapshot.mkdir(parents=True, exist_ok=True)
+            (snapshot / "latest.json").write_text(
                 json.dumps(
                     {
                         "generated_at": "2026-08-24T00:00:00+00:00",
@@ -3255,7 +3255,12 @@ class AppTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            return {"run_id": "run-source-posts", "accounts_fetched": 1, "posts_seen": 2}
+            return {
+                "run_id": "run-source-posts",
+                "snapshot_dir": str(snapshot),
+                "accounts_fetched": 1,
+                "posts_seen": 2,
+            }
 
         def cross_validate(_db, output, **_kwargs):
             output = Path(output)

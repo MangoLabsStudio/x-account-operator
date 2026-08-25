@@ -4746,7 +4746,8 @@ def get_daily_context_source_posts(context_date: str, limit: int = 50, offset: i
     run = get_daily_context_run_for_date(context_date)
     if run["status"] in {"queued", "running"}:
         raise HTTPException(404, "Mother-pool source posts are not available until the run completes")
-    path = daily_context_paths(context_date)["output"] / "latest.json"
+    output = str(run.get("raw_manifest", {}).get("output") or "").strip()
+    path = (Path(output) if output else daily_context_paths(context_date)["output"]) / "latest.json"
     if not path.exists():
         raise HTTPException(404, "Mother-pool source posts artifact not found")
     try:
