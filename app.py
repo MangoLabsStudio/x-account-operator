@@ -2691,6 +2691,7 @@ def validate_persona_editorial_decisions(result, topics: list[dict]):
         decision = decisions[topic_key]
         if (
             decision["status"] == "HOLD"
+            and decision["reason_code"] == "editorial_hold"
             and str(allowed[topic_key].get("scope", "public")) != "persona"
             and decision["why_me"]
             and min(decision[key] for key in ("notice", "authority", "tension", "marginal_value")) >= 3

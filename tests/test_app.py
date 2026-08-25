@@ -1962,6 +1962,20 @@ class AppTest(unittest.TestCase):
 
         self.assertEqual(result["macro-angle"]["status"], "HOLD")
 
+    def test_high_fit_hold_promotion_preserves_hard_rejection(self):
+        topic = {
+            "claim_key": "conflicted-angle", "core_claim": "这条存在事实冲突。", "scope": "public",
+        }
+        result = self.app_module.validate_persona_editorial_decisions({"decisions": [{
+            "topic_claim_key": "conflicted-angle", "status": "HOLD",
+            "notice": 5, "authority": 5, "tension": 5, "marginal_value": 5,
+            "why_me": "人设本身匹配。", "reason_code": "fact_conflict",
+            "rationale": "已核材料存在冲突。",
+        }]}, [topic])
+
+        self.assertEqual(result["conflicted-angle"]["status"], "HOLD")
+        self.assertEqual(result["conflicted-angle"]["reason_code"], "fact_conflict")
+
     def test_marginal_threshold_only_filters_low_value_after_five_posts(self):
         def decision(value):
             return {
