@@ -70,7 +70,7 @@ XOPS_DAILY_CONTEXT_WORKERS=8
 XOPS_DAILY_CONTEXT_RESUME_HOURS=20
 XOPS_MOTHER_POOL_ACCOUNTS=/path/to/content_source_accounts.json
 XOPS_DAILY_POST_ENABLED=true
-XOPS_DAILY_POST_PERSONAS=acheng,ridehail-driver-zhao,college-student-linjia,atuo,axu,nanqiao,qiliang,aye,xiaoman,maili
+XOPS_DAILY_POST_PERSONAS=acheng,ridehail-driver-zhao,college-student-linjia,atuo,axu,nanqiao,qiliang,aye,xiaoman,maili,hegong-afterwork,zhaojie-process,linxue-model,xiaocheng-product,ada-builds,susu-multimodal,zhangshifu-ai,lianglaoban-ai,mojie-eval,wenwen-ai-industry
 XOPS_GROK_API_KEY=...
 XOPS_GROK_BASE_URL=https://www.micuapi.ai/v1
 XOPS_GROK_MODEL=grok-4.6
@@ -84,6 +84,7 @@ XOPS_OPERATOR_TOKEN=...  # optional: protect all /api write requests
 - `XOPS_DAILY_CONTEXT_RUN_TIME` is interpreted in `XOPS_TIMEZONE` (default: `Asia/Shanghai`).
 - `XOPS_MOTHER_POOL_ACCOUNTS` is the account-list JSON used by the collector. If omitted, the service uses the verified default source configuration.
 - `XOPS_DAILY_POST_PERSONAS` defines the personas that are evaluated, not a promised draft count. The pipeline may legitimately return no `WRITE` results.
+- 人设按 `content.topic_domain` 取公共题：现有公共题缺省为 `crypto`，不会被 10 个 `ai` 人设硬写；AI 人设仍可先消费自己已批准的长期观点，待独立 AI 热点源接入后再消费 AI 公共题。
 - If `XOPS_OPERATOR_TOKEN` is configured, every non-GET `/api` request must send it as `X-Ops-Token`. The three built-in operator pages prompt once after a 401 and keep it only in that browser tab's session storage. `/health` exposes `operator_auth_enabled`.
 - In `/market`, a reviewer may explicitly confirm only a fact card's representative source reference, with a different first-party verification URL and a short verification note. X/Twitter links, the same source-post URL, and empty evidence are rejected. `two_source_candidate` and `corroborated_candidate` never become verified facts automatically, and a promoted fact is usable only by a selected topic that cites that exact reviewed reference.
 

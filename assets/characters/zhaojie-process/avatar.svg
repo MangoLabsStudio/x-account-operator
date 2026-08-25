@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="ZP geometric avatar">
+  <rect width="256" height="256" rx="48" fill="#fff5e7"/>
+  <path d="M43 74h75l20 54H63zM138 128h75l-20 54h-75z" fill="#df7b41"/>
+  <path d="M117 101h24v54h-24z" fill="#49342e"/>
+  <text x="128" y="145" text-anchor="middle" fill="#fff" font-family="Arial, sans-serif" font-size="44" font-weight="700">ZP</text>
+</svg>

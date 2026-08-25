@@ -421,21 +421,32 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.client.get("/personas").status_code, 200)
         personas = self.client.get("/api/personas").json()
         slugs = [persona["slug"] for persona in personas]
-        self.assertEqual(
-            set(slugs),
-            {
-                "acheng",
-                "ridehail-driver-zhao",
-                "college-student-linjia",
-                "atuo",
-                "axu",
-                "nanqiao",
-                "qiliang",
-                "aye",
-                "xiaoman",
-                "maili",
-            },
-        )
+        original_slugs = {
+            "acheng",
+            "ridehail-driver-zhao",
+            "college-student-linjia",
+            "atuo",
+            "axu",
+            "nanqiao",
+            "qiliang",
+            "aye",
+            "xiaoman",
+            "maili",
+        }
+        ai_slugs = {
+            "hegong-afterwork",
+            "zhaojie-process",
+            "linxue-model",
+            "xiaocheng-product",
+            "ada-builds",
+            "susu-multimodal",
+            "zhangshifu-ai",
+            "lianglaoban-ai",
+            "mojie-eval",
+            "wenwen-ai-industry",
+        }
+        self.assertTrue(original_slugs.issubset(slugs))
+        self.assertTrue(ai_slugs.issubset(slugs))
         self.assertNotIn("office-worker-zhou", slugs)
         self.assertNotIn("county-mom-xiaomei", slugs)
         self.assertNotIn("cc0-source-selection", slugs)
@@ -449,9 +460,8 @@ class AppTest(unittest.TestCase):
         self.assertEqual(atuo["handle"], "@atuo_xyz")
         self.assertIn("atuo/avatar.png", atuo["avatar_url"])
 
-        crypto_names = {
-            persona["display_name"] for persona in personas if persona["slug"] in self.app_module.PERSONA_BIOS
-        }
+        crypto_slugs = {"atuo", "axu", "nanqiao", "qiliang", "aye", "xiaoman", "maili"}
+        crypto_names = {persona["display_name"] for persona in personas if persona["slug"] in crypto_slugs}
         self.assertEqual(
             crypto_names,
             {"阿拓Tuo", "AXU", "南桥研究所", "7Liang", "野生Aye", "小满 onchain", "Milly的交易手账"},
@@ -466,6 +476,113 @@ class AppTest(unittest.TestCase):
         self.assertIn("不喊话", axu_detail["draft"]["voice"]["mobilization_style"])
         self.assertIn("不代表持有该 NFT", axu_detail["draft"]["visual"]["source_note"])
         self.assertEqual([asset["name"] for asset in axu_detail["assets"]], ["avatar"])
+
+        ai_personas = [persona for persona in personas if persona["slug"] in ai_slugs]
+        self.assertEqual(len({persona["display_name"] for persona in ai_personas}), len(ai_slugs))
+        self.assertEqual(len({persona["handle"] for persona in ai_personas}), len(ai_slugs))
+        self.assertTrue(all(persona["display_name"] and persona["handle"] for persona in ai_personas))
+        self.assertTrue(all(persona["avatar_url"].endswith("/avatar.svg") for persona in ai_personas))
+
+        ai_bios = []
+        ai_roles = []
+        ai_voice_configs = []
+        for persona in ai_personas:
+            detail = self.client.get(f"/api/personas/{persona['id']}").json()
+            draft = detail["draft"]
+            self.assertEqual(draft["config_revision"], 3)
+            self.assertEqual(draft["content"]["topic_domain"], "ai")
+            ai_bios.append(draft["identity"]["bio"])
+            ai_roles.append(draft["identity"]["role"])
+            ai_voice_configs.append(draft["voice"].get("tone") or draft["voice"].get("style_guide"))
+        self.assertTrue(all(ai_bios))
+        self.assertTrue(all(ai_roles))
+        self.assertTrue(all(ai_voice_configs))
+        self.assertEqual(len(set(ai_bios)), len(ai_slugs))
+        self.assertGreater(len(set(ai_roles)), 1)
+        self.assertGreater(len(set(ai_voice_configs)), 1)
+
+    def test_daily_post_default_queue_includes_all_personas(self):
+        expected = {
+            "acheng", "ridehail-driver-zhao", "college-student-linjia", "atuo", "axu",
+            "nanqiao", "qiliang", "aye", "xiaoman", "maili",
+            "hegong-afterwork", "zhaojie-process", "linxue-model", "xiaocheng-product",
+            "ada-builds", "susu-multimodal", "zhangshifu-ai", "lianglaoban-ai",
+            "mojie-eval", "wenwen-ai-industry",
+        }
+        with patch.dict(os.environ):
+            os.environ.pop("XOPS_DAILY_POST_PERSONAS", None)
+            os.environ.pop("XOPS_DAILY_POST_PERSONA", None)
+            self.assertTrue(expected.issubset(self.app_module.daily_post_persona_slugs()))
+
+    def test_ai_persona_does_not_receive_default_crypto_public_topics(self):
+        with self.app_module.db() as conn:
+            ai_persona = dict(conn.execute(
+                "SELECT id,slug,draft FROM personas WHERE slug='hegong-afterwork'"
+            ).fetchone())
+        crypto_topic = {
+            "claim_key": "btc-market-width",
+            "scope": "public",
+            "title": "BTC 市场宽度",
+            "core_claim": "BTC 走强不等于山寨全面扩散。",
+        }
+        explicit_crypto_topic = {**crypto_topic, "claim_key": "sol-liquidity", "topic_domain": "crypto"}
+        ai_topic = {
+            "claim_key": "model-release-workflow",
+            "scope": "public",
+            "topic_domain": "ai",
+            "title": "模型更新改变工作流",
+            "core_claim": "模型能力提升只有减少真实步骤才值得迁移。",
+        }
+        routed = self.app_module.persona_editorial_topics(
+            ai_persona,
+            [crypto_topic, explicit_crypto_topic, ai_topic],
+            {},
+        )
+        self.assertEqual(routed, [ai_topic])
+
+    def test_ai_persona_current_input_uses_same_domain_filtered_topic_batch(self):
+        context_date = "2026-08-25"
+        crypto_topic = {
+            "claim_key": "btc-market-width", "scope": "public",
+            "title": "BTC 市场宽度", "core_claim": "BTC 走强不等于山寨全面扩散。",
+        }
+        ai_topic = {
+            "claim_key": "model-workflow", "scope": "public", "topic_domain": "ai",
+            "title": "模型与工作流", "core_claim": "模型能力只有减少真实步骤才值得迁移。",
+        }
+        run_id = self.create_editorial_run(context_date, topics=[crypto_topic, ai_topic])
+        with self.app_module.db() as conn:
+            persona = conn.execute(
+                "SELECT id FROM personas WHERE slug='hegong-afterwork'"
+            ).fetchone()
+            payload = self.app_module.current_editorial_input_payload(
+                conn,
+                {
+                    "run_id": run_id,
+                    "persona_id": persona["id"],
+                    "topic_json": json.dumps(ai_topic, ensure_ascii=False),
+                },
+                context_date,
+            )
+        self.assertEqual(payload["topic_batch"], [ai_topic])
+
+    def test_ai_topic_domain_survives_mother_topic_angle_expansion(self):
+        parent = {
+            **self.mother_topic("ai-model-release", "discussion:ai-models"),
+            "topic_domain": "ai",
+        }
+        mothers = self.app_module.editorial_mother_topics({"selected_topics": [parent]})
+        self.assertEqual(mothers[0]["topic_domain"], "ai")
+        self.assertEqual(mothers[0]["seed_key"], "ai:discussion:ai-models")
+        angle = self.expanded_angle(
+            mothers[0]["seed_key"], "workflow-not-benchmark", "project_evaluation",
+            "模型发布的产品价值取决于它是否减少真实工作步骤，而不是榜单名次。",
+        )
+        topics, rejected = self.app_module.bounded_editorial_angles(
+            {"angles": [angle], "rejected_angles": []}, mothers, []
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(topics[0]["topic_domain"], "ai")
 
     def test_post_candidates_start_empty_and_are_available_by_persona(self):
         personas = self.client.get("/api/personas").json()
@@ -1470,31 +1587,34 @@ class AppTest(unittest.TestCase):
             self.app_module.httpx, "AsyncClient", return_value=FakeAsyncClient(payload, calls)
         ):
             result = asyncio.run(self._real_write_persona_editorial_gemini(
-                {"slug": "acheng"}, {"title": "题目"}, verified_facts,
+                {"slug": "hegong-afterwork"}, {"title": "题目", "topic_domain": "ai"}, verified_facts,
                 {"text": "背景", "citations": []}, {"source_kind": "market", "source_id": "", "source_item": None, "first_person_allowed": False},
             ))
         self.assertEqual(result["facts_used_ids"], ["fact:card-1"])
         self.assertEqual(result["stance"], "重算成本假设")
         self.assertIn("facts_used_ids", calls[0]["kwargs"]["json"]["messages"][0]["content"])
+        self.assertIn("中文 AI KOL 编辑", calls[0]["kwargs"]["json"]["messages"][0]["content"])
 
     def test_critic_parser_requires_unsupported_claims_string_array(self):
+        calls = []
         payload = {
             "choices": [{"message": {"content": json.dumps({
                 "verdict": "PASS", "reasons": [], "rewrite_instruction": "",
             }, ensure_ascii=False)}}],
         }
         with patch.dict(os.environ, {"XOPS_GEMINI_API_KEY": "test-key"}), patch.object(
-            self.app_module.httpx, "AsyncClient", return_value=FakeAsyncClient(payload, [])
+            self.app_module.httpx, "AsyncClient", return_value=FakeAsyncClient(payload, calls)
         ):
             with self.assertRaisesRegex(RuntimeError, "unsupported_claims"):
                 asyncio.run(self._real_critique_persona_editorial_draft(
-                    {"slug": "acheng"}, {"title": "题目"},
+                    {"slug": "hegong-afterwork"}, {"title": "题目", "topic_domain": "ai"},
                     {"schema": "facts_used_ids", "facts": [], "requires_fact_ids": False},
                     {"text": "背景", "citations": []},
                     {"source_kind": "market", "source_id": "", "source_item": None,
                      "first_person_allowed": False, "available_assets": []},
                     {"text": "这不是一条会被实际发布的测试正文，但它足够长，用于验证主编输出的事实审查字段是否严格存在。"}, [],
                 ))
+        self.assertIn("中文 AI 内容主编", calls[0]["kwargs"]["json"]["messages"][0]["content"])
 
     def test_manual_fact_promotion_requires_eligible_ref_and_selected_topic_reference(self):
         raw_cards = {"fact_cards": [
@@ -1560,7 +1680,7 @@ class AppTest(unittest.TestCase):
             self.app_module.httpx, "AsyncClient", return_value=FakeAsyncClient(payload, calls)
         ):
             result = asyncio.run(self._real_enrich_persona_editorial_context(
-                {"title": "热点", "scope": "public"}, {"schema": "facts_used_ids", "facts": [], "requires_fact_ids": False},
+                {"title": "热点", "scope": "public", "topic_domain": "ai"}, {"schema": "facts_used_ids", "facts": [], "requires_fact_ids": False},
                 {"context_date": "2026-08-24"},
             ))
         self.assertEqual(result["tool_usage"], ["web_search", "x_search"])
@@ -1569,6 +1689,7 @@ class AppTest(unittest.TestCase):
             [tool["type"] for tool in calls[0]["kwargs"]["json"]["tools"]], ["x_search", "web_search"]
         )
         self.assertEqual(calls[0]["kwargs"]["json"]["max_output_tokens"], 1000)
+        self.assertIn("中文 AI 编辑", calls[0]["kwargs"]["json"]["input"])
 
         self.app_module.EDITORIAL_GROK_CONTEXT_CACHE.clear()
         missing_citation = {"output": [{"type": "x_search_call"}, {"type": "web_search_call"}, {

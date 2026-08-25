@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="WW geometric avatar">
+  <rect width="256" height="256" rx="48" fill="#172554"/>
+  <path d="M43 164h35V92H43zm51 0h35V58H94zm51 0h35v-82h-35z" fill="#60a5fa"/>
+  <path d="M39 187h178" stroke="#f8fafc" stroke-width="10" stroke-linecap="round"/>
+  <text x="128" y="224" text-anchor="middle" fill="#dbeafe" font-family="Arial, sans-serif" font-size="37" font-weight="700">WW</text>
+</svg>

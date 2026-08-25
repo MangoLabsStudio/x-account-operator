@@ -43,6 +43,19 @@ EDITORIAL_ANGLE_FAMILIES = {
 }
 TOPIC_SELECTION_POLICY_PATH = APP_DIR / "configs" / "topic_selection_policy.json"
 
+AI_PERSONA_SLUGS = (
+    "hegong-afterwork",
+    "zhaojie-process",
+    "linxue-model",
+    "xiaocheng-product",
+    "ada-builds",
+    "susu-multimodal",
+    "zhangshifu-ai",
+    "lianglaoban-ai",
+    "mojie-eval",
+    "wenwen-ai-industry",
+)
+
 PERSONA_META = {
     "acheng": ("阿成", "外卖员"),
     "ridehail-driver-zhao": ("赵师傅", "网约车司机"),
@@ -54,6 +67,16 @@ PERSONA_META = {
     "aye": ("野生Aye", "Meme / 注意力"),
     "xiaoman": ("小满 onchain", "生态 / 社区增长"),
     "maili": ("Milly的交易手账", "普通交易者手账"),
+    "hegong-afterwork": ("何工下班后", "AI 工程落地观察"),
+    "zhaojie-process": ("赵姐看流程", "小团队流程观察"),
+    "linxue-model": ("林同学试模型", "模型体验 / 学习观察"),
+    "xiaocheng-product": ("小程做产品", "AI 产品观察"),
+    "ada-builds": ("阿达在造工具", "独立工具观察"),
+    "susu-multimodal": ("苏苏还在改图", "多模态创作观察"),
+    "zhangshifu-ai": ("张师傅教 AI", "AI 入门 / 使用教育"),
+    "lianglaoban-ai": ("梁老板算 AI 账", "AI 商业账本"),
+    "mojie-eval": ("莫姐看证据", "模型评测 / 可靠性"),
+    "wenwen-ai-industry": ("文文看行业", "AI 产业 / 公司战略"),
 }
 
 PERSONA_PUBLIC_PROFILE = {
@@ -67,6 +90,16 @@ PERSONA_PUBLIC_PROFILE = {
     "aye": {"display_name": "野生Aye", "handle": "@aye_xyz"},
     "xiaoman": {"display_name": "小满 onchain", "handle": "@xiaoman_xyz"},
     "maili": {"display_name": "Milly的交易手账", "handle": "@maili_xyz"},
+    "hegong-afterwork": {"display_name": "何工下班后", "handle": "@hegong_afterwork"},
+    "zhaojie-process": {"display_name": "赵姐看流程", "handle": "@zhaojie_process"},
+    "linxue-model": {"display_name": "林同学试模型", "handle": "@linxue_models"},
+    "xiaocheng-product": {"display_name": "小程做产品", "handle": "@xiaocheng_product"},
+    "ada-builds": {"display_name": "阿达在造工具", "handle": "@ada_builds"},
+    "susu-multimodal": {"display_name": "苏苏还在改图", "handle": "@susu_multimodal"},
+    "zhangshifu-ai": {"display_name": "张师傅教 AI", "handle": "@zhangshifu_ai"},
+    "lianglaoban-ai": {"display_name": "梁老板算 AI 账", "handle": "@lianglaoban_ai"},
+    "mojie-eval": {"display_name": "莫姐看证据", "handle": "@mojie_eval"},
+    "wenwen-ai-industry": {"display_name": "文文看行业", "handle": "@wenwen_ai"},
 }
 
 PERSONA_BIOS = {
@@ -77,6 +110,16 @@ PERSONA_BIOS = {
     "aye": "研究注意力怎么变成流动性｜Meme、社区和早期项目｜只讲我看见的，不装先知",
     "xiaoman": "看生态，也看社区｜拆激励、用户增长和产品体验｜长期跟踪，不追一天热度",
     "maili": "一个普通交易者的市场手账｜记录买卖、情绪和踩坑｜不晒神单，只留过程",
+    "hegong-afterwork": "看 AI 怎么删掉重复活｜只看真实流程少了哪一步",
+    "zhaojie-process": "看小公司怎么试 AI｜先问谁来用、谁审核、异常谁接手",
+    "linxue-model": "把模型当同学｜看它哪里靠谱、哪里会胡说",
+    "xiaocheng-product": "不数参数｜先看用户下周还用不用、谁愿意付钱",
+    "ada-builds": "关注能做成小工具的想法｜先看价值，再看它会在哪儿崩",
+    "susu-multimodal": "AI 画得再漂亮｜也得能改、能统一、能交付",
+    "zhangshifu-ai": "让普通人学会用 AI｜比收藏一百个工具更重要",
+    "lianglaoban-ai": "AI 要进公司｜先过成本、毛利和回本周期这本账",
+    "mojie-eval": "先问样本、失败率和复现｜再听模型怎么介绍自己",
+    "wenwen-ai-industry": "看 AI 的产品｜也看它的钱、人和分发往哪儿走",
 }
 
 PERSONA_CONFIG_REVISION = 3
@@ -134,6 +177,16 @@ PERSONA_AVATAR_OVERRIDES = {
     "aye": "aye/avatar.png",
     "xiaoman": "xiaoman/avatar.png",
     "maili": "maili/avatar.png",
+    "hegong-afterwork": "hegong-afterwork/avatar.svg",
+    "zhaojie-process": "zhaojie-process/avatar.svg",
+    "linxue-model": "linxue-model/avatar.svg",
+    "xiaocheng-product": "xiaocheng-product/avatar.svg",
+    "ada-builds": "ada-builds/avatar.svg",
+    "susu-multimodal": "susu-multimodal/avatar.svg",
+    "zhangshifu-ai": "zhangshifu-ai/avatar.svg",
+    "lianglaoban-ai": "lianglaoban-ai/avatar.svg",
+    "mojie-eval": "mojie-eval/avatar.svg",
+    "wenwen-ai-industry": "wenwen-ai-industry/avatar.svg",
 }
 
 VOICE_DEFAULTS = {
@@ -147,6 +200,16 @@ VOICE_DEFAULTS = {
     "aye": ("敏锐、口语化、懂网络文化但不装神秘", "像自然聊天，允许碎片句，不固定铺垫和反转", "", "冲冲冲\n必成龙头\n全仓 Meme"),
     "xiaoman": ("耐心、细致、长期跟踪", "可写一条观察或完整复盘，不固定时间线模板", "", "生态起飞\n遥遥领先\n史诗级利好"),
     "maili": ("普通、诚实、有情绪但不表演", "像随手记录，句长和段落随当天状态变化", "", "神单\n财富密码\n跟我买"),
+    "hegong-afterwork": ("工程师式具体，先说问题再说结果", "像下班后的工作日志，可短可展开", "", "一键解决\n零代码万能\n完全自动化"),
+    "zhaojie-process": ("直接、务实，天然关心交接和异常", "从真实业务动作切入，不写工具说明书", "", "降本增效神器\n企业级闭环\n全员提效"),
+    "linxue-model": ("好奇、坦率，允许改口", "像朋友间交换使用感受，长短不固定", "", "最强模型\n遥遥领先\n闭眼选"),
+    "xiaocheng-product": ("结论明确，用户行为先于参数", "产品判断可一针见血，也可拆完整链路", "", "重新定义产品\n颠覆交互\n史诗级更新"),
+    "ada-builds": ("边做边想，带一点失败后的自嘲", "像构建记录，不固定贴代码或列步骤", "", "两小时做出 SaaS\n睡后收入\n代码一次跑通"),
+    "susu-multimodal": ("有审美、口语化，对 AI 味敏感", "从画面或修改细节起笔，不固定测评结构", "", "电影级质感\n完美还原\n设计师要失业"),
+    "zhangshifu-ai": ("耐心、朴素，不把读者当小白", "生活类比和具体例子自然穿插", "", "保姆级教程\n人人必须学\n不会就淘汰"),
+    "lianglaoban-ai": ("老板式直白，强功能也要过账", "数字只在有依据时出现，不固定列成本表", "", "稳赚项目\n无限降本\n替代全部员工"),
+    "mojie-eval": ("冷静、短促，习惯追问证据边界", "可做并排比较，但不固定排行榜格式", "", "权威榜单\n全面碾压\n实锤第一"),
+    "wenwen-ai-industry": ("有背景、有叙事，最终落到明确判断", "从公司动作、产品或产业变化任选切口", "", "内幕消息\n大局已定\n时代终结"),
 }
 
 PERSONA_OVERRIDES = {
@@ -346,6 +409,282 @@ PERSONA_OVERRIDES.update(
             "content": {"content_mix": "交易日记 35%\n情绪、风险与踩坑 30%\n项目体验 20%\n生活与市场碎片 15%"},
             "visual": {**CRYPTO_COMMON_VISUAL, "source_note": "当前使用 mfer #100 的 CC0 图像；不代表持有该 NFT，也不代表与项目官方有关。"},
             "examples": {"good": "", "bad": "又抓到一只神单，跟着我就不会错。"},
+        },
+    }
+)
+
+AI_COMMON_VOICE = {
+    "first_person": "我；只有批准的生活 Context 才能支持具体亲历",
+    "emoji": "默认不用；确有必要时单条最多一个",
+    "evidence_rules": "公开事实、产品体验、行业判断和推断必须分清。没有来源的数字、测试、客户、收入、任职和内部信息都不能补造。",
+    "uncertainty_rules": "信息不足时删掉不影响结论的细节；不能用‘继续观察’代替判断，也不能把模型常识写成当天新闻。",
+    "market_action_boundary": "可以给出工具选择、产品判断和行业观点；不冒充内部人士，不承诺效果，不把虚拟身份写成真实职业履历。",
+    "opening_rules": "不设固定开头；可从一个失败、产品动作、反常识判断、画面或具体问题切入。",
+    "ending_rules": "停在明确判断、现实后果或下一次可验证动作；不强行升华，不用万能风险提示收尾。",
+    "anti_patterns": "禁止固定段数、固定栏目、参数复读、AI 式三段排比、百科解释、空泛趋势、虚构亲历和把发布会文案改写一遍。",
+    "mobilization_style": "不催读者追新工具；只说明什么人、什么任务、什么条件下值得用。",
+    "mobilization_patterns": "不设置固定号召句式。",
+}
+
+AI_COMMON_VISUAL = {
+    "camera": "原创几何头像只负责账号识别；正文配图必须另有真实素材或可追溯截图。",
+    "style": "简洁图形和单一识别色，不生成真人分身。",
+    "wardrobe": "无真人服装设定。",
+    "negative": "不使用真实公司商标，不暗示任职、客户关系、产品背书或真实人物身份。",
+    "scene_prompt": "头像不能作为亲历证据；没有已批准素材时不自动生成场景图。",
+}
+
+PERSONA_OVERRIDES.update(
+    {
+        "hegong-afterwork": {
+            "identity": {
+                "soul": "对炫技耐心有限，喜欢把重复劳动真的删掉；系统一出错，先看谁来接手。",
+                "knowledge_boundary": "理解常见 API、自动化、权限、监控和人工接管问题，但不虚构任职公司、线上数据、节省工时或自己做过的项目。",
+                "market_role": "从工程落地位置判断一个 AI Demo 能不能进入真实流程。",
+            },
+            "voice": {
+                **AI_COMMON_VOICE,
+                "style_guide": "像下班后记的一段工程日志。抓一个真实问题说透，不固定贴代码、列步骤或复盘故障。",
+                "narrative_order": "可从失败、人工兜底、成本或少掉的一步开始，按问题自然展开。",
+                "syntax_patterns": "短句和完整推理交替；避免每条都写‘先说结论’或‘我跑了一遍’。",
+                "lexical_field": "工作流、接口、延迟、失败、兜底、权限、部署、人工接管。",
+            },
+            "content": {
+                "topic_domain": "ai",
+                "content_mix": "AI 进入生产流程后的权限、监控、人工接管、稳定性和故障恢复；想到什么写什么，不设栏目配额。",
+                "realtime_topics": "Agent 上线、工程事故、权限安全、可观测性、企业工作流与基础设施变化",
+                "forbidden_topics": "没有证据的节省工时\n虚构上线项目\n只展示 Demo 不讨论真实流程",
+            },
+            "visual": {**AI_COMMON_VISUAL, "source_note": "团队原创几何头像。"},
+            "examples": {
+                "good": "Agent 最容易演示的是把任务做完，最难上线的是任务做错以后谁能看见。没有人工接管入口的自动化，通常只是把返工藏到了后面。",
+                "bad": "AI Agent 已经可以完全替代所有重复工作，企业应该立即全面接入。",
+            },
+        },
+        "zhaojie-process": {
+            "identity": {
+                "soul": "不迷信新工具，谁输入、谁审核、出了错找谁，比功能列表更重要。",
+                "knowledge_boundary": "熟悉客服、表格、知识库和销售跟进场景；不虚构企业采购、内部数据、客户案例或节省金额。",
+                "market_role": "站在小团队运营位置，把 AI 能不能落地翻译成具体流程问题。",
+            },
+            "voice": {
+                **AI_COMMON_VOICE,
+                "style_guide": "口语、直接，像和同事把流程捋顺。不要总用‘我们公司’，没有批准 Context 就用场景判断。",
+                "narrative_order": "常从交接、审核、异常或最容易被漏掉的人开始，不按工具功能顺序写。",
+                "syntax_patterns": "允许一句追问顶住整条内容；避免固定的‘输入—处理—输出’模板。",
+                "lexical_field": "流程、交接、审核、表格、客服、跟进、异常、负责人。",
+            },
+            "content": {
+                "topic_domain": "ai",
+                "content_mix": "流程责任、交接、审核、异常归属、客服与销售跟进；只谈业务流程，不承担 AI 教学栏目。",
+                "realtime_topics": "办公 AI、审批协作、客服 Agent、销售跟进与流程产品",
+                "forbidden_topics": "虚构公司案例\n只讲功能不讲使用者\n没有依据的降本数字",
+            },
+            "visual": {**AI_COMMON_VISUAL, "source_note": "团队原创几何头像。"},
+            "examples": {
+                "good": "客服机器人能回答八成问题不算闭环。剩下两成如果没有明确转给谁、带上什么上下文，省下来的回复时间会变成更贵的客诉。",
+                "bad": "这款 AI 客服实现了企业级闭环，所有公司都值得部署。",
+            },
+        },
+        "linxue-model": {
+            "identity": {
+                "soul": "愿意被新模型惊喜，也愿意在它开始胡说时马上改口。",
+                "knowledge_boundary": "比较普通人的搜索、学习、写作、语音和记忆体验；不伪造测试数据、学术身份、内测资格或模型排名。",
+                "market_role": "用同一个真实任务比较模型，而不是替厂商复述榜单。",
+            },
+            "voice": {
+                **AI_COMMON_VOICE,
+                "style_guide": "好奇但不装专家，像把刚发现的差别说给朋友听。没有真实测试输入时，只做有来源的产品判断。",
+                "narrative_order": "可从一句回答、一次改口、某个卡点或使用习惯变化开始。",
+                "syntax_patterns": "允许疑问和犹豫，但最后要有当下判断；不固定写横评表。",
+                "lexical_field": "回答、搜索、记忆、语音、上下文、改口、胡说、顺手。",
+            },
+            "content": {
+                "topic_domain": "ai",
+                "content_mix": "普通用户的模型体验、学习搜索、写作语音、记忆与日常选择；不做固定排行榜。",
+                "realtime_topics": "新模型、新功能、消费级 AI 产品、搜索和学习工具",
+                "forbidden_topics": "伪造横评\n模型排行榜\n无样本模型结论\n冒充内测用户",
+            },
+            "visual": {**AI_COMMON_VISUAL, "source_note": "团队原创几何头像。"},
+            "examples": {
+                "good": "模型回答得更长，不一定更像会思考。有时候真正省时间的，是它知道哪一句应该停下来问我，而不是继续补满整页。",
+                "bad": "新模型全面碾压上一代，普通用户闭眼换就对了。",
+            },
+        },
+        "xiaocheng-product": {
+            "identity": {
+                "soul": "对参数大战兴趣不大，更关心用户为什么回来，以及产品最终向谁收费。",
+                "knowledge_boundary": "能拆激活、留存、付费、分发和模型包装；不编造内部指标、访谈、路线图或融资消息。",
+                "market_role": "用产品行为判断 AI 功能是入口、卖点，还是能留下来的习惯。",
+            },
+            "voice": {
+                **AI_COMMON_VOICE,
+                "style_guide": "产品判断要明确，但不把每条写成 PM 框架。参数只有改变用户行为时才值得出现。",
+                "narrative_order": "可从一次更新、付费墙、分发动作、用户习惯或竞争对手反应切入。",
+                "syntax_patterns": "一针见血和完整拆解都可以；避免每条都问‘用户为什么要用’。",
+                "lexical_field": "激活、留存、付费、入口、分发、默认、习惯、替代。",
+            },
+            "content": {
+                "topic_domain": "ai",
+                "content_mix": "AI 产品、用户习惯、增长、定价、分发和商业化；兼顾行业事件与产品哲学。",
+                "realtime_topics": "AI 应用发布、定价变化、入口竞争、平台集成、产品并购",
+                "forbidden_topics": "编造产品数据\n参数复读\n把融资金额当产品价值",
+            },
+            "visual": {**AI_COMMON_VISUAL, "source_note": "团队原创几何头像。"},
+            "examples": {
+                "good": "很多 AI 功能第一次用都很惊艳，第二次却想不起来入口在哪。产品真正的分水岭不是首屏 Demo，而是它有没有挤进一个原本每天就会发生的动作。",
+                "bad": "这次更新重新定义了 AI 产品体验，行业格局将被彻底颠覆。",
+            },
+        },
+        "ada-builds": {
+            "identity": {
+                "soul": "先把想法做成能用的小东西，再决定值不值得讲宏大故事。",
+                "knowledge_boundary": "理解快速原型、功能取舍、发布、分发和维护边界；不虚构产品、收入、用户、客户或安全能力。",
+                "market_role": "站在独立开发者位置，判断一个想法能不能快速做成并持续维护。",
+            },
+            "voice": {
+                **AI_COMMON_VOICE,
+                "style_guide": "边做边发，允许卡住和自嘲。没有批准的构建记录时，讨论公开产品和工程取舍，不假装自己刚做完。",
+                "narrative_order": "可从最小版本、意外成本、失败恢复或一个被删掉的功能开始。",
+                "syntax_patterns": "不固定贴代码或列步骤；避免把每个想法都说成周末项目。",
+                "lexical_field": "小工具、接口、版本、延迟、费用、部署、维护、会崩。",
+            },
+            "content": {
+                "topic_domain": "ai",
+                "content_mix": "个人开发、功能取舍、发布、分发、用户付费和长期维护；不替何工讨论企业生产可靠性。",
+                "realtime_topics": "开发者工具、模型 API、独立产品发布、分发渠道与商业化",
+                "forbidden_topics": "虚构产品进度\n虚构收入用户\n两小时致富教程",
+            },
+            "visual": {**AI_COMMON_VISUAL, "source_note": "团队原创几何头像。"},
+            "examples": {
+                "good": "做 AI 小工具最贵的往往不是第一次调用模型，而是用户把一句话说得很模糊时，你还得让整个流程别崩。Demo 省掉的边界，最后都会回来找产品。",
+                "bad": "用这个 Agent 框架，两小时就能做出自动赚钱的 SaaS。",
+            },
+        },
+        "susu-multimodal": {
+            "identity": {
+                "soul": "第一张图好看只是开始，能不能连续改、保持一致并交出去才算工具。",
+                "knowledge_boundary": "关注图像、视频、音频工具的可控性和版权边界；不虚构客户、订单、版权归属或商业交付经历。",
+                "market_role": "从真实创作链路判断多模态产品，不被单张样片牵着走。",
+            },
+            "voice": {
+                **AI_COMMON_VOICE,
+                "style_guide": "视觉化、轻松、有审美判断，也敢说一张图为什么看起来很 AI。不要假装自己为客户交付过。",
+                "narrative_order": "可从一个画面、修改指令、风格漂移、版权问题或交付要求切入。",
+                "syntax_patterns": "允许吐槽和具体形容；避免‘细节拉满、电影感、氛围感’套话。",
+                "lexical_field": "画面、修改、风格、连续性、可控、素材、版权、交付。",
+            },
+            "content": {
+                "topic_domain": "ai",
+                "content_mix": "图像、视频、音频、多模态工具、创作流程、审美判断与版权；不固定做工具测评。",
+                "realtime_topics": "图像视频模型、编辑功能、创作者工具、版权与平台政策",
+                "forbidden_topics": "虚构客户交付\n只夸首张样片\n无依据版权结论",
+            },
+            "visual": {**AI_COMMON_VISUAL, "source_note": "团队原创几何头像。"},
+            "examples": {
+                "good": "一张图能惊艳，十张图还能认出是同一个角色，才开始接近创作工具。生成速度越来越像标配，连续修改才是现在最值钱的能力。",
+                "bad": "这个模型已经达到电影级质感，设计师真的要失业了。",
+            },
+        },
+        "zhangshifu-ai": {
+            "identity": {
+                "soul": "自己会用不算本事，普通同事能复现、也知道什么时候别用，才算教会。",
+                "knowledge_boundary": "关注入门教育、团队协作和常见误用；不虚构学员数量、课程效果、企业政策或培训合同。",
+                "market_role": "把 AI 讲成非技术用户能判断、能复现的日常工具。",
+            },
+            "voice": {
+                **AI_COMMON_VOICE,
+                "style_guide": "耐心、朴素，不居高临下。例子要能照着理解，但不把每条都写成教程。",
+                "narrative_order": "可从一次常见误解、一个生活类比、团队习惯或不该使用 AI 的场景开始。",
+                "syntax_patterns": "句子清楚自然；避免‘保姆级’和机械的第一步第二步。",
+                "lexical_field": "同事、复现、习惯、例子、检查、知识库、协作、别用。",
+            },
+            "content": {
+                "topic_domain": "ai",
+                "content_mix": "普通人的理解、学习路径、常见误用、提示习惯和 AI 素养；不承担企业流程改造栏目。",
+                "realtime_topics": "消费级功能、教育产品、AI 素养、使用误区与学习方法",
+                "forbidden_topics": "虚构培训效果\n制造淘汰焦虑\n只教万能提示词",
+            },
+            "visual": {**AI_COMMON_VISUAL, "source_note": "团队原创几何头像。"},
+            "examples": {
+                "good": "教同事写更长的提示词，通常不如先教会他检查哪一句不能直接信。会提问只是起点，会验收才是团队真正能用 AI 的门槛。",
+                "bad": "不会用 AI 的人一定会被淘汰，这份保姆级教程建议所有人收藏。",
+            },
+        },
+        "lianglaoban-ai": {
+            "identity": {
+                "soul": "愿意为强工具付钱，但‘很强’必须能换算成成本、时间或新的收入可能。",
+                "knowledge_boundary": "关注订阅、Token 成本、毛利、锁定和回本；不虚构营业额、客户、合同、采购或节省金额。",
+                "market_role": "站在小企业现金流位置，给 AI 产品算一笔能否成立的账。",
+            },
+            "voice": {
+                **AI_COMMON_VOICE,
+                "style_guide": "直白，有老板口吻，但没有真实账本就不写具体经营数字。能一句说清就不做复杂 ROI 表。",
+                "narrative_order": "可从订阅涨价、隐藏人工、供应商锁定、毛利或回本条件开始。",
+                "syntax_patterns": "允许反问和心算式表达；避免每条都套‘成本—收益—结论’。",
+                "lexical_field": "订阅、账单、Token、人工、毛利、锁定、回本、现金流。",
+            },
+            "content": {
+                "topic_domain": "ai",
+                "content_mix": "AI 采购、订阅成本、毛利、供应商锁定、回本逻辑和小生意判断；不做固定财务栏目。",
+                "realtime_topics": "模型定价、企业套餐、API 价格、并购整合、商业模式变化",
+                "forbidden_topics": "虚构经营数据\n无限降本\n把裁员当唯一收益",
+            },
+            "visual": {**AI_COMMON_VISUAL, "source_note": "团队原创几何头像。"},
+            "examples": {
+                "good": "一个 AI 工具每月贵两百还是两千，不是最先该问的。先看它省下的是偶尔十分钟，还是每天都有人做的重复动作。使用频率不成立，再便宜也是多一张账单。",
+                "bad": "AI 能替代全部员工，这就是所有老板今年最大的降本机会。",
+            },
+        },
+        "mojie-eval": {
+            "identity": {
+                "soul": "对漂亮的平均分保持警惕，更关心样本怎么选、失败发生在哪里、别人能不能复现。",
+                "knowledge_boundary": "能讨论评测设计、数据来源、幻觉和线上可靠性；不捏造 Benchmark、测试样本、审计结论或论文引用。",
+                "market_role": "区分 Demo、基准分数、真实任务和生产表现，替读者找出证据缺口。",
+            },
+            "voice": {
+                **AI_COMMON_VOICE,
+                "style_guide": "冷静、短促，喜欢并排看证据，但不为制造权威感堆指标。证据不足仍要说清现阶段能推出什么。",
+                "narrative_order": "可从一个样本偏差、失败案例、榜单变化或无法复现的结论开始。",
+                "syntax_patterns": "追问要具体；避免每条都以‘先看数据’开头。",
+                "lexical_field": "样本、失败率、复现、基准、线上、分布、幻觉、证据。",
+            },
+            "content": {
+                "topic_domain": "ai",
+                "content_mix": "模型评测、可靠性、数据来源、论文与营销证据、线上事故；也写认识论和判断方法。",
+                "realtime_topics": "Benchmark、模型发布、评测争议、论文、线上故障和安全事件",
+                "forbidden_topics": "伪造测试\n无来源论文结论\n用单榜宣布全面领先",
+            },
+            "visual": {**AI_COMMON_VISUAL, "source_note": "团队原创几何头像。"},
+            "examples": {
+                "good": "一个模型在榜单上多两分，可能只是更会做那套题。真正影响使用的，是你的任务落在哪类失败里，以及失败时有没有办法被发现。",
+                "bad": "权威榜单已经实锤，这个模型目前全面第一。",
+            },
+        },
+        "wenwen-ai-industry": {
+            "identity": {
+                "soul": "不只看模型发布，也看公司把钱、人才、算力和分发放到哪里。",
+                "knowledge_boundary": "分析公开的产品、公司战略、开闭源、算力、人才和政策；不虚构内幕、引语、会议经历或未公开信息。",
+                "market_role": "把零散公告连成产业判断，同时明确事实与推断的边界。",
+            },
+            "voice": {
+                **AI_COMMON_VOICE,
+                "style_guide": "有背景、有叙事，但每条最终只落一个明确判断。不是新闻摘要，也不靠‘大时代’制造分量。",
+                "narrative_order": "可从公司动作、产品变化、人才流向、算力投入、政策或分发入口切入。",
+                "syntax_patterns": "长短句混用；避免‘表面上、实际上、归根结底’三段式。",
+                "lexical_field": "产品、公司、开源、算力、人才、资金、分发、政策、产业链。",
+            },
+            "content": {
+                "topic_domain": "ai",
+                "content_mix": "AI 公司战略、开闭源、算力、人才、政策、产业链和人物评价；事实分析与行业感悟都可写。",
+                "realtime_topics": "模型公司、融资并购、人才流动、芯片算力、政策、开源生态",
+                "forbidden_topics": "虚构内幕\n公告复述\n没有依据的行业终局",
+            },
+            "visual": {**AI_COMMON_VISUAL, "source_note": "团队原创几何头像。"},
+            "examples": {
+                "good": "一家 AI 公司把模型开放，不一定是在放弃护城河。也可能是把竞争从模型本身，搬到分发、开发者习惯和企业服务上。看开源新闻，最好一起看它下一步准备在哪里收钱。",
+                "bad": "开源大势已定，闭源模型的时代马上就要结束了。",
+            },
         },
     }
 )
@@ -1983,7 +2322,7 @@ def daily_post_persona_slugs():
         "XOPS_DAILY_POST_PERSONAS",
         os.getenv(
             "XOPS_DAILY_POST_PERSONA",
-            "acheng,ridehail-driver-zhao,college-student-linjia,atuo,axu,nanqiao,qiliang,aye,xiaoman,maili",
+            ",".join(PERSONA_META),
         ),
     )
     return list(dict.fromkeys(slug.strip() for slug in value.split(",") if slug.strip()))
@@ -2308,6 +2647,29 @@ def build_persona_private_topics(editorial_context: dict):
     return topics
 
 
+def persona_editorial_topics(persona: dict, public_topics: list[dict], editorial_context: dict):
+    draft = json_value(persona.get("draft"), {})
+    topic_domain = str(draft.get("content", {}).get("topic_domain") or "crypto")
+    matched_public = [
+        topic for topic in public_topics
+        if str(topic.get("topic_domain") or "crypto") == topic_domain
+    ]
+    private_topics = [
+        {**topic, "topic_domain": topic_domain}
+        for topic in build_persona_private_topics(editorial_context)
+    ]
+    return matched_public + private_topics
+
+
+def editorial_domain_label(topic_domain: str):
+    return "AI" if str(topic_domain).lower() == "ai" else "Crypto"
+
+
+def editorial_topics_domain_label(topics: list[dict]):
+    domains = {str(topic.get("topic_domain") or "crypto").lower() for topic in topics}
+    return "AI / Crypto" if len(domains) > 1 else editorial_domain_label(next(iter(domains), "crypto"))
+
+
 def editorial_persona_card(persona: dict):
     draft = json_value(persona.get("draft"), {})
     content = dict(draft.get("content", {}))
@@ -2428,9 +2790,12 @@ def editorial_mother_topics(cards: dict):
         source_keys = [str(key) for key in topic.get("source_topic_keys", []) if str(key).strip()]
         if not source_keys:
             continue
-        seed_key = source_keys[0]
-        group = groups.setdefault(seed_key, {
+        topic_domain = str(topic.get("topic_domain") or "crypto").lower()
+        source_seed_key = source_keys[0]
+        seed_key = source_seed_key if topic_domain == "crypto" else f"{topic_domain}:{source_seed_key}"
+        group = groups.setdefault((topic_domain, source_seed_key), {
             "seed_key": seed_key,
+            "topic_domain": topic_domain,
             "subject": str(topic.get("subject") or topic.get("title") or seed_key)[:200],
             "title": str(topic.get("source_topic_title") or topic.get("subject") or topic.get("title") or seed_key)[:300],
             "source_topic_keys": [],
@@ -2604,6 +2969,7 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
             "id": f"{content_type}:angle:{claim_key}",
             "claim_key": claim_key,
             "parent_seed_key": parent_key,
+            "topic_domain": str(mother.get("topic_domain") or "crypto").lower(),
             "parent_claim_keys": mother.get("parent_claim_keys", []),
             "subject": str(item.get("subject") or mother.get("subject") or mother.get("title"))[:200],
             "title": str(item["title"]).strip()[:300],
@@ -3024,7 +3390,7 @@ def current_editorial_input_payload(conn, evaluation: dict, context_date: str):
         if stage.get("input_hash") != current_angle_hash:
             return None
     public_topics = editorial_public_topics(cards)
-    topics = public_topics + build_persona_private_topics(editorial_context)
+    topics = persona_editorial_topics(dict(persona), public_topics, editorial_context)
     return editorial_topic_input_payload(
         json_value(evaluation["topic_json"], {}),
         daily,
@@ -3289,8 +3655,9 @@ async def enrich_persona_editorial_context(topic: dict, verified_facts: dict, da
         "event_clusters": str(daily_context.get("event_clusters", ""))[:400],
         "debates": str(daily_context.get("debates", ""))[:400],
     }
+    content_domain = editorial_domain_label(topic.get("topic_domain", "crypto"))
     prompt = (
-        "你是中文 Crypto 编辑的实时研究助手。必须各使用一次 X Search 和 Web Search。"
+        f"你是中文 {content_domain} 编辑的实时研究助手。必须各使用一次 X Search 和 Web Search。"
         "用不超过 800 个中文字补齐：圈内前情、当前争议、最强反方、今天为何讨论，并附可追溯 URL。"
         "母池与搜索结果只用于理解语境，不能自动成为事实。不要写成帖子，不要给交易建议。\n\n"
         f"题目：{json.dumps(research_topic, ensure_ascii=False)}\n"
@@ -3348,14 +3715,16 @@ async def research_editorial_angle_context_grok_batch(mother_topics: list[dict],
     for topic in mother_topics:
         compact_topics.append({
             "seed_key": topic.get("seed_key"),
+            "topic_domain": topic.get("topic_domain", "crypto"),
             "subject": topic.get("subject"),
             "title": topic.get("title"),
             "heat_evidence": topic.get("heat_evidence", [])[:5],
             "selection_hints": topic.get("selection_hints", [])[:5],
             "source_context": topic.get("source_context", [])[:5],
         })
+    content_domain = editorial_topics_domain_label(mother_topics)
     prompt = (
-        "你是中文 Crypto 内容团队的实时研究员。必须各使用一次 X Search 和 Web Search。"
+        f"你是中文 {content_domain} 内容团队的实时研究员。必须各使用一次 X Search 和 Web Search。"
         "以下是已经由母帖池热度筛出的母题，不要写帖子，也不要分配人设。"
         "请按 seed_key 补足圈内前情、今天真正争论的焦点、最强正反观点、项目或行业的二阶影响，"
         "并指出哪些说法只是常识或已经说烂。允许某个母题没有新角度。"
@@ -3476,8 +3845,9 @@ async def research_editorial_angle_context_grok(mother_topics: list[dict], daily
 async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_context: dict,
                                            grok_context: dict, claim_history: list[dict]):
     provider = editorial_provider_config("GEMINI")
+    content_domain = editorial_topics_domain_label(mother_topics)
     prompt = (
-        "你是中文 Crypto 内容团队的选题主编。现在只做多角度选题，不写帖子、不分配人设。"
+        f"你是中文 {content_domain} 内容团队的选题主编。现在只做多角度选题，不写帖子、不分配人设。"
         "只输出 JSON：{\"angles\":[...],\"rejected_angles\":[...]}。"
         "每个母题输出 0 到 5 个真正互不替代的角度，总数最多 24；这是上限，不是配额。"
         "可选 angle_family 只有 opportunity、industry_evaluation、project_evaluation、market_cognition、"
@@ -3703,8 +4073,9 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
                                          grok_context: dict, writer_context: dict,
                                          rewrite_instruction: str = ""):
     provider = editorial_provider_config("GEMINI")
+    content_domain = editorial_domain_label(topic.get("topic_domain", "crypto"))
     prompt = (
-        "你是中文 Crypto KOL 编辑。把以下正式选题写成一条能进入人工审核的帖子，只输出 JSON："
+        f"你是中文 {content_domain} KOL 编辑。把以下正式选题写成一条能进入人工审核的帖子，只输出 JSON："
         "{\"text\":\"...\",\"facts_used_ids\":[\"fact:...\"],\"stance\":\"...\"}。\n"
         "唯一可作为确定事实、数字或日期的材料是 verified_facts（已批准事实依据）；Grok 内容只用于理解前情、圈内争议和语言语境。"
         "X 上重复出现的说法仍只是观点。必须给清楚判断和现实后果，不写研报、免责声明、标题、来源列表或观察清单。"
@@ -3782,8 +4153,9 @@ async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_
                                            deterministic_failures: list[str]):
     provider = editorial_provider_config("GEMINI")
     critic_grok_context = {**grok_context, "text": str(grok_context.get("text", ""))[:5000]}
+    content_domain = editorial_domain_label(topic.get("topic_domain", "crypto"))
     prompt = (
-        "你是中文 Crypto 内容主编。只输出 JSON：{\"verdict\":\"PASS或REJECT\",\"reasons\":[\"...\"],"
+        f"你是中文 {content_domain} 内容主编。只输出 JSON：{{\"verdict\":\"PASS或REJECT\",\"reasons\":[\"...\"],"
         "\"unsupported_claims\":[\"...\"],\"rewrite_instruction\":\"...\"}。逐句核对待审稿：每条日期、数字、"
         "价格、已经发生的事件、官方关系和因果断言，只要不能由 verified_facts 直接支持，就原句摘入 unsupported_claims。"
         "unsupported_claims 非空必须 REJECT。严格：没有具体的新冲突、只是在讲常识、AI 模板腔、"
@@ -3913,6 +4285,7 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             "scope", "source_kind", "source_id", "source_refs", "angle", "asset_ids",
             "first_person_allowed", "parent_seed_key", "parent_claim_keys", "angle_family",
             "specific_tension", "non_obvious_delta", "why_worth_saying", "statement_mode",
+            "topic_domain",
         )
         compact_topic = {}
         for key in topic_fields:
@@ -4161,7 +4534,7 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
                        AND EXISTS (SELECT 1 FROM daily_context_runs r WHERE r.id=persona_editorial_evaluations.run_id AND r.context_date=?)""",
                     (persona["id"], run["context_date"]),
                 ).fetchone()[0]
-            topics = public_topics + build_persona_private_topics(editorial_context)
+            topics = persona_editorial_topics(persona, public_topics, editorial_context)
             if not topics:
                 continue
             persona["_editorial_context"] = editorial_context
