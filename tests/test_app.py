@@ -3726,6 +3726,36 @@ class AppTest(unittest.TestCase):
         self.assertEqual(statuses.count("WRITE"), 3)
         self.assertEqual(statuses.count("HOLD"), 0)
 
+    def test_revalidation_keeps_completed_candidate_ready(self):
+        context_date = self.app_module.shanghai_today()
+        topic = self.mother_topic()
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+        candidate_id, evaluation_id = self.insert_formal_queue_candidate(
+            run_id, context_date, topic
+        )
+        with self.app_module.db() as conn:
+            raw_cards = self.app_module.json_value(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()[0], {})
+
+        self.app_module.validate_run_persona_theses(run_id, raw_cards)
+        self.app_module.resolve_persona_editorial_collisions(run_id)
+
+        with self.app_module.db() as conn:
+            evaluation = conn.execute(
+                "SELECT status,thesis_state,candidate_id FROM persona_editorial_evaluations WHERE id=?",
+                (evaluation_id,),
+            ).fetchone()
+            candidate = conn.execute(
+                "SELECT status FROM post_candidates WHERE id=?", (candidate_id,)
+            ).fetchone()
+        self.assertEqual(dict(evaluation), {
+            "status": "WRITE",
+            "thesis_state": "CANDIDATE_READY",
+            "candidate_id": candidate_id,
+        })
+        self.assertEqual(candidate["status"], "needs_review")
+
     def test_historical_pending_write_recovers_without_historical_backfill(self):
         context_date = "2020-01-02"
         topic = {
