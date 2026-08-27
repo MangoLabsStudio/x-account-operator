@@ -5235,7 +5235,7 @@ async def research_editorial_angle_context_grok_batch(mother_topics: list[dict],
         f"母题：{json.dumps(compact_topics, ensure_ascii=False)}\n"
         f"已批准市场语境：{json.dumps(editorial_daily_input(daily_context), ensure_ascii=False)}"
     )
-    async with httpx.AsyncClient(timeout=180) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         from_date = (
             datetime.fromisoformat(str(daily_context["context_date"])).date()
             - timedelta(days=EDITORIAL_HOT_TOPIC_RETENTION_DAYS - 1)
@@ -5295,7 +5295,7 @@ async def research_editorial_angle_context_grok_batch(mother_topics: list[dict],
 async def research_editorial_angle_context_grok(mother_topics: list[dict], daily_context: dict):
     """Research each mother independently so one slow topic cannot block the slate."""
     batches = [[topic] for topic in mother_topics]
-    semaphore = asyncio.Semaphore(3)
+    semaphore = asyncio.Semaphore(8)
 
     async def research_batch(batch):
         async with semaphore:
