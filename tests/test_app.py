@@ -3719,6 +3719,45 @@ class AppTest(unittest.TestCase):
         ))
         self.assertIsNotNone(row["next_retry_at"])
 
+    def test_pipeline_reopens_a_previously_rejected_required_public_angle(self):
+        context_date = self.app_module.shanghai_today()
+        topic = {
+            "claim_key": "required-reopen", "title": "必须恢复的观点",
+            "core_claim": "旧版正文被拒不能永久撤销 Thesis。",
+            "parent_seed_key": "mother:reopen", "scope": "public", "topic_domain": "crypto",
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+        with self.app_module.db() as conn:
+            cards = json.loads(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()[0])
+            cards["editorial_angle_expansion"] = {
+                "status": "ready", "expanded_topics": [topic], "rejected_angles": [],
+            }
+            conn.execute(
+                "UPDATE daily_context_runs SET raw_cards=? WHERE id=?",
+                (json.dumps(cards, ensure_ascii=False), run_id),
+            )
+        evaluation_id = self.insert_pending_editorial_write(run_id, context_date, topic)
+        with self.app_module.db() as conn:
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET status='HOLD',thesis_state='THESIS_HOLD',reason_code='grok_gemini_critic_reject'
+                   WHERE id=?""",
+                (evaluation_id,),
+            )
+        with patch.dict(os.environ, {"XOPS_DAILY_POST_PERSONAS": "acheng"}):
+            self.app_module.reopen_required_public_angle_rejections(run_id)
+        with self.app_module.db() as conn:
+            row = conn.execute(
+                "SELECT status,thesis_state,reason_code,next_retry_at FROM persona_editorial_evaluations WHERE id=?",
+                (evaluation_id,),
+            ).fetchone()
+
+        self.assertEqual(tuple(row), (
+            "WRITE", "THESIS_APPROVED", "required_public_angle", None,
+        ))
+
     def test_manual_retry_allows_unpublished_legacy_candidate(self):
         context_date = self.app_module.shanghai_today()
         topic = {"claim_key": "legacy-retry", "title": "旧稿复位", "eligible": True}

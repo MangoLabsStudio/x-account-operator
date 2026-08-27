@@ -6003,6 +6003,50 @@ def reopen_daily_supplement_guard_rejections(run_id: int | None = None):
             )
 
 
+def reopen_required_public_angle_rejections(run_id: int | None = None):
+    with db() as conn:
+        runs = conn.execute(
+            """SELECT id,raw_cards FROM daily_context_runs
+               WHERE status='approved' AND context_date=? AND (? IS NULL OR id=?)""",
+            (shanghai_today(), run_id, run_id),
+        ).fetchall()
+        for run in runs:
+            topics = editorial_public_topics(json_value(run["raw_cards"], {}))
+            assignments = required_public_topic_assignments(topics)
+            if not assignments:
+                continue
+            rows = conn.execute(
+                """SELECT e.id,e.topic_json,e.generation_state,p.slug
+                   FROM persona_editorial_evaluations e
+                   JOIN personas p ON p.id=e.persona_id
+                   WHERE e.run_id=? AND e.status='HOLD'""",
+                (run["id"],),
+            ).fetchall()
+            for row in rows:
+                topic = json_value(row["topic_json"], {})
+                if assignments.get(str(topic.get("claim_key", ""))) != row["slug"]:
+                    continue
+                state = json_value(row["generation_state"], {})
+                if isinstance(state, dict):
+                    for key in (
+                        "draft", "draft_failures", "critic", "thesis_adherence", "rewrite",
+                        "rewrite_failures", "final_critic", "writer_attempts", "thesis_repair_attempts",
+                    ):
+                        state.pop(key, None)
+                conn.execute(
+                    """UPDATE persona_editorial_evaluations
+                       SET status='WRITE',thesis_state='THESIS_APPROVED',
+                           generation_stage='context_ready',generation_state=?,next_retry_at=NULL,
+                           reason_code='required_public_angle',
+                           rationale='恢复已批准公共观点；只重写正文，不撤销 Thesis。',updated_at=?
+                       WHERE id=?""",
+                    (
+                        json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                        int(time.time()), row["id"],
+                    ),
+                )
+
+
 def validate_thesis_adherence_result(result: dict) -> dict:
     raw = result.get("adherence") if isinstance(result.get("adherence"), dict) else result
     spans = raw.get("spans", []) if isinstance(raw, dict) else []
@@ -6616,6 +6660,7 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
         enforce_daily_persona_draft_cap(
             conn, shanghai_today(), daily_persona_draft_target()
         )
+    reopen_required_public_angle_rejections(run_id)
     reopen_daily_supplement_guard_rejections(run_id)
     processed = await recover_pending_persona_editorial_candidates(run_id)
     with db() as conn:
