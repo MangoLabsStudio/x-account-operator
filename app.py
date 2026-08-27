@@ -5483,7 +5483,8 @@ async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict
         daily = daily_context_dict(daily_row)
         daily["approval_revision"] = run["approval_revision"]
         evaluation_count = conn.execute(
-            "SELECT COUNT(*) FROM persona_editorial_evaluations WHERE run_id=?", (run_id,)
+            "SELECT COUNT(*) FROM persona_editorial_evaluations WHERE run_id=? AND status='WRITE'",
+            (run_id,),
         ).fetchone()[0]
         existing_stage = current_cards.get("editorial_angle_expansion")
         if evaluation_count and not isinstance(existing_stage, dict):

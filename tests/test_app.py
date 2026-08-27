@@ -1674,6 +1674,45 @@ class AppTest(unittest.TestCase):
         self.assertEqual(row[0], before_hash)
         self.assertNotIn("editorial_angle_expansion", cards)
 
+    def test_held_legacy_evaluations_do_not_block_direct_mother_rebuild(self):
+        context_date = "2026-08-21"
+        parent = self.mother_topic()
+        run_id = self.create_editorial_run(context_date, topics=[parent])
+        evaluation_id = self.insert_pending_editorial_write(
+            run_id, context_date, parent, claim_key="held-legacy", core_claim="旧评估已撤回。",
+        )
+        with self.app_module.db() as conn:
+            conn.execute(
+                "UPDATE persona_editorial_evaluations SET status='HOLD' WHERE id=?",
+                (evaluation_id,),
+            )
+            run = conn.execute(
+                "SELECT approval_revision FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()
+            daily = self.app_module.daily_context_dict(conn.execute(
+                "SELECT * FROM daily_market_contexts WHERE context_date=?", (context_date,)
+            ).fetchone())
+        daily["approval_revision"] = run["approval_revision"]
+        research = AsyncMock(return_value={
+            "text": "实时语境", "citations": ["https://example.com/btc"],
+            "tool_usage": ["x_search", "web_search"], "model": "grok-test",
+        })
+        expansion = AsyncMock(return_value={
+            "angles": [self.expanded_angle("discussion:btc", "rebuilt-angle")],
+            "rejected_angles": [], "_model": "gemini-test",
+        })
+        with patch.object(
+            self.app_module, "research_editorial_angle_context_grok", research,
+        ), patch.object(
+            self.app_module, "expand_editorial_angles_gemini", expansion,
+        ):
+            topics = asyncio.run(self._real_ensure_editorial_angle_expansion(
+                run_id, self.signal_cards([parent]), daily,
+            ))
+
+        self.assertEqual([item["claim_key"] for item in topics], ["rebuilt-angle"])
+        research.assert_awaited_once()
+
     def test_editorial_decisions_only_write_and_never_fill_a_quota(self):
         run_id = self.create_editorial_run("2026-08-22")
         generated = AsyncMock(return_value={"post": "只给真正值得写的人设生成。"})
