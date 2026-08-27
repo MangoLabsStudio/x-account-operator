@@ -40,7 +40,7 @@ EDITORIAL_GEMINI_KEY_POOLS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.
 GEMINI_KEYCHAIN_SERVICE = "codex.xops.gemini.pool"
 GEMINI_KEYCHAIN_ACCOUNTS = ("slot-1", "slot-2", "slot-3", "slot-4", "slot-5")
 GEMINI_POOL_ENV_VARS = tuple(f"XOPS_GEMINI_API_KEY_{index}" for index in range(1, 6))
-EDITORIAL_ANGLE_EXPANSION_REVISION = 3
+EDITORIAL_ANGLE_EXPANSION_REVISION = 4
 EDITORIAL_ANGLE_MAX_ATTEMPTS = 3
 EDITORIAL_HOT_TOPIC_RETENTION_DAYS = 3
 EDITORIAL_ANGLE_FAMILIES = {
@@ -2536,7 +2536,7 @@ async def synthesize_daily_cards(context_date: str, cards: dict):
         "必须按照 topic_selection_policy 逐条筛选，并把 claim_history 视为全账号已覆盖历史。"
         "热点不等于可写；数字刷新不等于观点更新。与历史主张语义相同且没有 material delta 的研究题必须拒绝。"
         "去重单位是核心主张，不是事件或项目：同一热点下互不重叠的研究、机会和评论角度可以分别保留。"
-        "selected_topics 在这里负责确定今天值得继续研究的母题和初始判断，不会直接进入人设写稿；"
+        "selected_topics 只用于日报候选观点，不作为后续母题或人设写稿的输入；"
         "selected_topics 最多 15 条，rejected_topics 最多 8 条；只保留最有代表性的拒绝原因，避免重复罗列。"
         "审批后还会先经过 Grok 实时研究与 Gemini 多角度展开，因此不要为了预填所有表达方向而制造常识题。"
         "评论题可以复用当天事件背景，但必须有鲜明立场和非显而易见的表达。"
@@ -3670,114 +3670,66 @@ def editorial_public_topics(cards: dict):
     return [item for item in topics if isinstance(item, dict) and item.get("claim_key")]
 
 
-def selected_editorial_mother_topics(cards: dict):
-    """Collapse selected writing hints back to the approved subjects they came from."""
-    selected = cards.get("selected_topics", []) if isinstance(cards, dict) else []
-    discussions = {
-        (str(item.get("topic_domain") or "crypto").lower(), str(item.get("key"))): item
-        for field in ("discussion_topics", "discovery_topics")
-        for item in cards.get(field, [])
-        if isinstance(item, dict) and item.get("key")
-    }
-    opinions = {
-        (
-            str(item.get("topic_domain") or "crypto").lower(),
-            f"opinion:{item.get('source_ref')}",
-        ): item for item in cards.get("opinion_cards", [])
-        if isinstance(item, dict) and item.get("source_ref")
-    }
-    facts = {}
-    for item in cards.get("fact_cards", []):
-        if not isinstance(item, dict):
-            continue
-        ref = item.get("source_ref") or item.get("representative_source_ref")
-        if ref:
-            facts[(str(item.get("topic_domain") or "crypto").lower(), f"fact:{ref}")] = item
-    groups = {}
-    for topic in selected:
-        if not isinstance(topic, dict) or not topic.get("claim_key"):
-            continue
-        source_keys = [str(key) for key in topic.get("source_topic_keys", []) if str(key).strip()]
-        if not source_keys:
-            continue
-        topic_domain = str(topic.get("topic_domain") or "crypto").lower()
-        source_seed_key = source_keys[0]
-        seed_key = source_seed_key if topic_domain == "crypto" else f"{topic_domain}:{source_seed_key}"
-        group = groups.setdefault((topic_domain, source_seed_key), {
-            "seed_key": seed_key,
-            "topic_domain": topic_domain,
-            "subject": str(topic.get("subject") or topic.get("title") or seed_key)[:200],
-            "title": str(topic.get("source_topic_title") or topic.get("subject") or topic.get("title") or seed_key)[:300],
-            "source_topic_keys": [],
-            "source_refs": [],
-            "parent_claim_keys": [],
-            "selection_hints": [],
-            "heat_evidence": [],
-            "source_context": [],
-        })
-        for key in source_keys:
-            if key not in group["source_topic_keys"]:
-                group["source_topic_keys"].append(key)
-        for ref in topic.get("source_refs", []):
-            ref = str(ref).strip()
-            if ref and ref not in group["source_refs"]:
-                group["source_refs"].append(ref)
-        if topic["claim_key"] not in group["parent_claim_keys"]:
-            group["parent_claim_keys"].append(str(topic["claim_key"]))
-        group["selection_hints"].append({
-            key: str(topic.get(key, ""))[:500]
-            for key in ("title", "core_claim", "material_delta", "audience_value", "why_now")
-            if topic.get(key)
-        })
-        why_now = str(topic.get("why_now", "")).strip()
-        if why_now and why_now not in group["heat_evidence"]:
-            group["heat_evidence"].append(why_now[:500])
-    for group in groups.values():
-        for key in group["source_topic_keys"]:
-            lookup = (group["topic_domain"], key)
-            source = discussions.get(lookup) or opinions.get(lookup) or facts.get(lookup)
-            if not source:
+def signal_editorial_mother_topics(cards: dict):
+    """Turn hot/discovery signal clusters directly into neutral mother topics."""
+    mothers = []
+    seen = set()
+    for field, source_lane in (("discussion_topics", "hot"), ("discovery_topics", "discovery")):
+        for topic in cards.get(field, []) if isinstance(cards, dict) else []:
+            if not isinstance(topic, dict) or not topic.get("key"):
                 continue
-            if lookup in discussions:
-                summary = {
-                    field: source.get(field)
-                    for field in ("key", "title", "unique_authors", "post_count", "parent", "mechanism")
-                    if source.get(field) not in (None, "", [], {})
+            topic_domain = str(topic.get("topic_domain") or "crypto").lower()
+            source_key = str(topic["key"])
+            identity = (topic_domain, source_key)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            seed_key = source_key if topic_domain == "crypto" else f"{topic_domain}:{source_key}"
+            sample_posts = [
+                {
+                    key: sample.get(key)
+                    for key in ("source_ref", "text", "created_at", "like_count", "retweet_count")
+                    if sample.get(key) not in (None, "")
                 }
-                samples = []
-                for sample in source.get("sample_posts", [])[:5]:
-                    if not isinstance(sample, dict):
-                        continue
-                    samples.append({
-                        field: sample.get(field)
-                        for field in ("source_ref", "text", "created_at", "like_count", "retweet_count")
-                        if sample.get(field) not in (None, "")
-                    })
-                if samples:
-                    summary["sample_posts"] = samples
-                group["source_context"].append(summary)
-                for ref in source.get("sample_refs", []):
-                    ref = str(ref).strip()
-                    if ref and ref not in group["source_refs"]:
-                        group["source_refs"].append(ref)
-                authors = source.get("unique_authors")
-                posts = source.get("post_count")
-                if authors or posts:
-                    group["heat_evidence"].append(f"母池讨论作者 {authors or 0}，原帖 {posts or 0}。")
-            else:
-                group["source_context"].append({
-                    field: source.get(field)
-                    for field in (
-                        "source_ref", "topic", "summary", "viewpoint", "representative_text",
-                        "claim", "stance", "status",
-                    )
-                    if source.get(field) not in (None, "", [], {})
-                })
-        group["source_refs"] = group["source_refs"][:30]
-        group["selection_hints"] = group["selection_hints"][:8]
-        group["heat_evidence"] = list(dict.fromkeys(group["heat_evidence"]))[:8]
-        group["source_context"] = group["source_context"][:8]
-    return list(groups.values())[:16]
+                for sample in topic.get("sample_posts", [])[:5]
+                if isinstance(sample, dict)
+            ]
+            source_context = {
+                key: topic.get(key)
+                for key in (
+                    "key", "title", "parent", "mechanism", "unique_authors", "post_count",
+                    "recent_6h_authors", "recent_6h_posts", "cross_list_count",
+                    "engagement_total", "latest_at",
+                )
+                if topic.get(key) not in (None, "", [], {})
+            }
+            if sample_posts:
+                source_context["sample_posts"] = sample_posts
+            source_refs = [
+                str(ref).strip() for ref in topic.get("sample_refs", [])
+                if str(ref).strip()
+            ]
+            source_refs.extend(
+                str(sample.get("source_ref", "")).strip()
+                for sample in sample_posts if str(sample.get("source_ref", "")).strip()
+            )
+            parent = topic.get("parent") if isinstance(topic.get("parent"), dict) else {}
+            mothers.append({
+                "seed_key": seed_key,
+                "topic_domain": topic_domain,
+                "source_lane": source_lane,
+                "subject": str(parent.get("title") or topic.get("title") or source_key)[:200],
+                "title": str(topic.get("title") or source_key)[:300],
+                "source_topic_keys": [source_key],
+                "source_refs": list(dict.fromkeys(source_refs))[:30],
+                "parent_claim_keys": [],
+                "heat_evidence": [
+                    f"母池讨论作者 {int(topic.get('unique_authors') or 0)}，"
+                    f"原帖 {int(topic.get('post_count') or 0)}，来源类型 {source_lane}。"
+                ],
+                "source_context": [source_context],
+            })
+    return mothers[:16]
 
 
 def rolling_hot_topic_pool(conn, context_date: str) -> dict:
@@ -3799,7 +3751,7 @@ def rolling_hot_topic_pool(conn, context_date: str) -> dict:
         cards = json_value(row["raw_cards"], {})
         parsed_rows.append((str(row["context_date"]), cards))
         age_days = (current_date - datetime.fromisoformat(str(row["context_date"])).date()).days
-        for mother in selected_editorial_mother_topics(cards):
+        for mother in signal_editorial_mother_topics(cards):
             seed_key = str(mother.get("seed_key") or "")
             if not seed_key or seed_key in seen_mothers:
                 continue
@@ -3840,7 +3792,7 @@ def rolling_hot_topic_pool(conn, context_date: str) -> dict:
 
 
 def editorial_mother_topics(cards: dict):
-    current = selected_editorial_mother_topics(cards)
+    current = signal_editorial_mother_topics(cards)
     pool = cards.get("hot_topic_pool", {}) if isinstance(cards, dict) else {}
     seen = {str(item.get("seed_key") or "") for item in current}
     merged = list(current)
@@ -5263,15 +5215,16 @@ async def research_editorial_angle_context_grok_batch(mother_topics: list[dict],
             "title": topic.get("title"),
             "hot_pool_origin_date": topic.get("hot_pool_origin_date"),
             "hot_pool_age_days": topic.get("hot_pool_age_days", 0),
+            "source_lane": topic.get("source_lane", "hot"),
             "heat_evidence": topic.get("heat_evidence", [])[:5],
-            "selection_hints": topic.get("selection_hints", [])[:5],
             "source_context": topic.get("source_context", [])[:5],
         })
     content_domain = editorial_topics_domain_label(mother_topics)
     prompt = (
         f"你是中文 {content_domain} 内容团队的实时研究员。必须各使用一次 X Search 和 Web Search。"
-        "以下是已经由母帖池热度筛出的母题，不要写帖子，也不要分配人设。"
-        "母题可以来自今天或最近三天滚动热点池；旧母题必须重新核对当前讨论，不能把旧状态写成今天的新消息。"
+        "以下母题直接来自母帖池的热点信号或发现信号，不要写帖子，也不要分配人设。"
+        "source_lane=hot 表示广泛讨论，source_lane=discovery 表示早期发现；不得把发现题材伪装成市场热点。"
+        "母题可以来自今天或最近三天滚动题材池；旧母题必须重新核对当前讨论，不能把旧状态写成今天的新消息。"
         "请按 seed_key 补足圈内前情、今天真正争论的焦点、最强正反观点、项目或行业的二阶影响，"
         "并指出哪些说法只是常识或已经说烂。允许某个母题没有新角度。"
         "搜索结果只能作为语境，不能自动升级成可发布事实；附可追溯 URL。"
@@ -5431,8 +5384,8 @@ async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_contex
         "core_claim 必须是一句可争论、能直接说出口的明确结论，不能是问题、背景介绍、名词解释或等待后续。"
         "同一母题下，只有核心判断发生变化才算不同角度；换标题、换措辞、换人设都不算。"
         "历史重复只指 claim_key 或核心结论实质相同；同一项目、同一币种、同一事件或同属一个宏观叙事，"
-        "不能单独作为 covered_claim。母题里的 selection_hints 若包含不同因果、参与条件、反方证据或二阶影响，"
-        "应分别判断，不要因为题材相同直接合并。"
+        "不能单独作为 covered_claim。母题来源只描述对象、机制和讨论信号；具体因果、参与条件、反方证据和二阶影响"
+        "必须结合 source_context 与 Grok 实时语境重新判断，不能继承任何预制观点。"
         "圈内读者无需今天材料就会同意的常识、万能风险提示、空泛鸡汤、旧 Builder Codes 一类已覆盖主张，"
         "必须放进 rejected_angles，不能为了显得丰富而保留。"
         "机会角度必须存在正向参与或计算条件；如果结论只有别做、别追、风险很大，就不要生成。"

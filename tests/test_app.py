@@ -203,7 +203,7 @@ class AppTest(unittest.TestCase):
                     context_date,
                     status,
                     "test",
-                    json.dumps({"selected_topics": topics}, ensure_ascii=False),
+                    json.dumps(self.signal_cards(topics), ensure_ascii=False),
                     "{}",
                     now,
                     now,
@@ -303,6 +303,35 @@ class AppTest(unittest.TestCase):
             "source_refs": ["x:btc:1"],
             "source_topic_title": "BTC 资金结构",
             "eligible": True,
+        }
+
+    @staticmethod
+    def signal_cards(topics):
+        signals = []
+        for topic in topics:
+            source_keys = topic.get("source_topic_keys", [])
+            source_key = str(
+                source_keys[0] if source_keys
+                else topic.get("parent_seed_key") or topic.get("claim_key")
+            )
+            signals.append({
+                "key": source_key.removeprefix("ai:"),
+                "title": topic.get("source_topic_title") or topic.get("title") or source_key,
+                "topic_domain": topic.get("topic_domain", "crypto"),
+                "parent": {"title": topic.get("subject") or topic.get("title") or source_key},
+                "mechanism": {"title": "测试机制"},
+                "unique_authors": 3,
+                "post_count": 3,
+                "sample_refs": topic.get("source_refs", []),
+                "sample_posts": [
+                    {"source_ref": ref, "text": topic.get("title", source_key)}
+                    for ref in topic.get("source_refs", [])
+                ],
+            })
+        return {
+            "selected_topics": topics,
+            "discussion_topics": signals,
+            "discovery_topics": [],
         }
 
     @staticmethod
@@ -884,7 +913,7 @@ class AppTest(unittest.TestCase):
             **self.mother_topic("ai-model-release", "discussion:ai-models"),
             "topic_domain": "ai",
         }
-        mothers = self.app_module.editorial_mother_topics({"selected_topics": [parent]})
+        mothers = self.app_module.editorial_mother_topics(self.signal_cards([parent]))
         self.assertEqual(mothers[0]["topic_domain"], "ai")
         self.assertEqual(mothers[0]["seed_key"], "ai:discussion:ai-models")
         angle = self.expanded_angle(
@@ -896,6 +925,29 @@ class AppTest(unittest.TestCase):
         )
         self.assertEqual(rejected, [])
         self.assertEqual(topics[0]["topic_domain"], "ai")
+
+    def test_mother_topics_come_directly_from_signal_lanes(self):
+        selected = self.mother_topic("prewritten-claim", "other:selected")
+        cards = self.signal_cards([self.mother_topic()])
+        cards["selected_topics"] = [selected]
+        cards["discovery_topics"] = [{
+            "key": "project:launch",
+            "title": "早期项目发布",
+            "topic_domain": "crypto",
+            "unique_authors": 1,
+            "post_count": 2,
+            "sample_refs": ["x:project:1"],
+            "sample_posts": [{"source_ref": "x:project:1", "text": "项目发布原帖"}],
+        }]
+
+        mothers = self.app_module.editorial_mother_topics(cards)
+
+        self.assertEqual([item["seed_key"] for item in mothers], [
+            "discussion:btc", "project:launch",
+        ])
+        self.assertEqual([item["source_lane"] for item in mothers], ["hot", "discovery"])
+        self.assertTrue(all("selection_hints" not in item for item in mothers))
+        self.assertNotIn("other:selected", {item["seed_key"] for item in mothers})
 
     def test_hot_topic_pool_keeps_today_plus_previous_two_days(self):
         today = "2026-08-28"
@@ -1025,9 +1077,9 @@ class AppTest(unittest.TestCase):
         self.assertNotEqual(opportunity["hook_options"], industry["hook_options"])
         self.assertNotEqual(opportunity["cta"], industry["cta"])
 
-        mothers = self.app_module.editorial_mother_topics({
-            "selected_topics": [self.mother_topic()]
-        })
+        mothers = self.app_module.editorial_mother_topics(
+            self.signal_cards([self.mother_topic()])
+        )
         valid = self.expanded_angle("discussion:btc", "explicit-structure", "opportunity")
         valid["structure_id"] = "market_trade_setup"
         invalid = self.expanded_angle("discussion:btc", "invalid-structure")
@@ -1297,7 +1349,7 @@ class AppTest(unittest.TestCase):
 
     def test_angle_expansion_rejects_duplicate_common_knowledge_and_no_conclusion(self):
         parent = self.mother_topic()
-        mothers = self.app_module.editorial_mother_topics({"selected_topics": [parent]})
+        mothers = self.app_module.editorial_mother_topics(self.signal_cards([parent]))
         accepted = self.expanded_angle("discussion:btc", "specific-angle")
         duplicate = self.expanded_angle(
             "discussion:btc", "duplicate-angle", core_claim=accepted["core_claim"],
@@ -1318,9 +1370,9 @@ class AppTest(unittest.TestCase):
         )
 
     def test_angle_expansion_rejects_unverified_numbers_but_allows_protocol_ids(self):
-        mothers = self.app_module.editorial_mother_topics({
-            "selected_topics": [self.mother_topic()]
-        })
+        mothers = self.app_module.editorial_mother_topics(
+            self.signal_cards([self.mother_topic()])
+        )
         safe = self.expanded_angle(
             "discussion:btc", "protocol-ids-angle",
             core_claim=(
@@ -1439,9 +1491,9 @@ class AppTest(unittest.TestCase):
         self.assertEqual(evaluator.await_count, 1)
 
     def test_angle_expansion_allows_explicit_zero_without_filling_lenses(self):
-        mothers = self.app_module.editorial_mother_topics({
-            "selected_topics": [self.mother_topic()]
-        })
+        mothers = self.app_module.editorial_mother_topics(
+            self.signal_cards([self.mother_topic()])
+        )
         topics, rejected = self.app_module.bounded_editorial_angles({
             "angles": [],
             "rejected_angles": [{
@@ -1481,14 +1533,14 @@ class AppTest(unittest.TestCase):
             self.app_module, "expand_editorial_angles_gemini", expansion,
         ):
             self.assertIsNone(asyncio.run(self._real_ensure_editorial_angle_expansion(
-                run_id, {"selected_topics": [parent]}, daily,
+                run_id, self.signal_cards([parent]), daily,
             )))
             response = self.client.post(
                 f"/api/context/daily-runs/{context_date}/retry-angle-expansion"
             )
             self.assertEqual(response.status_code, 200)
             topics = asyncio.run(self._real_ensure_editorial_angle_expansion(
-                run_id, {"selected_topics": [parent]}, daily,
+                run_id, self.signal_cards([parent]), daily,
             ))
         self.assertEqual([item["claim_key"] for item in topics], ["btc-valid-after-retry"])
         self.assertEqual(research.await_count, 1)
@@ -1523,7 +1575,7 @@ class AppTest(unittest.TestCase):
         async def run_two():
             return await asyncio.gather(*(
                 self._real_ensure_editorial_angle_expansion(
-                    run_id, {"selected_topics": [parent]}, daily,
+                    run_id, self.signal_cards([parent]), daily,
                 ) for _ in range(2)
             ))
 
@@ -1564,7 +1616,7 @@ class AppTest(unittest.TestCase):
             }),
         ):
             topics = asyncio.run(self._real_ensure_editorial_angle_expansion(
-                run_id, {"selected_topics": [parent]}, daily,
+                run_id, self.signal_cards([parent]), daily,
             ))
         evaluation_id = self.insert_pending_editorial_write(
             run_id, context_date, topics[0], claim_key="stale-write",
