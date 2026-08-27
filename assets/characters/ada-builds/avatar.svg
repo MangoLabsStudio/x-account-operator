@@ -2,5 +2,5 @@
   <rect width="256" height="256" rx="48" fill="#202124"/>
   <path d="M128 38l77 45v90l-77 45-77-45V83z" fill="#f59e0b"/>
   <path d="M128 62l56 33v66l-56 33-56-33V95z" fill="#3b2f1a"/>
-  <text x="128" y="145" text-anchor="middle" fill="#fef3c7" font-family="Arial, sans-serif" font-size="48" font-weight="700">AD</text>
+<text x="128" y="145" text-anchor="middle" fill="#fef3c7" font-family="Arial, sans-serif" font-size="48" font-weight="700">ADA</text>
 </svg>

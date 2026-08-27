@@ -23,6 +23,15 @@ MOTHER_POOL_PATH = Path(
         Path(__file__).resolve().parents[1] / "configs" / "content_source_accounts.json",
     )
 )
+AI_POOL_PATH = Path(
+    os.getenv(
+        "XOPS_AI_SOURCE_ACCOUNTS",
+        os.getenv(
+            "XOPS_AI_POOL_ACCOUNTS",
+            Path(__file__).resolve().parents[1] / "configs" / "ai_content_source_accounts.json",
+        ),
+    )
+)
 DEFAULT_ACCOUNTS_PATH = MOTHER_POOL_PATH
 PAGE_SIZE = 20  # existing successful first-pass used this size; preserves continuation semantics
 MAX_RETRIES = 3
@@ -49,10 +58,20 @@ def _walk(value: object):
             yield from _walk(child)
 
 
+def _pool_path(topic_domain: str, path: Path | None = None) -> Path:
+    paths = {"crypto": MOTHER_POOL_PATH, "ai": AI_POOL_PATH}
+    if topic_domain not in paths:
+        raise ValueError("topic_domain must be 'crypto' or 'ai'")
+    expected = paths[topic_domain]
+    if path is not None and path.resolve() != expected.resolve():
+        if topic_domain == "crypto":
+            raise ValueError(f"必须使用唯一总信息源母池：{MOTHER_POOL_PATH}")
+        raise ValueError(f"AI 信源池路径必须是：{AI_POOL_PATH}")
+    return expected
+
+
 def _mother_pool_path(path: Path) -> Path:
-    if path.resolve() != MOTHER_POOL_PATH.resolve():
-        raise ValueError(f"必须使用唯一总信息源母池：{MOTHER_POOL_PATH}")
-    return MOTHER_POOL_PATH
+    return _pool_path("crypto", path)
 
 
 def _legacy_author_id(user_id: str) -> str:
@@ -60,8 +79,8 @@ def _legacy_author_id(user_id: str) -> str:
     return f"anon_{hashlib.sha256(str(user_id).encode()).hexdigest()}"
 
 
-def load_accounts(accounts_path: Path = DEFAULT_ACCOUNTS_PATH) -> list[dict]:
-    accounts = json.loads(_mother_pool_path(accounts_path).read_text(encoding="utf-8"))
+def load_accounts(accounts_path: Path | None = None, *, topic_domain: str = "crypto") -> list[dict]:
+    accounts = json.loads(_pool_path(topic_domain, accounts_path).read_text(encoding="utf-8"))
     if not isinstance(accounts, list) or not accounts:
         raise ValueError("Mother pool must be a non-empty list")
     ids = set()
@@ -279,7 +298,7 @@ def _write_outputs(db: sqlite3.Connection, output_dir: Path, run_id: str, stats:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "latest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "failures.json").write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
-    lines = ["# 每日大表信息源（运行快照）", "", f"运行：{run_id}",
+    lines = ["# 每日大表信息源（运行快照）", "", f"运行：{run_id}", f"领域：{stats['topic_domain']}",
              f"时间窗：{stats['window_start']} 至 {stats['window_end']}",
              f"母池：{stats['account_universe']}｜首屏已覆盖：{stats['accounts_skipped']}｜本轮续抓成功：{stats['accounts_fetched']}｜失败：{stats['accounts_failed']}｜覆盖率：{stats['coverage_rate']:.2%}｜新增：{stats['posts_new']}｜断点复用：{stats['posts_reused']}", ""]
     if failures:
@@ -291,18 +310,19 @@ def _write_outputs(db: sqlite3.Connection, output_dir: Path, run_id: str, stats:
 
 
 def collect(
-    accounts_path: Path = DEFAULT_ACCOUNTS_PATH, db_path: Path | None = None, output_dir: Path | None = None,
+    accounts_path: Path | None = None, db_path: Path | None = None, output_dir: Path | None = None,
     *, key: str | None = None, hours: int = 30, workers: int = 8, resume_hours: int = 20,
+    topic_domain: str = "crypto",
 ) -> dict:
     if db_path is None or output_dir is None:
         raise ValueError("db_path and output_dir are required")
-    accounts = load_accounts(accounts_path)
+    accounts = load_accounts(accounts_path, topic_domain=topic_domain)
     key = key or twitter241_api_key()
     now = datetime.now(timezone.utc)
     since = now - timedelta(hours=hours)
     run_id = f"{now.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     snapshot_dir = output_dir / "runs" / run_id
-    stats = {"run_id": run_id, "account_universe": len(accounts), "accounts_fetched": 0, "accounts_skipped": 0,
+    stats = {"run_id": run_id, "topic_domain": topic_domain, "account_universe": len(accounts), "accounts_fetched": 0, "accounts_skipped": 0,
              "accounts_failed": 0, "posts_seen": 0, "posts_new": 0, "posts_reused": 0,
              "window_start": since.isoformat(), "window_end": now.isoformat()}
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -346,7 +366,7 @@ def collect(
                     pass
             pending.append((account, watermark, False))
         db.commit()
-        print(json.dumps({"source_accounts": len(accounts), "first_page_covered": stats["accounts_skipped"], "continuation_pending": len(pending)}), flush=True)
+        print(json.dumps({"topic_domain": topic_domain, "source_accounts": len(accounts), "first_page_covered": stats["accounts_skipped"], "continuation_pending": len(pending)}), flush=True)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(fetch_account, key, account, since=since, watermark=watermark, run_started_at=now, continuation_only=continuation): account for account, watermark, continuation in pending}
             for future in as_completed(futures):
@@ -386,8 +406,10 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--hours", type=int, default=30)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--accounts", type=Path)
+    parser.add_argument("--topic-domain", choices=("crypto", "ai"), default="crypto")
     args = parser.parse_args()
-    print(json.dumps(collect(db_path=args.db, output_dir=args.output, hours=args.hours, workers=args.workers), ensure_ascii=False))
+    print(json.dumps(collect(args.accounts, db_path=args.db, output_dir=args.output, hours=args.hours, workers=args.workers, topic_domain=args.topic_domain), ensure_ascii=False))
 
 
 if __name__ == "__main__":

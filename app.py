@@ -10,6 +10,7 @@ import subprocess
 import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -28,9 +29,18 @@ TZ = ZoneInfo(os.getenv("XOPS_TIMEZONE", "Asia/Shanghai"))
 DAILY_CONTEXT_ARTIFACTS = DATA_DIR / "daily_context_runs"
 DAILY_CONTEXT_SOURCE_DB = DATA_DIR / "market_source_posts.sqlite3"
 DAILY_CONTEXT_TASKS: set[asyncio.Task] = set()
+DAILY_POST_GENERATION_TASKS: dict[int, asyncio.Task] = {}
 EDITORIAL_GROK_CONTEXT_CACHE: dict[str, dict] = {}
 EDITORIAL_GROK_CONTEXT_CACHE_MAX = 64
-EDITORIAL_ANGLE_EXPANSION_REVISION = 1
+GITHUB_TRACTION_CACHE: dict[str, dict] = {}
+GITHUB_TRACTION_CACHE_MAX = 64
+EDITORIAL_PROVIDER_HEALTH: dict[str, dict] = {}
+EDITORIAL_PROVIDER_MODEL_OVERRIDES: dict[str, dict] = {}
+EDITORIAL_GEMINI_KEY_POOLS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Queue] = {}
+GEMINI_KEYCHAIN_SERVICE = "codex.xops.gemini.pool"
+GEMINI_KEYCHAIN_ACCOUNTS = ("slot-1", "slot-2", "slot-3", "slot-4", "slot-5")
+GEMINI_POOL_ENV_VARS = tuple(f"XOPS_GEMINI_API_KEY_{index}" for index in range(1, 6))
+EDITORIAL_ANGLE_EXPANSION_REVISION = 2
 EDITORIAL_ANGLE_MAX_ATTEMPTS = 3
 EDITORIAL_ANGLE_FAMILIES = {
     "opportunity": "opportunity",
@@ -42,6 +52,9 @@ EDITORIAL_ANGLE_FAMILIES = {
     "other": "editorial",
 }
 TOPIC_SELECTION_POLICY_PATH = APP_DIR / "configs" / "topic_selection_policy.json"
+EDITORIAL_CONTENT_STRUCTURES_PATH = APP_DIR / "configs" / "editorial_content_structures.json"
+EVERGREEN_TOPIC_BANK_PATH = APP_DIR / "configs" / "evergreen_editorial_topics.json"
+EDITORIAL_FALLBACK_BANK_PATH = APP_DIR / "configs" / "editorial_fallback_cards.json"
 
 AI_PERSONA_SLUGS = (
     "hegong-afterwork",
@@ -56,6 +69,19 @@ AI_PERSONA_SLUGS = (
     "wenwen-ai-industry",
 )
 
+LEGACY_AI_PERSONA_NAMES = {
+    "hegong-afterwork": "何工下班后",
+    "zhaojie-process": "赵姐看流程",
+    "linxue-model": "林同学试模型",
+    "xiaocheng-product": "小程做产品",
+    "ada-builds": "阿达在造工具",
+    "susu-multimodal": "苏苏还在改图",
+    "zhangshifu-ai": "张师傅教 AI",
+    "lianglaoban-ai": "梁老板算 AI 账",
+    "mojie-eval": "莫姐看证据",
+    "wenwen-ai-industry": "文文看行业",
+}
+
 PERSONA_META = {
     "acheng": ("阿成", "外卖员"),
     "ridehail-driver-zhao": ("赵师傅", "网约车司机"),
@@ -67,16 +93,16 @@ PERSONA_META = {
     "aye": ("野生Aye", "Meme / 注意力"),
     "xiaoman": ("小满 onchain", "生态 / 社区增长"),
     "maili": ("Milly的交易手账", "普通交易者手账"),
-    "hegong-afterwork": ("何工下班后", "AI 工程落地观察"),
-    "zhaojie-process": ("赵姐看流程", "小团队流程观察"),
-    "linxue-model": ("林同学试模型", "模型体验 / 学习观察"),
-    "xiaocheng-product": ("小程做产品", "AI 产品观察"),
-    "ada-builds": ("阿达在造工具", "独立工具观察"),
-    "susu-multimodal": ("苏苏还在改图", "多模态创作观察"),
-    "zhangshifu-ai": ("张师傅教 AI", "AI 入门 / 使用教育"),
-    "lianglaoban-ai": ("梁老板算 AI 账", "AI 商业账本"),
-    "mojie-eval": ("莫姐看证据", "模型评测 / 可靠性"),
-    "wenwen-ai-industry": ("文文看行业", "AI 产业 / 公司战略"),
+    "hegong-afterwork": ("Patch", "AI 工程落地观察"),
+    "zhaojie-process": ("小顾", "小团队流程观察"),
+    "linxue-model": ("一觉", "模型体验 / 学习观察"),
+    "xiaocheng-product": ("一川", "AI 产品观察"),
+    "ada-builds": ("Ada", "独立工具观察"),
+    "susu-multimodal": ("麦冬", "多模态创作观察"),
+    "zhangshifu-ai": ("未读", "AI 入门 / 使用教育"),
+    "lianglaoban-ai": ("老闻", "AI 商业账本"),
+    "mojie-eval": ("白盒", "模型评测 / 可靠性"),
+    "wenwen-ai-industry": ("慢变量", "AI 产业 / 公司战略"),
 }
 
 PERSONA_PUBLIC_PROFILE = {
@@ -90,16 +116,16 @@ PERSONA_PUBLIC_PROFILE = {
     "aye": {"display_name": "野生Aye", "handle": "@aye_xyz"},
     "xiaoman": {"display_name": "小满 onchain", "handle": "@xiaoman_xyz"},
     "maili": {"display_name": "Milly的交易手账", "handle": "@maili_xyz"},
-    "hegong-afterwork": {"display_name": "何工下班后", "handle": "@hegong_afterwork"},
-    "zhaojie-process": {"display_name": "赵姐看流程", "handle": "@zhaojie_process"},
-    "linxue-model": {"display_name": "林同学试模型", "handle": "@linxue_models"},
-    "xiaocheng-product": {"display_name": "小程做产品", "handle": "@xiaocheng_product"},
-    "ada-builds": {"display_name": "阿达在造工具", "handle": "@ada_builds"},
-    "susu-multimodal": {"display_name": "苏苏还在改图", "handle": "@susu_multimodal"},
-    "zhangshifu-ai": {"display_name": "张师傅教 AI", "handle": "@zhangshifu_ai"},
-    "lianglaoban-ai": {"display_name": "梁老板算 AI 账", "handle": "@lianglaoban_ai"},
-    "mojie-eval": {"display_name": "莫姐看证据", "handle": "@mojie_eval"},
-    "wenwen-ai-industry": {"display_name": "文文看行业", "handle": "@wenwen_ai"},
+    "hegong-afterwork": {"display_name": "Patch", "handle": ""},
+    "zhaojie-process": {"display_name": "小顾", "handle": ""},
+    "linxue-model": {"display_name": "一觉", "handle": ""},
+    "xiaocheng-product": {"display_name": "一川", "handle": ""},
+    "ada-builds": {"display_name": "Ada", "handle": ""},
+    "susu-multimodal": {"display_name": "麦冬", "handle": ""},
+    "zhangshifu-ai": {"display_name": "未读", "handle": ""},
+    "lianglaoban-ai": {"display_name": "老闻", "handle": ""},
+    "mojie-eval": {"display_name": "白盒", "handle": ""},
+    "wenwen-ai-industry": {"display_name": "慢变量", "handle": ""},
 }
 
 PERSONA_BIOS = {
@@ -551,7 +577,7 @@ PERSONA_OVERRIDES.update(
             },
             "content": {
                 "topic_domain": "ai",
-                "content_mix": "个人开发、功能取舍、发布、分发、用户付费和长期维护；不替何工讨论企业生产可靠性。",
+                "content_mix": "个人开发、功能取舍、发布、分发、用户付费和长期维护；不讨论企业生产可靠性。",
                 "realtime_topics": "开发者工具、模型 API、独立产品发布、分发渠道与商业化",
                 "forbidden_topics": "虚构产品进度\n虚构收入用户\n两小时致富教程",
             },
@@ -890,11 +916,18 @@ def init_db():
                 core_claim TEXT NOT NULL DEFAULT '',
                 reason_code TEXT NOT NULL DEFAULT '',
                 rationale TEXT NOT NULL DEFAULT '',
+                reader_conclusion TEXT NOT NULL DEFAULT '',
+                thesis_json TEXT NOT NULL DEFAULT '{}',
+                thesis_state TEXT NOT NULL DEFAULT 'TOPIC_READY',
+                thesis_adherence_json TEXT NOT NULL DEFAULT '{}',
+                thesis_repair_attempts INTEGER NOT NULL DEFAULT 0,
                 open_loop TEXT NOT NULL DEFAULT '',
                 candidate_id INTEGER REFERENCES post_candidates(id),
                 generation_attempts INTEGER NOT NULL DEFAULT 0,
                 next_retry_at INTEGER,
                 generation_max_attempts INTEGER NOT NULL DEFAULT 3,
+                generation_stage TEXT NOT NULL DEFAULT '',
+                generation_state TEXT NOT NULL DEFAULT '{}',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(run_id, persona_id, topic_input_hash)
@@ -924,11 +957,27 @@ def init_db():
             conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN next_retry_at INTEGER")
         if "generation_max_attempts" not in evaluation_columns:
             conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN generation_max_attempts INTEGER NOT NULL DEFAULT 3")
+        if "generation_stage" not in evaluation_columns:
+            conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN generation_stage TEXT NOT NULL DEFAULT ''")
+        if "generation_state" not in evaluation_columns:
+            conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN generation_state TEXT NOT NULL DEFAULT '{}'")
+        if "reader_conclusion" not in evaluation_columns:
+            conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN reader_conclusion TEXT NOT NULL DEFAULT ''")
+        if "thesis_json" not in evaluation_columns:
+            conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN thesis_json TEXT NOT NULL DEFAULT '{}'")
+        if "thesis_state" not in evaluation_columns:
+            conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN thesis_state TEXT NOT NULL DEFAULT 'TOPIC_READY'")
+        if "thesis_adherence_json" not in evaluation_columns:
+            conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN thesis_adherence_json TEXT NOT NULL DEFAULT '{}'")
+        if "thesis_repair_attempts" not in evaluation_columns:
+            conn.execute("ALTER TABLE persona_editorial_evaluations ADD COLUMN thesis_repair_attempts INTEGER NOT NULL DEFAULT 0")
         conn.execute("PRAGMA optimize")
     seed_personas()
     seed_project_contexts()
     seed_topic_claim_history()
     remove_retired_historical_imports()
+    with db() as conn:
+        attach_publishable_assets_to_daily_supplements(conn, shanghai_today())
 
 
 def read_text(path):
@@ -937,6 +986,230 @@ def read_text(path):
 
 def topic_selection_policy():
     return json.loads(TOPIC_SELECTION_POLICY_PATH.read_text(encoding="utf-8"))
+
+
+def evergreen_editorial_topics() -> list[dict]:
+    payload = json.loads(EVERGREEN_TOPIC_BANK_PATH.read_text(encoding="utf-8"))
+    items = payload.get("topics", []) if isinstance(payload, dict) else []
+    return [item for item in items if isinstance(item, dict) and item.get("claim_key")]
+
+
+def fallback_editorial_cards() -> list[dict]:
+    """Source-backed methodology cards used only when a daily queue has a gap."""
+    payload = json.loads(EDITORIAL_FALLBACK_BANK_PATH.read_text(encoding="utf-8"))
+    items = payload.get("cards", []) if isinstance(payload, dict) else []
+    cards = [
+        item for item in items
+        if isinstance(item, dict) and item.get("id") and item.get("topic_domain")
+    ]
+    for topic in evergreen_editorial_topics():
+        if not topic.get("eligible", True):
+            continue
+        claim_key = str(topic["claim_key"])
+        cards.append({
+            "id": f"fallback-{claim_key.replace(':', '-')}",
+            "topic_domain": str(topic.get("topic_domain") or "crypto"),
+            "title": str(topic.get("title") or claim_key),
+            "subject": str(topic.get("title") or claim_key),
+            "core_claim": str(topic.get("core_claim") or ""),
+            "specific_tension": str(topic.get("core_claim") or ""),
+            "non_obvious_delta": "这是已批准常青判断，不是当天新闻或直接引语。",
+            "source_name": "已批准常青观点卡",
+            "source_locator": claim_key,
+            "source_mode": "approved_editorial",
+            "angle_family": str(topic.get("angle_family") or "editorial"),
+            "structure_id": str(topic.get("structure_id") or "philosophy_wealth"),
+            "eligible": True,
+        })
+    return cards
+
+
+def reusable_topic_claims(conn) -> tuple[set[str], set[str]]:
+    rows = conn.execute(
+        """SELECT claim_key,core_claim FROM topic_claim_history
+           WHERE status<>'superseded' AND source<>'daily_context_run'"""
+    ).fetchall()
+    rows += conn.execute(
+        """SELECT claim_key,core_claim FROM persona_editorial_evaluations
+           WHERE status='WRITE'"""
+    ).fetchall()
+    keys = {str(row["claim_key"]).strip().lower() for row in rows if row["claim_key"]}
+    claims = {
+        normalize_editorial_claim(row["core_claim"])
+        for row in rows if normalize_editorial_claim(row["core_claim"])
+    }
+    return keys, claims
+
+
+def reusable_editorial_topics(conn, context_date: str, cards: dict, limit: int = 8) -> list[dict]:
+    """Bring back unused public angles and a small rotating evergreen candidate set."""
+    current = editorial_public_topics(cards)
+    seen_keys = {str(item.get("claim_key", "")).strip().lower() for item in current}
+    seen_claims = {
+        normalize_editorial_claim(item.get("core_claim")) for item in current
+        if normalize_editorial_claim(item.get("core_claim"))
+    }
+    claimed_keys, claimed_claims = reusable_topic_claims(conn)
+    reusable = []
+
+    def accept(topic: dict, origin: str, source_date: str = ""):
+        key = str(topic.get("claim_key", "")).strip().lower()
+        claim = normalize_editorial_claim(topic.get("core_claim"))
+        domain = str(topic.get("topic_domain") or "crypto").lower()
+        if (
+            not key or not claim or domain not in {"crypto", "ai"}
+            or str(topic.get("scope", "public")) != "public"
+            or key in seen_keys or key in claimed_keys
+            or claim in seen_claims or claim in claimed_claims
+            or len(reusable) >= limit
+        ):
+            return False
+        item = {
+            **topic,
+            "id": str(topic.get("id") or f"editorial:{origin}:{key}"),
+            "parent_seed_key": str(topic.get("parent_seed_key") or f"{origin}:{key}"),
+            "reusable_origin": origin,
+            "reusable_from_context_date": source_date,
+            "scope": "public",
+            "eligible": True,
+        }
+        reusable.append(item)
+        seen_keys.add(key)
+        seen_claims.add(claim)
+        return True
+
+    rows = conn.execute(
+        """SELECT context_date,raw_cards FROM daily_context_runs
+           WHERE status='approved' AND context_date<?
+           ORDER BY context_date DESC LIMIT 45""",
+        (context_date,),
+    ).fetchall()
+    for row in rows:
+        old_cards = json_value(row["raw_cards"], {})
+        stage = old_cards.get("editorial_angle_expansion", {})
+        for topic in stage.get("expanded_topics", []) if isinstance(stage, dict) else []:
+            if isinstance(topic, dict) and topic.get("reusable_origin") != "evergreen":
+                accept(topic, "backlog", str(row["context_date"]))
+        if len(reusable) >= limit:
+            return reusable
+
+    buckets = {"crypto": [], "ai": []}
+    for topic in evergreen_editorial_topics():
+        if not topic.get("eligible", True):
+            continue
+        domain = str(topic.get("topic_domain") or "crypto").lower()
+        if domain in buckets:
+            buckets[domain].append(topic)
+    for domain in buckets:
+        buckets[domain].sort(key=lambda item: hashlib.sha256(
+            f"{context_date}:{item.get('claim_key', '')}".encode("utf-8")
+        ).hexdigest())
+    while len(reusable) < limit and any(buckets.values()):
+        for domain in ("crypto", "ai"):
+            if buckets[domain]:
+                accept(buckets[domain].pop(0), "evergreen")
+            if len(reusable) >= limit:
+                break
+    return reusable
+
+
+def has_formal_daily_topic_pool(cards: dict) -> bool:
+    return isinstance(cards, dict) and isinstance(cards.get("domains"), dict)
+
+
+def editorial_content_structure_config():
+    return json.loads(EDITORIAL_CONTENT_STRUCTURES_PATH.read_text(encoding="utf-8"))
+
+
+EDITORIAL_CTA_MODES = {
+    "none", "optional_action", "optional_trial", "optional_question", "required_conditional",
+}
+
+
+def validate_editorial_content_structure(structure: dict) -> dict:
+    order = structure.get("section_order")
+    required = structure.get("required_sections")
+    semantic_slots = structure.get("required_semantic_slots")
+    reasoning_shapes = structure.get("allowed_reasoning_shapes")
+    cta_mode = structure.get("cta_mode")
+    if (
+        not isinstance(order, list) or not order or len(order) != len(set(order))
+        or not all(isinstance(item, str) and item for item in order)
+        or not isinstance(required, list) or not set(required).issubset(order)
+        or semantic_slots != required
+        or not isinstance(reasoning_shapes, list) or not reasoning_shapes
+        or any(not isinstance(shape, list) or set(shape) != set(semantic_slots) for shape in reasoning_shapes)
+        or not isinstance(structure.get("actionability_required"), bool)
+        or cta_mode not in EDITORIAL_CTA_MODES
+        or order[-1] != "cta"
+    ):
+        raise ValueError(f"invalid editorial content structure: {structure.get('id', '')}")
+    return structure
+
+
+def editorial_content_structure(topic: dict, thesis: dict | None = None):
+    payload = editorial_content_structure_config()
+    structures = payload["structures"]
+    structure_id = str(topic.get("structure_id", "")).strip()
+    if structure_id and structure_id not in structures:
+        raise ValueError(f"unknown editorial content structure: {structure_id}")
+    if not structure_id:
+        for field, mapping_name in (
+            ("angle_family", "angle_family_defaults"),
+            ("source_kind", "legacy_source_kind_defaults"),
+            ("content_type", "content_type_defaults"),
+        ):
+            structure_id = payload.get(mapping_name, {}).get(str(topic.get(field, "")), "")
+            if structure_id:
+                break
+    structure_id = structure_id or "news_explainer"
+    structure = validate_editorial_content_structure({
+        "revision": payload.get("revision", 1),
+        "id": structure_id,
+        **structures[structure_id],
+    })
+    if thesis is not None and thesis != dict(thesis):
+        raise ValueError("structure selection mutated thesis")
+    return structure
+
+
+def editorial_content_structure_catalog():
+    return editorial_content_structure_config()["structures"]
+
+
+def assemble_editorial_sections(result: dict, style_recipe: dict) -> tuple[str, dict]:
+    structure = validate_editorial_content_structure(style_recipe)
+    sections = result.get("sections")
+    if not isinstance(sections, dict):
+        raise RuntimeError("Gemini 未按内容结构返回 sections")
+    cleaned = {
+        key: str(sections.get(key, "")).strip()
+        for key in structure["section_order"]
+    }
+    missing = [key for key in structure["required_sections"] if not cleaned[key]]
+    if missing:
+        raise RuntimeError(f"Gemini 缺少必填内容段：{','.join(missing)}")
+    required_values = [cleaned[key] for key in structure["required_sections"]]
+    if len(required_values) != len(set(required_values)):
+        raise RuntimeError("Gemini 重复填充内容结构段")
+    cta = cleaned["cta"]
+    mode = structure["cta_mode"]
+    if mode == "none" and cta:
+        raise RuntimeError("该题材禁止 CTA")
+    if mode == "required_conditional" and (
+        not cta or not re.search(r"如果|当.+时|只要|满足|前提|确认.+后|失效.+就", cta)
+    ):
+        raise RuntimeError("该题材必须使用条件式 CTA")
+    if mode == "optional_question" and cta and not re.search(r"[？?]$", cta):
+        raise RuntimeError("该题材 CTA 必须是自然提问")
+    reasoning_shape = result.get("reasoning_shape") or structure["allowed_reasoning_shapes"][0]
+    if reasoning_shape not in structure["allowed_reasoning_shapes"]:
+        raise RuntimeError("Gemini 使用了未允许的推理结构")
+    output_shape = [*reasoning_shape]
+    if cleaned["cta"] and "cta" not in output_shape:
+        output_shape.append("cta")
+    text = "\n\n".join(cleaned[key] for key in output_shape if cleaned[key])
+    return text, cleaned
 
 
 def seed_topic_claim_history():
@@ -1114,6 +1387,28 @@ def seed_personas():
             ).fetchone()
             current = json.loads(row["draft"])
             old_student_profile = current.get("identity", {}).get("profile", "")
+            legacy_ai_name = LEGACY_AI_PERSONA_NAMES.get(slug)
+            current_identity = current.get("identity", {})
+            current_profile = current_identity.get("profile", "")
+            if legacy_ai_name and (
+                row["name"] == legacy_ai_name
+                or current_identity.get("name") == legacy_ai_name
+                or legacy_ai_name in current_profile
+            ):
+                current_identity["name"] = draft["identity"]["name"]
+                if isinstance(current_profile, str):
+                    current_identity["profile"] = current_profile.replace(
+                        legacy_ai_name, draft["identity"]["name"]
+                    )
+                conn.execute(
+                    "UPDATE personas SET name=?,draft=?,updated_at=? WHERE slug=?",
+                    (
+                        draft["identity"]["name"],
+                        json.dumps(current, ensure_ascii=False),
+                        int(time.time()),
+                        slug,
+                    ),
+                )
             if slug == "college-student-linjia" and row["name"] != draft["identity"]["name"]:
                 current["identity"]["name"] = draft["identity"]["name"]
                 conn.execute(
@@ -1221,6 +1516,11 @@ class PersonaDraftIn(BaseModel):
 class PostGenerationIn(BaseModel):
     context_pack_id: int | None = None
     facts: str | None = Field(default=None, max_length=8000)
+
+
+class CandidateRewriteIn(BaseModel):
+    feedback_code: str = Field(min_length=1, max_length=40)
+    note: str = Field(default="", max_length=500)
 
 
 class ProjectContextIn(BaseModel):
@@ -1772,8 +2072,15 @@ def daily_context_paths(context_date: str):
                 APP_DIR / "configs" / "content_source_accounts.json",
             )
         ),
+        "ai_accounts": Path(
+            os.getenv(
+                "XOPS_AI_SOURCE_ACCOUNTS",
+                APP_DIR / "configs" / "ai_content_source_accounts.json",
+            )
+        ),
         "source_db": DAILY_CONTEXT_SOURCE_DB,
         "output": root / "cards",
+        "ai_output": root / "ai_cards",
     }
 
 
@@ -1782,6 +2089,51 @@ def read_card_file(path: Path, key: str):
         return []
     data = json.loads(path.read_text(encoding="utf-8"))
     return data.get(key, []) if isinstance(data, dict) and isinstance(data.get(key), list) else []
+
+
+def with_topic_domain(items: list[dict], topic_domain: str) -> list[dict]:
+    return [
+        {**item, "topic_domain": topic_domain}
+        for item in items
+        if isinstance(item, dict)
+    ]
+
+
+def combine_domain_syntheses(syntheses: dict[str, dict]) -> dict:
+    labels = {"crypto": "Crypto", "ai": "AI"}
+
+    def joined(field: str) -> str:
+        return "\n".join(
+            f"{labels.get(domain, domain)}：{synthesis.get(field, '')}"
+            for domain, synthesis in syntheses.items()
+            if str(synthesis.get(field, "")).strip()
+        )
+
+    sources = []
+    seen_sources = set()
+    for synthesis in syntheses.values():
+        for source in synthesis.get("sources", []):
+            signature = json.dumps(source, ensure_ascii=False, sort_keys=True)
+            if signature not in seen_sources:
+                seen_sources.add(signature)
+                sources.append(source)
+    return {
+        "market_state": joined("market_state"),
+        "event_clusters": joined("event_clusters"),
+        "debates": joined("debates"),
+        "evidence": joined("evidence"),
+        "unknowns": joined("unknowns"),
+        "sources": sources,
+        "selected_topics": [
+            item for synthesis in syntheses.values()
+            for item in synthesis.get("selected_topics", []) if isinstance(item, dict)
+        ],
+        "rejected_topics": [
+            item for synthesis in syntheses.values()
+            for item in synthesis.get("rejected_topics", []) if isinstance(item, dict)
+        ],
+        "domains": syntheses,
+    }
 
 
 def normalize_topic(value) -> str:
@@ -1882,6 +2234,10 @@ def controlled_cards(
                 "research_brief",
                 "priority",
                 "eligible",
+                "topic_domain",
+                "parent",
+                "mechanism",
+                "tags",
             )
             if key in card
         }
@@ -1956,27 +2312,168 @@ def llm_api_key():
     raise HTTPException(503, "未配置 Post 生成模型")
 
 
+@lru_cache(maxsize=8)
+def _cached_gemini_api_keys(accounts_value: str, env_key: str, env_pool: tuple[str, ...]):
+    if env_pool:
+        return tuple(dict.fromkeys(env_pool))
+    if not accounts_value and env_key:
+        return (env_key,)
+    accounts = (
+        [item.strip() for item in accounts_value.split(",") if item.strip()]
+        if accounts_value else list(GEMINI_KEYCHAIN_ACCOUNTS)
+    )
+    keys = []
+    for account in accounts:
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-s", GEMINI_KEYCHAIN_SERVICE,
+                 "-a", account, "-w"],
+                capture_output=True, text=True,
+            )
+        except OSError:
+            break
+        key = result.stdout.strip() if result.returncode == 0 else ""
+        if key and key not in keys:
+            keys.append(key)
+    if keys:
+        return tuple(keys)
+    if env_key:
+        return (env_key,)
+    raise RuntimeError("未配置 GEMINI 正式编辑模型")
+
+
+def gemini_api_keys():
+    env_pool = tuple(
+        value for name in GEMINI_POOL_ENV_VARS
+        if (value := os.getenv(name, "").strip())
+    )
+    return list(_cached_gemini_api_keys(
+        os.getenv("XOPS_GEMINI_KEYCHAIN_ACCOUNTS", "").strip(),
+        os.getenv("XOPS_GEMINI_API_KEY", "").strip(),
+        env_pool,
+    ))
+
+
+def configured_gemini_pool_size():
+    env_pool = {
+        os.getenv(name, "").strip() for name in GEMINI_POOL_ENV_VARS
+        if os.getenv(name, "").strip()
+    }
+    if env_pool:
+        return len(env_pool)
+    return 1 if os.getenv("XOPS_GEMINI_API_KEY", "").strip() else 0
+
+
+@asynccontextmanager
+async def gemini_request_key(config: dict):
+    pool_id = (asyncio.get_running_loop(), config["signature"])
+    queue = EDITORIAL_GEMINI_KEY_POOLS.get(pool_id)
+    if queue is None:
+        queue = asyncio.Queue(maxsize=len(config["keys"]))
+        for key in config["keys"]:
+            queue.put_nowait(key)
+        EDITORIAL_GEMINI_KEY_POOLS[pool_id] = queue
+    key = await queue.get()
+    try:
+        yield key
+    finally:
+        queue.put_nowait(key)
+
+
 def editorial_provider_config(provider: str):
     """Formal candidate writing has dedicated providers; never fall back to XOPS_LLM."""
-    prefix = f"XOPS_{provider.upper()}"
-    key = os.getenv(f"{prefix}_API_KEY", "").strip()
-    if not key:
+    provider = provider.upper()
+    prefix = f"XOPS_{provider}"
+    keys = gemini_api_keys() if provider == "GEMINI" else []
+    key = os.getenv(f"{prefix}_API_KEY", "").strip() if provider != "GEMINI" else ""
+    if provider != "GEMINI" and not key:
         raise RuntimeError(f"未配置 {provider} 正式编辑模型")
     defaults = {
         "GROK": ("https://www.micuapi.ai/v1", "grok-4.6"),
         "GEMINI": ("https://www.micuapi.ai/v1", "gemini-3.1-pro-preview-low"),
     }
-    base_url, model = defaults[provider.upper()]
+    base_url, model = defaults[provider]
+    base_url = os.getenv(f"{prefix}_BASE_URL", base_url).rstrip("/")
+    configured_model = os.getenv(f"{prefix}_MODEL", model)
+    credential_signature = hashlib.sha256(
+        "\0".join(keys or [key]).encode("utf-8")
+    ).hexdigest()
+    signature = hashlib.sha256(
+        f"{base_url}\0{configured_model}\0{credential_signature}".encode("utf-8")
+    ).hexdigest()
+    override = EDITORIAL_PROVIDER_MODEL_OVERRIDES.get(provider, {})
     return {
-        "key": key,
-        "base_url": os.getenv(f"{prefix}_BASE_URL", base_url).rstrip("/"),
-        "model": os.getenv(f"{prefix}_MODEL", model),
+        **({"keys": keys} if provider == "GEMINI" else {"key": key}),
+        "base_url": base_url,
+        "model": override.get("model") if override.get("signature") == signature else configured_model,
+        "configured_model": configured_model,
+        "signature": signature,
     }
 
 
+async def ensure_editorial_provider_ready(provider: str):
+    provider = provider.upper()
+    config = editorial_provider_config(provider)
+    cached = EDITORIAL_PROVIDER_HEALTH.get(provider, {})
+    if cached.get("signature") == config["signature"] and cached.get("checked_at", 0) > time.time() - 300:
+        return editorial_provider_config(provider)
+    candidates = [config["configured_model"]]
+    if provider == "GEMINI":
+        fallback = os.getenv("XOPS_GEMINI_FALLBACK_MODEL", "gemini-3.1-pro-preview-low").strip()
+        if fallback and fallback not in candidates:
+            candidates.append(fallback)
+    statuses = []
+    async with httpx.AsyncClient(timeout=45) as client:
+        for model in candidates:
+            try:
+                if provider == "GROK":
+                    response = await client.post(
+                        config["base_url"] + "/responses",
+                        headers={
+                            "Authorization": f"Bearer {config['key']}",
+                            "Content-Type": "application/json",
+                            "User-Agent": "Mozilla/5.0",
+                        },
+                        json={"model": model, "input": "只回复 OK", "max_output_tokens": 16},
+                    )
+                else:
+                    async with gemini_request_key(config) as key:
+                        response = await client.post(
+                            config["base_url"] + "/chat/completions",
+                            headers={
+                                "Authorization": f"Bearer {key}",
+                                "Content-Type": "application/json",
+                                "User-Agent": "Mozilla/5.0",
+                            },
+                            json={
+                                "model": model,
+                                "messages": [{"role": "user", "content": "只回复 OK"}],
+                                "max_tokens": 16,
+                            },
+                        )
+                statuses.append(f"{model}:{response.status_code}")
+                if response.is_success:
+                    EDITORIAL_PROVIDER_MODEL_OVERRIDES[provider] = {
+                        "signature": config["signature"], "model": model,
+                    }
+                    EDITORIAL_PROVIDER_HEALTH[provider] = {
+                        "signature": config["signature"], "checked_at": int(time.time()),
+                    }
+                    return editorial_provider_config(provider)
+            except httpx.HTTPError as error:
+                statuses.append(f"{model}:{type(error).__name__}")
+    raise RuntimeError(f"{provider} 模型健康检查失败（{'，'.join(statuses)}）")
+
+
+async def ensure_editorial_providers_ready(providers=("GROK", "GEMINI")):
+    await asyncio.gather(*(ensure_editorial_provider_ready(provider) for provider in providers))
+
+
 async def synthesize_daily_cards(context_date: str, cards: dict):
+    topic_domain = str(cards.get("topic_domain") or "crypto").lower()
+    domain_label = "AI 行业" if topic_domain == "ai" else "Crypto 市场"
     prompt = (
-        "你是 Crypto 市场研究编辑。以下是经过筛选的事实候选卡、观点候选卡和覆盖统计。"
+        f"你是{domain_label}研究编辑。以下是经过筛选的事实候选卡、观点候选卡和覆盖统计。"
         "只依据这些卡片生成当天市场理解，所有字段必须使用中文，输出 JSON 对象。\n"
         "字段必须是 market_state,event_clusters,debates,evidence,unknowns,sources,selected_topics,rejected_topics。\n"
         "discussion_topics 是实体与具体机制共同出现的可写议题，按讨论热度排序，是内容选题的主轴；"
@@ -1989,7 +2486,7 @@ async def synthesize_daily_cards(context_date: str, cards: dict):
         "审批后还会先经过 Grok 实时研究与 Gemini 多角度展开，因此不要为了预填所有表达方向而制造常识题。"
         "评论题可以复用当天事件背景，但必须有鲜明立场和非显而易见的表达。"
         "圈内读者不需要当天材料也能回答的常识题必须拒绝。按 slate_guidance 形成足够丰富但不凑数的题单。\n"
-        "selected_topics 每项必须包含 claim_key,subject,title,core_claim,content_type,kind,source_topic_keys,"
+        "selected_topics 每项必须包含 claim_key,subject,title,core_claim,content_type,kind,source_topic_keys,topic_domain,"
         "fact_basis,opinion_basis,material_delta,audience_value,why_now,persona_fit。"
         "content_type 只能是 opportunity、editorial、research；source_topic_keys 必须来自 discussion_topics，或使用输入卡片的 opinion:<source_ref> / fact:<source_ref>。"
         "editorial 还可以从 content_inspiration 自由取材，并使用 evergreen:<key>；这些只是灵感，不是固定栏目、配额或轮换表。"
@@ -2005,6 +2502,7 @@ async def synthesize_daily_cards(context_date: str, cards: dict):
         "事实候选卡不是最终事实：evidence 只保留卡片里可追溯的多源线索；"
         "观点候选卡只能用于提炼市场分歧，不能伪装为事实，也不得复述原作者个人交易、持仓或生活经历。"
         "覆盖不足必须写入 unknowns。sources 只列卡片已有的来源线索。\n\n"
+        f"本轮内容域：{topic_domain}；topic_domain 必须原样填写为 {topic_domain}。\n"
         f"日期：{context_date}\n受控卡片：\n{json.dumps(cards, ensure_ascii=False)}"
     )
     async with httpx.AsyncClient(timeout=90) as client:
@@ -2031,8 +2529,14 @@ def chinese_synthesis_text(value, fallback: str):
 
 
 def bounded_selected_topics(result: dict, cards: dict):
+    default_domain = str(cards.get("topic_domain") or "crypto").lower()
     source_topics = {
         str(item.get("key")): str(item.get("title") or item.get("key"))
+        for item in cards.get("discussion_topics", [])
+        if isinstance(item, dict) and item.get("key")
+    }
+    source_domains = {
+        str(item.get("key")): str(item.get("topic_domain") or default_domain).lower()
         for item in cards.get("discussion_topics", [])
         if isinstance(item, dict) and item.get("key")
     }
@@ -2053,20 +2557,26 @@ def bounded_selected_topics(result: dict, cards: dict):
         source_refs[str(item["key"])] = refs
     for item in cards.get("opinion_cards", []):
         if isinstance(item, dict) and item.get("source_ref"):
-            source_topics[f"opinion:{item['source_ref']}"] = "母池高质量观点"
-            source_refs[f"opinion:{item['source_ref']}"] = {str(item["source_ref"])}
+            key = f"opinion:{item['source_ref']}"
+            source_topics[key] = "母池高质量观点"
+            source_refs[key] = {str(item["source_ref"])}
+            source_domains[key] = str(item.get("topic_domain") or default_domain).lower()
     for item in cards.get("fact_cards", []):
         if not isinstance(item, dict):
             continue
         source_ref = item.get("source_ref") or item.get("representative_source_ref")
         if source_ref:
-            source_topics[f"fact:{source_ref}"] = "母池事实候选"
-            source_refs[f"fact:{source_ref}"] = {str(source_ref)}
+            key = f"fact:{source_ref}"
+            source_topics[key] = "母池事实候选"
+            source_refs[key] = {str(source_ref)}
+            source_domains[key] = str(item.get("topic_domain") or default_domain).lower()
     policy = cards.get("topic_selection_policy", {})
     if isinstance(policy, dict):
         for item in policy.get("evergreen_inspirations", []):
             if isinstance(item, dict) and item.get("key"):
-                source_topics[f"evergreen:{item['key']}"] = str(item.get("label") or "长期灵感")
+                key = f"evergreen:{item['key']}"
+                source_topics[key] = str(item.get("label") or "长期灵感")
+                source_domains[key] = default_domain
     source_keys = set(source_topics)
     history_keys = {
         str(item.get("claim_key"))
@@ -2085,6 +2595,10 @@ def bounded_selected_topics(result: dict, cards: dict):
         required = ("claim_key", "subject", "title", "core_claim", "material_delta", "audience_value")
         if not keys or any(not str(item.get(key, "")).strip() for key in required):
             continue
+        domains = {source_domains.get(key, default_domain) for key in keys}
+        if len(domains) != 1:
+            continue
+        topic_domain = domains.pop()
         if item["claim_key"] in history_keys:
             rejected.append(
                 {
@@ -2103,6 +2617,7 @@ def bounded_selected_topics(result: dict, cards: dict):
             {
                 **item,
                 "id": f"{content_type}:screened:{item['claim_key']}",
+                "topic_domain": topic_domain,
                 "source_topic_keys": keys,
                 # Model-owned topic keys identify the discussion. Exact source refs
                 # are derived from that discussion's captured samples only, so a
@@ -2328,6 +2843,89 @@ def daily_post_persona_slugs():
     return list(dict.fromkeys(slug.strip() for slug in value.split(",") if slug.strip()))
 
 
+def daily_persona_draft_target() -> int:
+    try:
+        return min(5, max(0, int(os.getenv("XOPS_DAILY_POST_TARGET_PER_PERSONA", "3"))))
+    except ValueError:
+        return 3
+
+
+def daily_supplement_cooldown_days() -> int:
+    try:
+        return min(90, max(7, int(os.getenv("XOPS_DAILY_SUPPLEMENT_COOLDOWN_DAYS", "7"))))
+    except ValueError:
+        return 7
+
+
+DAILY_SUPPLEMENT_LENSES = {
+    "acheng": ("小钱和时间", "先把能承受的错误成本写清楚，比替自己找一个更热闹的理由重要。"),
+    "ridehail-driver-zhao": ("反复等待信号", "规则能不能执行，比判断看起来多聪明更重要。"),
+    "college-student-linjia": ("刚开始学习", "最危险的不是听不懂，而是刚听懂一个词就急着把它当结论。"),
+    "atuo": ("增长和注意力", "注意力带来的速度和价值留下来的时间，要分开算。"),
+    "axu": ("市场结构", "先看谁被迫交易、谁能持续买入，再听最顺的故事。"),
+    "nanqiao": ("产品和价值回流", "把产品、激励和资产绑成一个词，往往会漏掉真正的付费闭环。"),
+    "qiliang": ("赔率与失效", "赔率再好，也要知道错了会错在哪里；没有失效点的爆发力只是故事。"),
+    "aye": ("注意力和流动性", "注意力能启动流动性，却不能自动替流动性续命。"),
+    "xiaoman": ("社区留存", "社区热闹不是护城河，能反复让新人留下来的机制才算。"),
+    "maili": ("交易复盘", "复盘的价值不是把今天说得通，而是让明天少重复一次同样的冲动。"),
+    "hegong-afterwork": ("流程接管", "流程是不是真的变短，要看异常出现时谁接管，不是看 Demo 多流畅。"),
+    "zhaojie-process": ("小团队协作", "真正该省的是交接成本，不是把每一步都交给 AI。"),
+    "linxue-model": ("普通用户体验", "模型更强不如一次少一点不确定性。"),
+    "xiaocheng-product": ("产品留存", "产品变好不是功能更多，而是用户下周还愿不愿回来。"),
+    "ada-builds": ("独立开发", "最贵的不是做不出来，而是把维护成本藏在第一版里。"),
+    "susu-multimodal": ("创作交付", "好看不是终点，能改、能对齐、能交付才算。"),
+    "zhangshifu-ai": ("学习路径", "学会一个可重复的工作流，比收藏一百个工具更有用。"),
+    "lianglaoban-ai": ("经营账", "AI 的账不能只看模型成本，还要看返工、交接和错误由谁承担。"),
+    "mojie-eval": ("证据边界", "能复现的输出才是可用结果，偶尔惊艳不等于可靠。"),
+    "wenwen-ai-industry": ("行业结构", "行业变化的价值不在发布会当晚，而在它会不会改掉一条长期成本曲线。"),
+}
+
+
+def daily_persona_supplement_topics(persona: dict, context_date: str) -> list[dict]:
+    """Build a stable, persona-scoped fallback slate without inventing a quote or experience."""
+    draft = json_value(persona.get("draft"), {})
+    topic_domain = str(draft.get("content", {}).get("topic_domain") or "crypto").lower()
+    slug = str(persona.get("slug") or "persona").lower()
+    lens, takeaway = DAILY_SUPPLEMENT_LENSES.get(
+        slug, (str(persona.get("name") or "这个人设"), "把判断落到自己真正关心的取舍上。")
+    )
+    cards = [
+        card for card in fallback_editorial_cards()
+        if card.get("eligible", True) and str(card.get("topic_domain") or "crypto").lower() == topic_domain
+    ]
+    cards.sort(key=lambda card: hashlib.sha256(
+        f"{context_date}:{slug}:{card['id']}".encode("utf-8")
+    ).hexdigest())
+    topics = []
+    for card in cards:
+        source_id = str(card["id"])
+        topic = {
+            **card,
+            "claim_key": f"daily-supplement:{context_date}:{slug}:{source_id}",
+            "parent_seed_key": f"daily-supplement:{source_id}",
+            "subject": str(card.get("subject") or card.get("title") or source_id),
+            "title": f"{str(card.get('title') or source_id)}｜{lens}",
+            "core_claim": f"{str(card.get('core_claim') or '').strip()} {takeaway}".strip(),
+            "specific_tension": f"{str(card.get('specific_tension') or '').strip()} {lens}最容易被忽略。".strip(),
+            "non_obvious_delta": f"{str(card.get('non_obvious_delta') or '').strip()} {takeaway}".strip(),
+            "why_worth_saying": f"不是复读名人语录，而是把一条公开方法论落到{lens}这个具体取舍。",
+            "why_now": "当天热点不足时，用可审计的方法论补足可表达的独立判断。",
+            "topic_domain": topic_domain,
+            "scope": "persona",
+            "source_kind": "daily_supplement",
+            "source_id": source_id,
+            "source_refs": [str(card.get("source_url") or "")] if card.get("source_url") else [],
+            "source_topic_keys": [f"daily-supplement:{source_id}"],
+            "fact_basis": [],
+            "opinion_basis": [str(card.get("core_claim") or ""), takeaway],
+            "first_person_allowed": False,
+            "eligible": True,
+        }
+        structure = editorial_content_structure(topic)
+        topics.append({**topic, "structure_id": structure["id"], "style_recipe": structure})
+    return topics
+
+
 def persona_editorial_enabled():
     return os.getenv("XOPS_DAILY_POST_ENABLED", "false").lower() == "true"
 
@@ -2476,6 +3074,9 @@ def normalize_persona_editorial_context(value: dict):
                     "quote": editorial_text(item, "quote") if item.get("quote_allowed") else "",
                     "asset_ids": asset_ids,
                 }
+            structure_id = editorial_text(item, "structure_id", 80)
+            if structure_id:
+                normalized["structure_id"] = structure_id
             result[kind].append(normalized)
     assets = value.get("available_asset_ids", [])
     if not isinstance(assets, list):
@@ -2488,6 +3089,7 @@ def normalize_persona_editorial_context(value: dict):
 
 def validate_persona_editorial_context_input(value: dict, valid_asset_ids: set[str]):
     allowed_statuses = {"context", "open", "ready", "draft", "expressed", "archived"}
+    structure_ids = set(editorial_content_structure_config()["structures"])
     if len(json.dumps(value, ensure_ascii=False)) > 100000:
         raise HTTPException(422, "editorial context is too large")
     selected = value.get("available_asset_ids", [])
@@ -2511,6 +3113,9 @@ def validate_persona_editorial_context_input(value: dict, valid_asset_ids: set[s
                 raise HTTPException(422, f"duplicate {kind} id: {item_id}")
             ids.add(item_id)
             if isinstance(item, dict):
+                structure_id = str(item.get("structure_id", "") or "").strip()
+                if structure_id and structure_id not in structure_ids:
+                    raise HTTPException(422, f"{kind}.structure_id is invalid")
                 status = str(item.get("status", "") or "")
                 if status and status not in allowed_statuses:
                     raise HTTPException(422, f"{kind}.status is invalid")
@@ -2602,7 +3207,7 @@ def build_persona_private_topics(editorial_context: dict):
             or f"{kind}:{item['id']}" in expressed
         ):
             return
-        topics.append({
+        topic = {
             "claim_key": f"private:{kind}:{item['id']}",
             "subject": title[:160],
             "title": title[:300],
@@ -2614,7 +3219,10 @@ def build_persona_private_topics(editorial_context: dict):
             "source_refs": [f"{kind}:{item['id']}"],
             "asset_ids": [asset_id for asset_id in item.get("asset_ids", []) if asset_id in selected_assets],
             **extra,
-        })
+        }
+        if item.get("structure_id"):
+            topic["structure_id"] = item["structure_id"]
+        topics.append(topic)
 
     for item in editorial_context.get("life_context", []):
         add(
@@ -2658,7 +3266,19 @@ def persona_editorial_topics(persona: dict, public_topics: list[dict], editorial
         {**topic, "topic_domain": topic_domain}
         for topic in build_persona_private_topics(editorial_context)
     ]
-    return matched_public + private_topics
+    result = []
+    for topic in matched_public + private_topics:
+        structure = editorial_content_structure(topic)
+        result.append({**topic, "structure_id": structure["id"], "style_recipe": structure})
+    return result
+
+
+def persona_editorial_input_topics(persona: dict, public_topics: list[dict], editorial_context: dict,
+                                  context_date: str, topic: dict | None = None) -> list[dict]:
+    topics = persona_editorial_topics(persona, public_topics, editorial_context)
+    if str((topic or {}).get("source_kind") or "") == "daily_supplement":
+        topics += daily_persona_supplement_topics(persona, context_date)
+    return topics
 
 
 def editorial_domain_label(topic_domain: str):
@@ -2672,14 +3292,33 @@ def editorial_topics_domain_label(topics: list[dict]):
 
 def editorial_persona_card(persona: dict):
     draft = json_value(persona.get("draft"), {})
-    content = dict(draft.get("content", {}))
-    for key in ("posts_per_day", "posting_windows", "content_mix"):
-        content.pop(key, None)
+    identity_source = draft.get("identity", {})
+    voice_source = draft.get("voice", {})
+    content_source = draft.get("content", {})
+    identity = {
+        key: identity_source[key] for key in (
+            "name", "role", "bio", "soul", "knowledge_boundary", "market_cognition",
+        ) if identity_source.get(key)
+    }
+    voice = {
+        key: voice_source[key] for key in (
+            "first_person", "emoji", "spoken_particles", "lexical_field",
+            "forbidden_phrases", "anti_patterns", "evidence_rules",
+        ) if voice_source.get(key)
+    }
+    tone = str(voice_source.get("tone", "")).split("，", 1)[0].strip()
+    if tone:
+        voice["tone"] = tone
+    content = {
+        key: content_source[key] for key in (
+            "topic_domain", "realtime_topics", "forbidden_topics",
+        ) if content_source.get(key)
+    }
     return {
-        "identity": draft.get("identity", {}),
-        "voice": draft.get("voice", {}),
+        "identity": identity,
+        "voice": voice,
         "content": content,
-        "examples": draft.get("examples", {}),
+        "thesis_profile": persona_thesis_profile(str(persona.get("slug", ""))),
     }
 
 
@@ -2751,7 +3390,214 @@ def editorial_score(item: dict):
 
 
 EDITORIAL_CLAIM_KEY = re.compile(r"^[a-z0-9][a-z0-9:_-]{2,119}$")
-EDITORIAL_EVALUATOR_REVISION = 3
+EDITORIAL_EVALUATOR_REVISION = 5
+THESIS_CONTRACT_VERSION = "thesis_contract_v1"
+THESIS_TYPES = {
+    "ASSERTION", "INTERPRETATION", "OBSERVATION", "DECISION", "PREDICTION",
+    "COMPARISON", "EXPLANATION", "QUESTION", "STORY_POINT", "HUMOR_PREMISE",
+}
+THESIS_STATES = {
+    "TOPIC_READY", "THESIS_RESOLVING", "THESIS_WRITE", "THESIS_HOLD", "THESIS_IGNORED",
+    "THESIS_DEDUP_PENDING", "THESIS_APPROVED", "STRUCTURE_READY", "DRAFT_GENERATING",
+    "DRAFT_READY", "THESIS_ADHERENCE_FAILED", "REPAIR_PENDING", "EDITORIAL_REVIEW",
+    "CANDIDATE_READY",
+}
+THESIS_REASON_CODES = {
+    "TOPIC_TOO_BROAD", "SUBJECT_UNDEFINED", "CLAIM_UNDEFINED", "CLAIM_SCOPE_UNDEFINED",
+    "PERSONA_TOPIC_MISMATCH", "NO_PERSONA_LENS", "PERSONA_LENS_INVALID",
+    "INSUFFICIENT_CONTEXT", "INSUFFICIENT_EVIDENCE", "UNSUPPORTED_FACTUAL_PREMISE",
+    "MULTIPLE_PRIMARY_CLAIMS", "INFORMATION_DELTA_ZERO", "READER_PAYOFF_UNDEFINED",
+    "RECENT_PERSONA_THESIS_COLLISION", "CROSS_PERSONA_THESIS_COLLISION",
+    "DUPLICATED_BY_STRONGER_PERSONA", "NO_DISTINCT_THESIS", "THESIS_DRIFT", "OFF_THESIS",
+    "SECONDARY_THESIS_INTRODUCED", "UNSUPPORTED_NEW_CLAIM",
+}
+THESIS_ADHERENCE_CLASSES = {
+    "SUPPORTS_THESIS", "NECESSARY_CONTEXT", "QUALIFIES_THESIS", "CONSTRAINS_THESIS",
+    "RESTATEMENT", "TANGENT", "UNSUPPORTED_NEW_CLAIM",
+}
+THESIS_HARD_ADHERENCE_FAILURES = {
+    "UNSUPPORTED_NEW_CLAIM", "SECONDARY_THESIS_INTRODUCED", "THESIS_DRIFT", "OFF_THESIS",
+}
+
+PERSONA_THESIS_PROFILES = {
+    "acheng": (["ordinary_user_cost", "small_budget_execution", "time_tradeoff"], ["institutional_authority", "insider_access"], "先问普通人花多少时间和钱，再决定值不值得做。"),
+    "ridehail-driver-zhao": (["downside_first", "real_world_tradeoff", "durability"], ["insider_access", "technical_supremacy"], "先看失败时谁承担成本，再判断这件事是否稳。"),
+    "college-student-linjia": (["beginner_learning", "low_cost_trial", "clarity"], ["expert_authority", "large_capital_execution"], "把门槛拆到新手能验证的一步。"),
+    "atuo": (["growth_incentive", "execution_window", "token_mechanics"], ["insider_access", "guaranteed_return"], "判断增长动作能否换来留存，而不只换来一次流量。"),
+    "axu": (["market_structure", "liquidity", "positioning"], ["insider_access", "moral_judgment"], "从结构和可证伪信号纠正情绪叙事。"),
+    "nanqiao": (["product_utility", "user_friction", "commercialization"], ["insider_access", "pure_price_call"], "先看产品是否真的少一步，再谈叙事。"),
+    "qiliang": (["asymmetric_payoff", "catalyst", "invalidation"], ["guaranteed_return", "insider_access"], "先写清赔率和失效条件，再谈方向。"),
+    "aye": (["attention_liquidity", "meme_dynamics", "community_behavior"], ["private_motive", "guaranteed_return"], "研究注意力怎样变成流动性，而不是替热度背书。"),
+    "xiaoman": (["ecosystem_retention", "community_growth", "incentive_quality"], ["one_day_hype", "insider_access"], "看激励之后是否留下真实用户和行为。"),
+    "maili": (["trader_psychology", "decision_process", "mistake_review"], ["guru_authority", "guaranteed_return"], "把判断落到一个普通交易者能复盘的选择。"),
+    "hegong-afterwork": (["workflow_reduction", "engineering_reliability", "handoff_cost"], ["marketing_claim", "executive_authority"], "只看真实流程少了哪一步，以及哪里会崩。"),
+    "zhaojie-process": (["workflow_owner", "exception_handling", "small_team_adoption"], ["technical_supremacy", "marketing_claim"], "先问谁使用、谁审核、异常谁接手。"),
+    "linxue-model": (["model_experience", "learning_curve", "failure_mode"], ["benchmark_authority", "marketing_claim"], "像同学一样试模型，明确哪里靠谱、哪里会胡说。"),
+    "xiaocheng-product": (["user_retention", "product_tradeoff", "willingness_to_pay"], ["parameter_ranking", "marketing_claim"], "参数让位于下周还用不用和谁愿意付钱。"),
+    "ada-builds": (["builder_utility", "prototype_speed", "breakpoint"], ["enterprise_authority", "marketing_claim"], "先看能做成什么小工具，再找它会在哪儿崩。"),
+    "susu-multimodal": (["creative_control", "editability", "delivery_consistency"], ["benchmark_authority", "marketing_claim"], "漂亮不是终点，可改、统一、交付才是价值。"),
+    "zhangshifu-ai": (["beginner_use", "teaching_clarity", "repeatable_habit"], ["expert_gatekeeping", "marketing_claim"], "让普通人借走一个能重复使用的动作。"),
+    "lianglaoban-ai": (["unit_economics", "payback", "organizational_cost"], ["marketing_claim", "technical_supremacy"], "强功能也要过成本、毛利和回本周期这本账。"),
+    "mojie-eval": (["evidence_quality", "failure_rate", "reproducibility"], ["marketing_claim", "leaderboard_only"], "先问样本、失败率和复现，再听模型自我介绍。"),
+    "wenwen-ai-industry": (["industry_structure", "capital_allocation", "distribution_power"], ["insider_access", "short_term_price_call"], "从产品动作追到钱、人和分发如何重新分配。"),
+}
+
+THESIS_AMBIGUOUS_PHRASES = (
+    "可能", "也许", "值得关注", "继续观察", "要看后续", "各有利弊", "见仁见智", "不确定",
+    "可以关注", "值得一试", "需要观察", "等待更多信息",
+)
+THESIS_GENERIC_CLAIMS = {
+    normalize_editorial_claim(value) for value in (
+        "投资有风险", "风险和收益并存", "不要盲目跟风", "需要独立思考", "耐心很重要",
+        "控制仓位很重要", "做好自己的研究", "机会和风险并存",
+    )
+}
+
+
+def persona_thesis_profile(slug: str) -> dict:
+    allowed, disallowed, instinct = PERSONA_THESIS_PROFILES.get(
+        slug, (["general_analysis"], ["insider_access"], "只表达有证据边界的独立判断。")
+    )
+    return {
+        "allowed_lenses": allowed,
+        "disallowed_lenses": disallowed,
+        "editorial_instincts": [instinct],
+    }
+
+
+def thesis_contract_id(contract: dict) -> str:
+    semantic = {
+        key: contract.get(key) for key in (
+            "topic_id", "persona_id", "thesis_type", "claim_nature", "primary_subject", "relation",
+            "primary_claim", "scope", "persona_lens_id", "reader_payoff", "source_delta",
+        )
+    }
+    encoded = json.dumps(semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "thesis:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+
+
+def legacy_persona_thesis_contract(topic: dict, decision: dict) -> dict:
+    """Readable migration adapter for evaluations created before thesis_contract_v1."""
+    claim = str(decision.get("core_claim", "")).strip()
+    subject = str(topic.get("subject") or topic.get("title") or topic.get("claim_key") or "").strip()
+    lens = persona_thesis_profile(str(decision.get("persona_slug") or decision.get("slug") or ""))["allowed_lenses"][0]
+    contract = {
+        "contract_version": THESIS_CONTRACT_VERSION,
+        "topic_id": str(topic.get("claim_key", "")).strip(),
+        "persona_id": str(decision.get("persona_slug") or decision.get("slug") or decision.get("persona_id") or "legacy"),
+        "thesis_type": "ASSERTION",
+        "claim_nature": "opinion",
+        "primary_subject": {"type": "topic", "id": subject or str(topic.get("claim_key", ""))},
+        "relation": "judges",
+        "primary_claim": claim,
+        "primary_claim_count": 1,
+        "scope": {"statement": str(topic.get("specific_tension") or topic.get("scope") or subject or topic.get("claim_key") or "legacy")},
+        "persona_lens_id": lens,
+        "supporting_basis": [],
+        "reader_payoff": {"type": "judgment", "statement": str(decision.get("reader_conclusion") or claim)},
+        "falsifier": "",
+        "source_delta": str(decision.get("why_me") or claim),
+        "novelty": {"recent_persona_collision": False, "cross_persona_collision": False},
+        "provenance_source": "approved_input",
+        "legacy_adapter": True,
+    }
+    contract["thesis_id"] = thesis_contract_id(contract)
+    return contract
+
+
+def persona_thesis_contract(topic: dict, decision: dict) -> dict:
+    contract = decision.get("thesis")
+    if not isinstance(contract, dict):
+        contract = json_value(decision.get("thesis_json"), {})
+    if not isinstance(contract, dict) or not contract:
+        return legacy_persona_thesis_contract(topic, decision)
+    contract = dict(contract)
+    contract["contract_version"] = THESIS_CONTRACT_VERSION
+    contract["topic_id"] = str(topic.get("claim_key", "")).strip()
+    persona_id = str(decision.get("persona_slug") or decision.get("slug") or contract.get("persona_id") or decision.get("persona_id") or "")
+    contract["persona_id"] = persona_id
+    if contract.get("persona_lens_id") == "__AUTO__":
+        contract["persona_lens_id"] = persona_thesis_profile(persona_id)["allowed_lenses"][0]
+    contract["thesis_id"] = thesis_contract_id(contract)
+    return contract
+
+
+def thesis_contract_errors(topic: dict, persona_slug: str, contract: dict,
+                           allowed_fact_ids: set[str] | None = None) -> list[str]:
+    errors = []
+    subject = contract.get("primary_subject")
+    claim = str(contract.get("primary_claim", "")).strip()
+    scope = contract.get("scope")
+    payoff = contract.get("reader_payoff")
+    profile = persona_thesis_profile(persona_slug)
+    if not str(topic.get("claim_key", "")).strip() or not str(topic.get("subject") or topic.get("title") or "").strip():
+        errors.append("TOPIC_TOO_BROAD")
+    if not isinstance(subject, dict) or not str(subject.get("type", "")).strip() or not str(subject.get("id", "")).strip():
+        errors.append("SUBJECT_UNDEFINED")
+    minimum_claim_length = 2 if contract.get("legacy_adapter") else 4
+    if not claim or len(normalize_editorial_claim(claim)) < minimum_claim_length or not str(contract.get("relation", "")).strip():
+        errors.append("CLAIM_UNDEFINED")
+    if int(contract.get("primary_claim_count", 0) or 0) != 1:
+        errors.append("MULTIPLE_PRIMARY_CLAIMS")
+    minimum_scope_length = 1
+    if not isinstance(scope, dict) or len(normalize_editorial_claim(scope.get("statement"))) < minimum_scope_length:
+        errors.append("CLAIM_SCOPE_UNDEFINED")
+    lens = str(contract.get("persona_lens_id", ""))
+    if not lens:
+        errors.append("NO_PERSONA_LENS")
+    elif lens not in profile["allowed_lenses"] or lens in profile["disallowed_lenses"]:
+        errors.append("PERSONA_LENS_INVALID")
+    if contract.get("thesis_type") not in THESIS_TYPES:
+        errors.append("CLAIM_UNDEFINED")
+    claim_nature = str(contract.get("claim_nature", ""))
+    if claim_nature not in {"factual", "opinion", "mixed"}:
+        errors.append("CLAIM_UNDEFINED")
+    if any(phrase in claim for phrase in THESIS_AMBIGUOUS_PHRASES) or normalize_editorial_claim(claim) in THESIS_GENERIC_CLAIMS:
+        errors.append("NO_DISTINCT_THESIS")
+    topic_claim = normalize_editorial_claim(topic.get("core_claim"))
+    delta = normalize_editorial_claim(contract.get("source_delta"))
+    if not delta or (
+        not contract.get("legacy_adapter")
+        and topic_claim and normalize_editorial_claim(claim) == topic_claim
+    ):
+        errors.append("INFORMATION_DELTA_ZERO")
+    if not isinstance(payoff, dict) or not normalize_editorial_claim(payoff.get("statement")):
+        errors.append("READER_PAYOFF_UNDEFINED")
+    basis = contract.get("supporting_basis")
+    if not isinstance(basis, list):
+        errors.append("INSUFFICIENT_EVIDENCE")
+        basis = []
+    authorized = allowed_fact_ids if allowed_fact_ids is not None else None
+    for item in basis:
+        if not isinstance(item, dict) or not str(item.get("claim", "")).strip():
+            errors.append("INSUFFICIENT_EVIDENCE")
+            continue
+        fact_ids = item.get("fact_ids", [])
+        if not isinstance(fact_ids, list):
+            errors.append("UNSUPPORTED_FACTUAL_PREMISE")
+            continue
+        if item.get("role") == "factual_premise" and not fact_ids:
+            errors.append("UNSUPPORTED_FACTUAL_PREMISE")
+        if item.get("role") == "primary_claim" or item.get("is_primary") is True:
+            errors.append("MULTIPLE_PRIMARY_CLAIMS")
+        if authorized is not None and any(fact_id not in authorized for fact_id in fact_ids):
+            errors.append("UNSUPPORTED_FACTUAL_PREMISE")
+    if claim_nature in {"factual", "mixed"} and not any(
+        isinstance(item, dict) and item.get("role") == "factual_premise" and item.get("fact_ids")
+        for item in basis
+    ):
+        errors.append("INSUFFICIENT_EVIDENCE")
+    if contract.get("provenance_source") != "approved_input":
+        errors.append("UNSUPPORTED_FACTUAL_PREMISE")
+    if contract.get("thesis_type") == "PREDICTION" and not str(contract.get("falsifier", "")).strip():
+        errors.append("CLAIM_SCOPE_UNDEFINED")
+    return list(dict.fromkeys(errors))
+
+
+def persona_thesis_error(topic: dict, decision: dict, allowed_fact_ids: set[str] | None = None) -> str:
+    slug = str(decision.get("persona_slug") or decision.get("slug") or decision.get("persona_id") or "")
+    errors = thesis_contract_errors(topic, slug, persona_thesis_contract(topic, decision), allowed_fact_ids)
+    return errors[0] if errors else ""
 
 
 def editorial_public_topics(cards: dict):
@@ -2769,11 +3615,15 @@ def editorial_mother_topics(cards: dict):
     """Collapse selected writing hints back to the approved subjects they came from."""
     selected = cards.get("selected_topics", []) if isinstance(cards, dict) else []
     discussions = {
-        str(item.get("key")): item for item in cards.get("discussion_topics", [])
+        (str(item.get("topic_domain") or "crypto").lower(), str(item.get("key"))): item
+        for item in cards.get("discussion_topics", [])
         if isinstance(item, dict) and item.get("key")
     }
     opinions = {
-        f"opinion:{item.get('source_ref')}": item for item in cards.get("opinion_cards", [])
+        (
+            str(item.get("topic_domain") or "crypto").lower(),
+            f"opinion:{item.get('source_ref')}",
+        ): item for item in cards.get("opinion_cards", [])
         if isinstance(item, dict) and item.get("source_ref")
     }
     facts = {}
@@ -2782,7 +3632,7 @@ def editorial_mother_topics(cards: dict):
             continue
         ref = item.get("source_ref") or item.get("representative_source_ref")
         if ref:
-            facts[f"fact:{ref}"] = item
+            facts[(str(item.get("topic_domain") or "crypto").lower(), f"fact:{ref}")] = item
     groups = {}
     for topic in selected:
         if not isinstance(topic, dict) or not topic.get("claim_key"):
@@ -2824,10 +3674,11 @@ def editorial_mother_topics(cards: dict):
             group["heat_evidence"].append(why_now[:500])
     for group in groups.values():
         for key in group["source_topic_keys"]:
-            source = discussions.get(key) or opinions.get(key) or facts.get(key)
+            lookup = (group["topic_domain"], key)
+            source = discussions.get(lookup) or opinions.get(lookup) or facts.get(lookup)
             if not source:
                 continue
-            if key in discussions:
+            if lookup in discussions:
                 summary = {
                     field: source.get(field)
                     for field in ("key", "title", "unique_authors", "post_count", "parent", "mechanism")
@@ -2891,6 +3742,8 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
         normalize_editorial_claim(item.get("core_claim")) for item in claim_history
         if normalize_editorial_claim(item.get("core_claim"))
     }
+    structure_config = editorial_content_structure_config()
+    structure_ids = set(structure_config["structures"])
     accepted, rejected, seen_keys, seen_claims = [], [], set(), set()
 
     def reject(item, reason_code, reason):
@@ -2934,6 +3787,15 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
         if family not in EDITORIAL_ANGLE_FAMILIES:
             reject(item, "invalid_angle_family", "角度镜头不在允许范围内。")
             continue
+        structure_id = str(item.get("structure_id", "")).strip()
+        if structure_id and structure_id not in structure_ids:
+            reject(item, "invalid_content_structure", "内容结构不在允许范围内。")
+            continue
+        structure_id = structure_id or editorial_content_structure({"angle_family": family})["id"]
+        allowed_structures = structure_config.get("angle_family_allowed", {}).get(family, [])
+        if structure_id not in allowed_structures:
+            reject(item, "content_structure_mismatch", "内容结构与该角度题材不匹配。")
+            continue
         core_claim = str(item["core_claim"]).strip()
         normalized = normalize_editorial_claim(core_claim)
         if len(normalized) < 10 or any(phrase in core_claim for phrase in EMPTY_WAITING_PHRASES):
@@ -2976,6 +3838,7 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
             "core_claim": core_claim[:1600],
             "content_type": content_type,
             "angle_family": family,
+            "structure_id": structure_id,
             "specific_tension": str(item["specific_tension"]).strip()[:1000],
             "non_obvious_delta": str(item["non_obvious_delta"]).strip()[:1000],
             "material_delta": str(item["non_obvious_delta"]).strip()[:1000],
@@ -3007,8 +3870,8 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
     return accepted, rejected
 
 
-def validate_persona_editorial_decisions(result, topics: list[dict]):
-    """Validate the evaluator's pure JSON output without inferring a claim for it."""
+def validate_persona_editorial_decisions(result, topics: list[dict], persona_slug: str = ""):
+    """Validate resolver output. WRITE is impossible without a valid ThesisContract."""
     raw = result.get("decisions", result) if isinstance(result, dict) else result
     if not isinstance(raw, list):
         raise ValueError("人设编辑评估不是 decisions 数组")
@@ -3029,8 +3892,11 @@ def validate_persona_editorial_decisions(result, topics: list[dict]):
                 scores[key] = max(0, min(5, int(item.get(key, 0))))
         except (TypeError, ValueError):
             continue
-        claim_key = str(item.get("claim_key", "")).strip().lower()
-        core_claim = str(item.get("core_claim", "")).strip()
+        thesis = item.get("thesis") if isinstance(item.get("thesis"), dict) else {}
+        core_claim = str(thesis.get("primary_claim") or item.get("core_claim", "")).strip()
+        claim_key = str(item.get("claim_key") or thesis.get("thesis_id") or "").strip().lower()
+        reader_payoff = thesis.get("reader_payoff") if isinstance(thesis.get("reader_payoff"), dict) else {}
+        reader_conclusion = str(reader_payoff.get("statement") or item.get("reader_conclusion") or core_claim).strip()
         if status == "WRITE":
             if not claim_key or not core_claim or not str(item.get("why_me", "")).strip():
                 status = "HOLD"
@@ -3042,6 +3908,9 @@ def validate_persona_editorial_decisions(result, topics: list[dict]):
             "why_me": str(item.get("why_me", "")).strip(),
             "claim_key": claim_key,
             "core_claim": core_claim,
+            "reader_conclusion": reader_conclusion,
+            "persona_slug": persona_slug,
+            "thesis": thesis,
             "reason_code": (
                 "invalid_claim_key"
                 if str(item.get("status", "")).upper() == "WRITE" and claim_key
@@ -3055,6 +3924,15 @@ def validate_persona_editorial_decisions(result, topics: list[dict]):
             "topic_claim_key": topic_key,
         }
         decision = decisions[topic_key]
+        if decision["status"] == "WRITE":
+            contract = persona_thesis_contract(allowed[topic_key], decision)
+            decision["thesis"] = contract
+            errors = thesis_contract_errors(allowed[topic_key], persona_slug, contract)
+            if errors:
+                decision.update({
+                    "status": "HOLD", "reason_code": errors[0],
+                    "rationale": "未形成可执行的人格化 Thesis。",
+                })
         if (
             decision["status"] == "HOLD"
             and str(item.get("reason_code", "")).strip() == "editorial_hold"
@@ -3064,19 +3942,18 @@ def validate_persona_editorial_decisions(result, topics: list[dict]):
             and editorial_score(decision) >= 14
         ):
             decision.update({
-                "status": "WRITE",
-                "claim_key": topic_key,
-                "core_claim": str(allowed[topic_key].get("core_claim", "")).strip(),
-                "reason_code": "score_promoted",
-                "rationale": "公共角度已通过质量门，且该人设四项适配评分均不低于 3。",
+                "status": "HOLD",
+                "reason_code": "thesis_required_before_write",
+                "rationale": "公共 Topic 评分再高，也必须先形成独立的人格化 Thesis。",
             })
     for topic in topics:
         key = str(topic.get("claim_key", ""))
         if key not in decisions:
             decisions[key] = {
                 "status": "IGNORE", "notice": 0, "authority": 0, "tension": 0,
-                "marginal_value": 0, "why_me": "", "claim_key": "", "core_claim": "",
-                "reason_code": "evaluator_missing", "rationale": "评估器未返回该题。", "open_loop": "",
+                "marginal_value": 0, "why_me": "", "claim_key": "", "core_claim": "", "reader_conclusion": "",
+                "reason_code": "NO_DISTINCT_THESIS", "rationale": "评估器未返回该题。", "open_loop": "", "thesis": {},
+                "persona_slug": persona_slug,
                 "topic_claim_key": key,
             }
     return decisions
@@ -3125,10 +4002,22 @@ async def evaluate_persona_editorial(persona: dict, persona_context: dict, daily
         "status 只能 WRITE/HOLD/IGNORE；why_me 说明为什么该人设此刻有资格说；"
         "HOLD 必须显式输出 reason_code：软性犹豫用 editorial_hold；事实冲突用 fact_conflict；"
         "人设禁区用 forbidden_claim；历史重复用 historical_duplicate；证据不足用 unsupported。"
-        "WRITE 必须有新的 claim_key 和非显而易见 core_claim。HOLD 是内部状态，不是正文，绝不以等待后续凑稿。"
+        "WRITE 必须返回 thesis 对象，不能只返回一句 core_claim。thesis 必须包含："
+        "thesis_type、claim_nature(factual/opinion/mixed)、primary_subject{type,id}、relation、primary_claim、primary_claim_count=1、"
+        "scope{statement}、persona_lens_id、supporting_basis[{role,claim,fact_ids}]、"
+        "reader_payoff{type,statement}、falsifier、source_delta、"
+        "novelty{recent_persona_collision,cross_persona_collision}、provenance_source=approved_input。"
+        "persona_lens_id 只能从 persona_card.thesis_profile.allowed_lenses 选择。"
+        "primary_claim 是唯一中心主张；supporting_basis 只能支撑它，不能再长出第二个中心。"
+        "事实前提只能绑定输入里已有的 fact id；禁止先写 Thesis 再反向搜证据。"
+        "reader_payoff 必须是具体判断、解释或决策收益，不能写‘值得关注’。"
+        "不得写问题、背景、可能/也许/值得关注/继续观察/要看后续/各有利弊，也不得复用公共 Topic 的 core_claim。"
+        "条件型 Thesis 可以写‘只有当 X 可验证时，Y 才值得参与’，但不能写‘可以关注’。"
+        "why_me 必须说明这个人设的观察位置怎样导向这条判断，不能只说符合人设或有观察位置。"
+        "HOLD 是内部状态，不是正文，绝不以等待后续凑稿。"
         "逐题独立决定，可有多条 WRITE，也可以全部 HOLD 或 IGNORE；不设数量上下限。"
         "公共 topic 已经通过母题多角度质量门；这里只判断哪个人设最适合说，不再临时发明新主题。"
-        "公共 topic 若四项评分均不低于 3 且没有明确事实冲突，应优先 WRITE；"
+        "公共 topic 若四项评分均不低于 3 且没有明确事实冲突，应优先形成独立 Thesis 后 WRITE；"
         "不要仅以还需更多数据、已有讨论或不是最完美人选为由 HOLD。"
         "WRITE 必须保持该 angle 的判断边界，不能合并多个角度，也不能退化成常识。"
         "同一热点只有不同核心主张才值得写；不要复述常识、冷门机制或已覆盖的主张。"
@@ -3158,7 +4047,7 @@ async def evaluate_persona_editorial(persona: dict, persona_context: dict, daily
             )
             response.raise_for_status()
         result = json.loads(response.json()["choices"][0]["message"]["content"])
-        return validate_persona_editorial_decisions(result, topics)
+        return validate_persona_editorial_decisions(result, topics, persona["slug"])
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise RuntimeError("人设编辑评估失败") from error
 
@@ -3173,6 +4062,9 @@ def write_persona_editorial_evaluations(run_id: int, persona_id: int,
         ).fetchone()
         if not run or run["status"] != "approved":
             return
+        persona_slug = conn.execute(
+            "SELECT slug FROM personas WHERE id=?", (persona_id,)
+        ).fetchone()[0]
         for topic, input_hash, input_payload in inputs:
             current_payload = current_editorial_input_payload(
                 conn,
@@ -3185,20 +4077,120 @@ def write_persona_editorial_evaluations(run_id: int, persona_id: int,
             )
             if current_payload != input_payload:
                 continue
-            decision = decisions[str(topic.get("claim_key", ""))]
+            decision = dict(decisions[str(topic.get("claim_key", ""))])
+            decision["persona_slug"] = persona_slug
+            decision.setdefault("reader_conclusion", decision.get("core_claim", ""))
+            decision.setdefault("rationale", "")
+            decision.setdefault("open_loop", "")
+            decision.setdefault("reason_code", decision.get("status", "IGNORE").lower())
+            thesis = persona_thesis_contract(topic, decision) if decision.get("status") == "WRITE" else {}
+            if decision.get("status") == "WRITE":
+                errors = thesis_contract_errors(topic, persona_slug, thesis)
+                if errors:
+                    decision.update({
+                        "status": "HOLD", "reason_code": errors[0],
+                        "rationale": "未形成可执行的人格化 Thesis。",
+                    })
+            thesis_state = {
+                "WRITE": "THESIS_DEDUP_PENDING", "HOLD": "THESIS_HOLD", "IGNORE": "THESIS_IGNORED",
+            }[decision["status"]]
             conn.execute(
                 """INSERT INTO persona_editorial_evaluations(
                     run_id,persona_id,topic_input_hash,input_json,topic_json,status,notice,authority,tension,marginal_value,
-                    why_me,claim_key,core_claim,reason_code,rationale,open_loop,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    why_me,claim_key,core_claim,reason_code,rationale,reader_conclusion,thesis_json,thesis_state,
+                    open_loop,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(run_id,persona_id,topic_input_hash) DO NOTHING""",
                 (
                     run_id, persona_id, input_hash, json.dumps(input_payload, ensure_ascii=False),
                     json.dumps(topic, ensure_ascii=False), decision["status"],
                     decision["notice"], decision["authority"], decision["tension"], decision["marginal_value"],
                     decision["why_me"], decision["claim_key"], decision["core_claim"], decision["reason_code"],
-                    decision["rationale"], decision["open_loop"], now, now,
+                    decision["rationale"], decision["reader_conclusion"],
+                    json.dumps(thesis, ensure_ascii=False, separators=(",", ":")), thesis_state,
+                    decision["open_loop"], now, now,
                 ),
+            )
+
+
+def thesis_semantic_signature(contract: dict) -> tuple[str, str, str]:
+    subject = contract.get("primary_subject") if isinstance(contract.get("primary_subject"), dict) else {}
+    return (
+        normalize_editorial_claim(contract.get("topic_id")),
+        normalize_editorial_claim(subject.get("id")),
+        normalize_editorial_claim(contract.get("relation")),
+    )
+
+
+def normalized_claims_collide(left_claim: str, right_claim: str) -> bool:
+    left = normalize_editorial_claim(left_claim)
+    right = normalize_editorial_claim(right_claim)
+    if not left or not right:
+        return False
+    if left == right or left in right or right in left:
+        return True
+    left_pairs = {left[index:index + 2] for index in range(len(left) - 1)}
+    right_pairs = {right[index:index + 2] for index in range(len(right) - 1)}
+    return bool(left_pairs | right_pairs) and len(left_pairs & right_pairs) / len(left_pairs | right_pairs) >= 0.72
+
+
+def thesis_semantic_collision(left: dict, right: dict) -> bool:
+    left_signature = thesis_semantic_signature(left)
+    right_signature = thesis_semantic_signature(right)
+    if not left_signature[0] or left_signature[0] != right_signature[0]:
+        return False
+    if left_signature[1:] != right_signature[1:]:
+        return False
+    return normalized_claims_collide(left.get("primary_claim"), right.get("primary_claim"))
+
+
+def validate_run_persona_theses(run_id: int, raw_cards: dict):
+    """Bind WRITE theses to the evidence snapshot before dedup or writing."""
+    now = int(time.time())
+    with db() as conn:
+        context_date = conn.execute(
+            "SELECT context_date FROM daily_context_runs WHERE id=?", (run_id,)
+        ).fetchone()[0]
+        rows = conn.execute(
+            """SELECT e.*,p.slug FROM persona_editorial_evaluations e
+               JOIN personas p ON p.id=e.persona_id
+               WHERE e.run_id=? AND e.status='WRITE'""",
+            (run_id,),
+        ).fetchall()
+        for row in rows:
+            evaluation = dict(row)
+            topic = json_value(evaluation["topic_json"], {})
+            snapshot = json_value(evaluation["input_json"], {})
+            facts = editorial_verified_facts(raw_cards, topic, editorial_writer_context(snapshot, topic))
+            allowed_fact_ids = {item["id"] for item in facts["facts"]}
+            contract = persona_thesis_contract(topic, {**evaluation, "persona_slug": evaluation["slug"]})
+            errors = thesis_contract_errors(topic, evaluation["slug"], contract, allowed_fact_ids)
+            recent = conn.execute(
+                """SELECT core_claim FROM topic_claim_history
+                   WHERE persona_id=? AND status<>'superseded' AND source<>?
+                     AND context_date IS NOT NULL
+                     AND date(context_date)>=date(?,'-7 days')
+                   ORDER BY last_seen_at DESC LIMIT 80""",
+                (
+                    evaluation["persona_id"], persona_editorial_candidate_source(evaluation["id"]),
+                    context_date,
+                ),
+            ).fetchall()
+            claim = str(contract.get("primary_claim", ""))
+            if claim and any(normalized_claims_collide(claim, item["core_claim"]) for item in recent):
+                errors.append("RECENT_PERSONA_THESIS_COLLISION")
+            if errors:
+                conn.execute(
+                    """UPDATE persona_editorial_evaluations
+                       SET status='HOLD',thesis_state='THESIS_HOLD',reason_code=?,
+                           rationale='Persona Thesis 未通过确定性硬校验。',updated_at=? WHERE id=?""",
+                    (errors[0], now, evaluation["id"]),
+                )
+                continue
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET thesis_json=?,thesis_state='THESIS_DEDUP_PENDING',updated_at=? WHERE id=?""",
+                (json.dumps(contract, ensure_ascii=False, separators=(",", ":")), now, evaluation["id"]),
             )
 
 
@@ -3210,23 +4202,14 @@ def resolve_persona_editorial_collisions(run_id: int):
             (run_id,),
         ).fetchall()
         items = [dict(row) for row in rows]
-        public_topic_keys = {
-            item["id"]: str(json_value(item["topic_json"], {}).get("claim_key", "")).strip().lower()
-            if str(json_value(item["topic_json"], {}).get("scope", "public")) != "persona" else ""
-            for item in items
-        }
+        for item in items:
+            item["thesis"] = persona_thesis_contract(
+                json_value(item["topic_json"], {}), {**item, "persona_slug": item["slug"]}
+            )
         links = {item["id"]: {item["id"]} for item in items}
         for index, item in enumerate(items):
-            item_key = str(item["claim_key"]).strip().lower()
-            item_claim = normalize_editorial_claim(item["core_claim"])
             for other in items[index + 1:]:
-                same_public_topic = (
-                    public_topic_keys[item["id"]]
-                    and public_topic_keys[item["id"]] == public_topic_keys[other["id"]]
-                )
-                same_key = item_key and item_key == str(other["claim_key"]).strip().lower()
-                same_claim = item_claim and item_claim == normalize_editorial_claim(other["core_claim"])
-                if same_public_topic or same_key or same_claim:
+                if thesis_semantic_collision(item["thesis"], other["thesis"]):
                     links[item["id"]].add(other["id"])
                     links[other["id"]].add(item["id"])
         now = int(time.time())
@@ -3249,8 +4232,9 @@ def resolve_persona_editorial_collisions(run_id: int):
                 losers.add(item["id"])
         for evaluation_id in losers:
             conn.execute(
-                """UPDATE persona_editorial_evaluations SET status='HOLD',reason_code='cross_persona_collision',
-                   rationale='与更匹配人设的核心主张重复。',updated_at=? WHERE id=?""",
+                """UPDATE persona_editorial_evaluations SET status='IGNORE',
+                   thesis_state='THESIS_IGNORED',reason_code='DUPLICATED_BY_STRONGER_PERSONA',
+                   rationale='同一 Topic 下的 Thesis 与更匹配人设语义重复。',updated_at=? WHERE id=?""",
                 (now, evaluation_id),
             )
             conn.execute(
@@ -3263,6 +4247,222 @@ def resolve_persona_editorial_collisions(run_id: int):
                 "UPDATE topic_claim_history SET status='superseded',last_seen_at=? WHERE source=?",
                 (now, persona_editorial_candidate_source(evaluation_id)),
             )
+        winner_ids = set(by_id) - losers
+        for evaluation_id in winner_ids:
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET thesis_state='THESIS_APPROVED',updated_at=?
+                   WHERE id=? AND status='WRITE'""",
+                (now, evaluation_id),
+            )
+
+
+def daily_persona_visible_draft_count(conn, persona_id: int, context_date: str) -> int:
+    return int(conn.execute(
+        """SELECT COUNT(*) FROM post_candidates
+           WHERE persona_id=? AND context_date=? AND status IN ('needs_review','queued','published')""",
+        (persona_id, context_date),
+    ).fetchone()[0])
+
+
+def daily_persona_draft_count(conn, persona_id: int, context_date: str) -> int:
+    candidate_count = daily_persona_visible_draft_count(conn, persona_id, context_date)
+    pending_count = conn.execute(
+        """SELECT COUNT(*) FROM persona_editorial_evaluations e
+           JOIN daily_context_runs r ON r.id=e.run_id
+           WHERE e.persona_id=? AND r.context_date=? AND e.status='WRITE'
+             AND NOT EXISTS (
+                 SELECT 1 FROM post_candidates c
+                 WHERE c.id=e.candidate_id AND c.status IN ('needs_review','queued','published')
+             )""",
+        (persona_id, context_date),
+    ).fetchone()[0]
+    return int(candidate_count) + int(pending_count)
+
+
+def limit_persona_editorial_writes(decisions: dict, available_slots: int) -> dict:
+    writes = [
+        (key, decision) for key, decision in decisions.items()
+        if decision.get("status") == "WRITE"
+    ]
+    writes.sort(
+        key=lambda item: (
+            sum(int(item[1].get(field) or 0) for field in (
+                "notice", "authority", "tension", "marginal_value"
+            )),
+            item[0],
+        ),
+        reverse=True,
+    )
+    for _, decision in writes[max(0, available_slots):]:
+        decision.update({
+            "status": "HOLD",
+            "reason_code": "daily_target_reached",
+            "rationale": "该人设当天候选已达到目标数量。",
+        })
+    return decisions
+
+
+def enforce_daily_persona_draft_cap(conn, context_date: str, target: int) -> int:
+    if target <= 0:
+        return 0
+    rows = conn.execute(
+        """SELECT c.id,c.persona_id,c.status,c.source,e.id evaluation_id
+           FROM post_candidates c
+           JOIN persona_editorial_evaluations e
+             ON c.source=('persona_editorial_grok_gemini:' || e.id)
+           WHERE c.context_date=? AND c.status IN ('published','queued','needs_review')
+           ORDER BY c.persona_id,
+                    CASE c.status WHEN 'published' THEN 0 ELSE 1 END,
+                    c.created_at,c.id""",
+        (context_date,),
+    ).fetchall()
+    counts = {}
+    superseded = 0
+    now = int(time.time())
+    for row in rows:
+        persona_id = row["persona_id"]
+        counts[persona_id] = counts.get(persona_id, 0) + 1
+        if counts[persona_id] <= target or row["status"] == "published":
+            continue
+        conn.execute(
+            "UPDATE post_candidates SET status='superseded',updated_at=? WHERE id=?",
+            (now, row["id"]),
+        )
+        conn.execute(
+            """UPDATE persona_editorial_evaluations
+               SET status='HOLD',reason_code='daily_target_reached',
+                   rationale='该人设当天候选已达到目标数量。',updated_at=?
+               WHERE id=? AND status='WRITE'""",
+            (now, row["evaluation_id"]),
+        )
+        conn.execute(
+            "UPDATE topic_claim_history SET status='superseded',last_seen_at=? WHERE source=?",
+            (now, row["source"]),
+        )
+        superseded += 1
+    return superseded
+
+
+def daily_supplement_decision(persona: dict, topic: dict) -> dict:
+    name = PERSONA_PUBLIC_PROFILE.get(persona["slug"], {}).get("display_name", persona.get("name", "这个人设"))
+    focus = PERSONA_BIOS.get(persona["slug"], name).split("｜", 1)[0].strip()
+    tension = str(topic.get("specific_tension") or topic["core_claim"]).strip()
+    thesis = (
+        f"对{focus}这个位置来说，{topic['core_claim']}；只有先处理{tension}，"
+        "才把它当成可执行的取舍。"
+    )
+    profile = persona_thesis_profile(persona["slug"])
+    contract = {
+        "contract_version": THESIS_CONTRACT_VERSION,
+        "topic_id": str(topic["claim_key"]),
+        "persona_id": persona["slug"],
+        "thesis_type": "INTERPRETATION",
+        "claim_nature": "opinion",
+        "primary_subject": {"type": "editorial_topic", "id": str(topic.get("subject") or topic["claim_key"])},
+        "relation": "interprets_for_execution",
+        "primary_claim": thesis,
+        "primary_claim_count": 1,
+        "scope": {"statement": tension},
+        "persona_lens_id": profile["allowed_lenses"][0],
+        "supporting_basis": [],
+        "reader_payoff": {"type": "decision_rule", "statement": thesis},
+        "falsifier": "",
+        "source_delta": f"{name} 从 {profile['allowed_lenses'][0]} 解释这条具体冲突。",
+        "novelty": {"recent_persona_collision": False, "cross_persona_collision": False},
+        "provenance_source": "approved_input",
+    }
+    contract["thesis_id"] = thesis_contract_id(contract)
+    return {
+        "status": "WRITE",
+        "notice": 3,
+        "authority": 3,
+        "tension": 4,
+        "marginal_value": 3,
+        "why_me": f"{name}关注{focus}，因此会把方法论落到执行取舍，而不是泛泛复述。",
+        "claim_key": f"{topic['claim_key']}:persona:{persona['slug']}",
+        "core_claim": thesis,
+        "reader_conclusion": thesis,
+        "persona_slug": persona["slug"],
+        "thesis": contract,
+        "reason_code": "daily_supplement_fill",
+        "rationale": "当天热点与已批准选题不足三条，用可审计方法论补足待审稿。",
+        "open_loop": "",
+        "topic_claim_key": str(topic["claim_key"]),
+    }
+
+
+def ensure_daily_persona_draft_floor(run_id: int, personas: list[dict]):
+    """Fill only missing daily slots. The resulting drafts still use the normal generation gate."""
+    target = daily_persona_draft_target()
+    if target <= 0:
+        return
+    pending_writes = []
+    with db() as conn:
+        run = conn.execute(
+            "SELECT status,context_date,raw_cards,approval_revision FROM daily_context_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        if not run or run["status"] != "approved":
+            return
+        daily_row = conn.execute(
+            "SELECT * FROM daily_market_contexts WHERE context_date=?", (run["context_date"],)
+        ).fetchone()
+        if not daily_row:
+            return
+        daily = daily_context_dict(daily_row)
+        daily["approval_revision"] = run["approval_revision"]
+        public_topics = editorial_public_topics(json_value(run["raw_cards"], {}))
+        for persona in personas:
+            persona = dict(persona)
+            missing = target - daily_persona_draft_count(conn, persona["id"], run["context_date"])
+            if missing <= 0:
+                continue
+            editorial_context = approved_persona_editorial_context(
+                conn, persona["id"], persona["slug"], run_id
+            )
+            context_row = conn.execute(
+                "SELECT * FROM persona_contexts WHERE persona_id=?", (persona["id"],)
+            ).fetchone()
+            persona_context = persona_context_dict(context_row) if context_row else {}
+            history = editorial_stable_claim_history(conn, run["context_date"], persona["id"])
+            normal_topics = persona_editorial_topics(persona, public_topics, editorial_context)
+            supplements = daily_persona_supplement_topics(persona, run["context_date"])
+            existing_claim_keys = {
+                str(json_value(row["topic_json"], {}).get("claim_key", ""))
+                for row in conn.execute(
+                    "SELECT topic_json,input_json FROM persona_editorial_evaluations WHERE run_id=? AND persona_id=?",
+                    (run_id, persona["id"]),
+                ).fetchall()
+                if json_value(row["input_json"], {}).get("daily", {}).get("approval_revision")
+                == run["approval_revision"]
+            }
+            selected = [
+                topic for topic in supplements
+                if topic["claim_key"] not in existing_claim_keys
+            ][:missing]
+            if not selected:
+                continue
+            full_topics = [*normal_topics, *supplements]
+            inputs = []
+            decisions = {}
+            for topic in selected:
+                input_payload = editorial_topic_input_payload(
+                    topic, daily, persona, persona_context, topics=full_topics,
+                    claim_history=history, editorial_context=editorial_context,
+                )
+                encoded = json.dumps(
+                    input_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+                inputs.append((
+                    topic,
+                    hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                    input_payload,
+                ))
+                decisions[str(topic["claim_key"])] = daily_supplement_decision(persona, topic)
+            pending_writes.append((persona["id"], inputs, decisions))
+    for persona_id, inputs, decisions in pending_writes:
+        write_persona_editorial_evaluations(run_id, persona_id, inputs, decisions)
 
 
 def record_persona_editorial_claim(conn, evaluation: dict, context_date: str):
@@ -3285,7 +4485,7 @@ def supersede_persona_editorial_evaluation(conn, evaluation_id: int, reason_code
     now = int(time.time())
     conn.execute(
         """UPDATE persona_editorial_evaluations
-           SET status='HOLD',reason_code=?,rationale=?,updated_at=? WHERE id=?""",
+           SET status='HOLD',thesis_state='THESIS_HOLD',reason_code=?,rationale=?,updated_at=? WHERE id=?""",
         (reason_code, rationale, now, evaluation_id),
     )
     conn.execute(
@@ -3327,6 +4527,62 @@ def mark_persona_editorial_generation_retryable(conn, evaluation_id: int, error:
                reason_code='formal_generation_retryable',rationale=?,updated_at=? WHERE id=?""",
         (attempts, now + delay, rationale, now, evaluation_id),
     )
+
+
+def persist_persona_editorial_generation_state(evaluation: dict, stage: str, state: dict):
+    thesis_state = {
+        "context_ready": "STRUCTURE_READY",
+        "draft_generating": "DRAFT_GENERATING",
+        "draft_ready": "DRAFT_READY",
+        "thesis_adherence_failed": "THESIS_ADHERENCE_FAILED",
+        "rewrite_ready": "REPAIR_PENDING",
+        "critique_ready": "EDITORIAL_REVIEW",
+        "final_critique_ready": "EDITORIAL_REVIEW",
+        "candidate_ready": "CANDIDATE_READY",
+    }.get(stage)
+    with db() as conn:
+        updated = conn.execute(
+            """UPDATE persona_editorial_evaluations
+               SET generation_stage=?,generation_state=?,
+                   thesis_state=COALESCE(?,thesis_state),updated_at=?
+               WHERE id=? AND status='WRITE' AND topic_input_hash=?""",
+            (
+                stage, json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                thesis_state, int(time.time()), evaluation["id"], evaluation["topic_input_hash"],
+            ),
+        ).rowcount
+    return bool(updated)
+
+
+def editorial_always_critique():
+    return os.getenv("XOPS_EDITORIAL_ALWAYS_CRITIQUE", "true").lower() == "true"
+
+
+def local_editorial_critic(verdict: str, reasons=None, mode="local_gate"):
+    reasons = list(reasons or [])
+    return {
+        "verdict": verdict,
+        "reasons": reasons,
+        "unsupported_claims": [],
+        "rewrite_instruction": "",
+        "model": "",
+        "mode": mode,
+        "adherence": {
+            "verdict": verdict,
+            "reason_codes": [],
+            "spans": [],
+        },
+    }
+
+
+EDITORIAL_FEEDBACK_INSTRUCTIONS = {
+    "too_ai": "删掉模板句、总结腔和对称排比，改成这个人设会自然说的话。",
+    "context_missing": "开头两句补足对象是谁、做什么、为什么和这条判断有关。",
+    "hook_weak": "把已核材料里最能吸引读者的变化或数字放到开头，不得新增事实。",
+    "stance_weak": "只保留一个主题，并给出明确判断和现实影响。",
+    "persona_mismatch": "保持事实不变，按人设的身份、关注点和常用语气重写。",
+    "too_short": "补足必要背景、判断依据和现实影响，但不要扩成研报。",
+}
 
 
 def editorial_stable_claim_history(conn, context_date: str, persona_id: int | None = None):
@@ -3390,9 +4646,12 @@ def current_editorial_input_payload(conn, evaluation: dict, context_date: str):
         if stage.get("input_hash") != current_angle_hash:
             return None
     public_topics = editorial_public_topics(cards)
-    topics = persona_editorial_topics(dict(persona), public_topics, editorial_context)
+    evaluated_topic = json_value(evaluation["topic_json"], {})
+    topics = persona_editorial_input_topics(
+        dict(persona), public_topics, editorial_context, context_date, evaluated_topic
+    )
     return editorial_topic_input_payload(
-        json_value(evaluation["topic_json"], {}),
+        evaluated_topic,
         daily,
         dict(persona),
         persona_context_dict(context_row) if context_row else {},
@@ -3408,8 +4667,18 @@ def editorial_claim_already_drafted(conn, evaluation: dict):
     claim = normalize_editorial_claim(evaluation.get("core_claim"))
     if not claim:
         return False
+    topic = json_value(evaluation.get("topic_json"), {})
+    is_daily_supplement = topic.get("source_kind") == "daily_supplement"
+    current_date = ""
+    if is_daily_supplement:
+        run = conn.execute(
+            "SELECT context_date FROM daily_context_runs WHERE id=?", (evaluation["run_id"],)
+        ).fetchone()
+        current_date = str(run["context_date"]) if run else ""
     rows = conn.execute(
-        """SELECT h.core_claim FROM topic_claim_history h
+        """SELECT h.core_claim,h.persona_id,h.context_date,e.topic_json FROM topic_claim_history h
+           LEFT JOIN persona_editorial_evaluations e
+             ON h.source=('persona_editorial_grok_gemini:' || e.id)
            WHERE h.status<>'superseded' AND h.source NOT IN (?,?)
              AND (
                  h.source NOT LIKE 'persona_editorial:%'
@@ -3421,7 +4690,24 @@ def editorial_claim_already_drafted(conn, evaluation: dict):
              AND NOT (h.source='daily_context_run' AND h.persona_id IS NULL)""",
         (persona_editorial_candidate_source(evaluation["id"]), f"persona_editorial:{evaluation['id']}"),
     ).fetchall()
-    return any(normalize_editorial_claim(row["core_claim"]) == claim for row in rows)
+    for row in rows:
+        if normalize_editorial_claim(row["core_claim"]) != claim:
+            continue
+        prior_topic = json_value(row["topic_json"], {})
+        if not is_daily_supplement or prior_topic.get("source_kind") != "daily_supplement":
+            return True
+        if row["persona_id"] != evaluation["persona_id"]:
+            return True
+        try:
+            age = (
+                datetime.fromisoformat(current_date).date()
+                - datetime.fromisoformat(str(row["context_date"])).date()
+            ).days
+        except (TypeError, ValueError):
+            return True
+        if age <= daily_supplement_cooldown_days():
+            return True
+    return False
 
 
 def persona_editorial_candidate_source(evaluation_id: int) -> str:
@@ -3444,6 +4730,15 @@ def editorial_writer_context(input_snapshot: dict, topic: dict):
             (item for item in context.get(key, []) if str(item.get("id", "")) == source_id),
             None,
         )
+    elif kind == "daily_supplement":
+        source_item = {
+            key: topic.get(key, "")
+            for key in (
+                "source_name", "source_url", "source_locator", "source_mode",
+                "method", "core_claim", "specific_tension", "non_obvious_delta",
+            )
+            if topic.get(key)
+        }
     source_item = compact_editorial_source_item(source_item)
     assets = [
         {
@@ -3499,9 +4794,47 @@ def editorial_candidate_asset_id(input_snapshot: dict, topic: dict):
     return selected[0] if len(selected) == 1 else ""
 
 
+def attach_publishable_assets_to_daily_supplements(conn, context_date: str):
+    rows = conn.execute(
+        """SELECT c.id,c.asset_id,p.slug,e.topic_json FROM post_candidates c
+           JOIN personas p ON p.id=c.persona_id
+           JOIN persona_editorial_evaluations e
+             ON c.source=('persona_editorial_grok_gemini:' || e.id)
+           WHERE c.context_date=? AND c.status='needs_review'
+           ORDER BY p.slug,c.created_at,c.id""",
+        (context_date,),
+    ).fetchall()
+    now = int(time.time())
+    positions = {}
+    for row in rows:
+        topic = json_value(row["topic_json"], {})
+        if topic.get("source_kind") != "daily_supplement" or row["slug"] not in ASSET_COLLECTIONS:
+            continue
+        position = positions.get(row["slug"], 0)
+        positions[row["slug"]] = position + 1
+        assets = persona_assets(row["slug"])
+        if assets and not row["asset_id"]:
+            offset = int(hashlib.sha256(
+                f"{context_date}:{row['slug']}".encode("utf-8")
+            ).hexdigest(), 16) % len(assets)
+            conn.execute(
+                "UPDATE post_candidates SET asset_id=?,updated_at=? WHERE id=? AND asset_id=''",
+                (assets[(offset + position) % len(assets)]["id"], now, row["id"]),
+            )
+
+
 SAFE_FIRST_PERSON_OPINION_LEADS = (
     "我认为", "我觉得", "我的判断是", "我的判断", "我的理解是", "我的理解",
     "我倾向于", "我倾向", "我更关心", "在我看来",
+)
+EDITORIAL_DETERMINISTIC_GUARD_REVISION = 2
+
+UNAUTHORIZED_FIRST_PERSON_EXPERIENCE_RE = re.compile(
+    r"(?:我|本人)(?:上周|上个月|昨天|今天|最近|今年|这个月|一直|已经|刚|曾|现在|目前)?"
+    r"(?:抄底|买了|买入|卖了|卖出|做空|做多|持有|赚了|亏了)|"
+    r"(?:我|本人)(?:的)?(?:账户|手里)|"
+    r"(?:我|本人)[，、 ]?(?:用|使用|在用).{0,12}(?:天|周|月|年)|"
+    r"(?:我|本人)[一-龥，、 ]{0,5}(?:跑单|开车|上班|任职|见过|参与(?:了)?|试(?:了)?|实测|跑(?:了)?)"
 )
 
 PROTOCOL_IDENTIFIER_RE = re.compile(
@@ -3521,7 +4854,7 @@ def unauthorized_first_person_experience(post: str, writer_context: dict):
     remaining = post
     for phrase in SAFE_FIRST_PERSON_OPINION_LEADS:
         remaining = remaining.replace(phrase, "")
-    return any(pronoun in remaining for pronoun in ("我", "本人"))
+    return bool(UNAUTHORIZED_FIRST_PERSON_EXPERIENCE_RE.search(remaining))
 
 
 FACT_CARD_STATUSES = {
@@ -3532,6 +4865,7 @@ FACT_CARD_STATUSES = {
 
 def editorial_verified_facts(raw_cards: dict, topic: dict, writer_context: dict):
     """Build fact permissions from exact approved card references, never from model prose."""
+    topic_domain = str(topic.get("topic_domain") or "crypto").lower()
     references = set()
     for field in ("source_topic_keys", "source_refs"):
         values = topic.get(field, [])
@@ -3543,7 +4877,11 @@ def editorial_verified_facts(raw_cards: dict, topic: dict, writer_context: dict)
                 references.add(text.removeprefix("fact:"))
     facts = []
     for card in raw_cards.get("fact_cards", []) if isinstance(raw_cards, dict) else []:
-        if not isinstance(card, dict) or card.get("status") not in FACT_CARD_STATUSES:
+        if (
+            not isinstance(card, dict)
+            or str(card.get("topic_domain") or "crypto").lower() != topic_domain
+            or card.get("status") not in FACT_CARD_STATUSES
+        ):
             continue
         card_refs = {
             str(card.get("representative_source_ref") or card.get("source_ref") or "").strip()
@@ -3583,6 +4921,60 @@ def editorial_verified_facts(raw_cards: dict, topic: dict, writer_context: dict)
             "status": "approved_life",
         })
     return {"schema": "facts_used_ids", "facts": facts, "requires_fact_ids": bool(facts)}
+
+
+async def enrich_verified_facts_with_github_traction(topic: dict, verified_facts: dict,
+                                                      grok_context: dict):
+    topic_text = json.dumps(topic, ensure_ascii=False).lower()
+    repo_url = ""
+    repo_name = ""
+    for citation in grok_context.get("citations", []):
+        parsed = urlparse(str(citation))
+        if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
+            continue
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) < 2:
+            continue
+        owner, repo = parts[0], parts[1].removesuffix(".git")
+        if repo.lower() not in topic_text and f"{owner}/{repo}".lower() not in topic_text:
+            continue
+        repo_name = f"{owner}/{repo}"
+        repo_url = f"https://github.com/{repo_name}"
+        break
+    if not repo_url:
+        return verified_facts
+
+    snapshot_date = datetime.now(TZ).date().isoformat()
+    cache_key = f"{snapshot_date}:{repo_name.lower()}"
+    if cache_key not in GITHUB_TRACTION_CACHE:
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                response = await client.get(repo_url, headers={"User-Agent": "Mozilla/5.0"})
+                response.raise_for_status()
+            match = re.search(
+                r'aria-label="([\d,]+) users starred this repository"', response.text
+            )
+            GITHUB_TRACTION_CACHE[cache_key] = {
+                "stars": int(match.group(1).replace(",", "")) if match else 0,
+            }
+        except httpx.HTTPError:
+            GITHUB_TRACTION_CACHE[cache_key] = {"stars": 0}
+        if len(GITHUB_TRACTION_CACHE) > GITHUB_TRACTION_CACHE_MAX:
+            GITHUB_TRACTION_CACHE.pop(next(iter(GITHUB_TRACTION_CACHE)))
+
+    stars = int(GITHUB_TRACTION_CACHE[cache_key].get("stars") or 0)
+    if not stars:
+        return verified_facts
+    fact_id = f"github:{repo_name.lower()}:stars:{snapshot_date}"
+    facts = list(verified_facts.get("facts", []))
+    if not any(item.get("id") == fact_id for item in facts if isinstance(item, dict)):
+        facts.append({
+            "id": fact_id,
+            "text": f"截至 {snapshot_date}，GitHub 上的 {repo_name} 仓库有 {stars:,} 个 Star。",
+            "source_refs": [repo_url],
+            "status": "official_primary",
+        })
+    return {**verified_facts, "facts": facts, "requires_fact_ids": bool(facts)}
 
 
 def response_output_text_and_citations(body: dict):
@@ -3659,6 +5051,7 @@ async def enrich_persona_editorial_context(topic: dict, verified_facts: dict, da
     prompt = (
         f"你是中文 {content_domain} 编辑的实时研究助手。必须各使用一次 X Search 和 Web Search。"
         "用不超过 800 个中文字补齐：圈内前情、当前争议、最强反方、今天为何讨论，并附可追溯 URL。"
+        "如果对象是开源项目，必须附上与题目同名的官方 GitHub 仓库 URL，供后续程序独立核验 Star。"
         "母池与搜索结果只用于理解语境，不能自动成为事实。不要写成帖子，不要给交易建议。\n\n"
         f"题目：{json.dumps(research_topic, ensure_ascii=False)}\n"
         f"可写成事实的已核材料（仅这些）：{json.dumps(verified_facts, ensure_ascii=False)}\n"
@@ -3842,19 +5235,45 @@ async def research_editorial_angle_context_grok(mother_topics: list[dict], daily
     }
 
 
+def cached_editorial_topic_context(raw_cards: dict, topic: dict):
+    stage = raw_cards.get("editorial_angle_expansion", {}) if isinstance(raw_cards, dict) else {}
+    research = stage.get("research", {}) if isinstance(stage, dict) else {}
+    parent_seed_key = str(topic.get("parent_seed_key", ""))
+    contexts = research.get("contexts", []) if isinstance(research, dict) else []
+    context = next(
+        (
+            item for item in contexts
+            if isinstance(item, dict) and str(item.get("seed_key", "")) == parent_seed_key
+        ),
+        None,
+    )
+    if not context:
+        return None
+    return {
+        "text": json.dumps(context, ensure_ascii=False),
+        "citations": list(research.get("citations") or [])[:24],
+        "tool_usage": list(research.get("tool_usage") or []),
+        "model": str(research.get("model", "")),
+        "source": "daily_mother_topic_research",
+    }
+
+
 async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_context: dict,
                                            grok_context: dict, claim_history: list[dict]):
     provider = editorial_provider_config("GEMINI")
     content_domain = editorial_topics_domain_label(mother_topics)
+    structure_catalog = editorial_content_structure_catalog()
     prompt = (
         f"你是中文 {content_domain} 内容团队的选题主编。现在只做多角度选题，不写帖子、不分配人设。"
         "只输出 JSON：{\"angles\":[...],\"rejected_angles\":[...]}。"
         "每个母题输出 0 到 5 个真正互不替代的角度，总数最多 24；这是上限，不是配额。"
         "可选 angle_family 只有 opportunity、industry_evaluation、project_evaluation、market_cognition、"
         "trading_philosophy、people_or_community、other，不要求覆盖任何一类。"
-        "angles 每项必须包含 parent_seed_key,claim_key,subject,title,core_claim,angle_family,"
+        "angles 每项必须包含 parent_seed_key,claim_key,subject,title,core_claim,angle_family,structure_id,"
         "specific_tension,non_obvious_delta,audience_value,why_worth_saying,why_now,statement_mode,persona_fit。"
         "claim_key 只能用小写字母、数字、冒号、下划线或连字符。statement_mode 只能 opinion 或 conditional。"
+        "structure_id 必须从给定内容结构中选择，它只由这条内容的题材和读者任务决定，不能按人设选择。"
+        "参与活动与交易 setup 要分开；资讯解释、配套讲解、开源发现、项目评价和行业分析也不能混成同一结构。"
         "core_claim 必须是一句可争论、能直接说出口的明确结论，不能是问题、背景介绍、名词解释或等待后续。"
         "同一母题下，只有核心判断发生变化才算不同角度；换标题、换措辞、换人设都不算。"
         "历史重复只指 claim_key 或核心结论实质相同；同一项目、同一币种、同一事件或同属一个宏观叙事，"
@@ -3871,6 +5290,7 @@ async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_contex
         "rejected_angles 每项包含 parent_seed_key,title,core_claim,reason_code,reason。"
         "每个输入母题必须至少有一条合格 angle，或在 rejected_angles 中用 no_worthwhile_angle 明确说明零产出；"
         "漏掉母题会让整批失败重试。\n\n"
+        f"可选内容结构：{json.dumps(structure_catalog, ensure_ascii=False)}\n"
         f"永久规则：{json.dumps(topic_selection_policy().get('angle_expansion', {}), ensure_ascii=False)}\n"
         f"母题：{json.dumps(mother_topics, ensure_ascii=False)}\n"
         f"已批准市场语境：{json.dumps(editorial_daily_input(daily_context), ensure_ascii=False)}\n"
@@ -3878,17 +5298,18 @@ async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_contex
         f"团队已覆盖主张：{json.dumps(editorial_claim_memory(claim_history), ensure_ascii=False)}"
     )
     async with httpx.AsyncClient(timeout=240) as client:
-        response = await client.post(
-            provider["base_url"] + "/chat/completions",
-            headers={
-                "Authorization": f"Bearer {provider['key']}", "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0",
-            },
-            json={
-                "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}, "temperature": 0.55, "max_tokens": 8000,
-            },
-        )
+        async with gemini_request_key(provider) as key:
+            response = await client.post(
+                provider["base_url"] + "/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                },
+                json={
+                    "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"}, "temperature": 0.55, "max_tokens": 8000,
+                },
+            )
         response.raise_for_status()
     result = chat_completion_json(response.json())
     result["_model"] = provider["model"]
@@ -3958,8 +5379,22 @@ async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict
             if isinstance(existing_stage, dict) and existing_stage.get("input_hash") == input_hash
             else {}
         )
+        can_reuse = has_formal_daily_topic_pool(current_cards)
         now = int(time.time())
         if stage.get("status") == "ready":
+            if can_reuse and not evaluation_count and "reusable_topics" not in stage:
+                reusable = reusable_editorial_topics(conn, run["context_date"], current_cards)
+                if reusable:
+                    stage = {
+                        **stage,
+                        "expanded_topics": [*stage.get("expanded_topics", []), *reusable],
+                        "reusable_topics": reusable,
+                    }
+                    current_cards["editorial_angle_expansion"] = stage
+                    conn.execute(
+                        "UPDATE daily_context_runs SET raw_cards=?,updated_at=? WHERE id=?",
+                        (json.dumps(current_cards, ensure_ascii=False), now, run_id),
+                    )
             return editorial_public_topics(current_cards)
         if stage.get("status") == "exhausted" and int(stage.get("next_retry_at") or 0) > now:
             return None
@@ -3968,6 +5403,7 @@ async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict
         if stage.get("status") == "running" and int(stage.get("started_at") or 0) > now - 600:
             return None
         attempt_token = secrets.token_hex(12)
+        reusable = reusable_editorial_topics(conn, run["context_date"], current_cards) if can_reuse else []
         if not mothers:
             current_cards["editorial_angle_expansion"] = {
                 "version": EDITORIAL_ANGLE_EXPANSION_REVISION,
@@ -3976,7 +5412,8 @@ async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict
                 "status": "ready",
                 "mother_topics": [],
                 "research": {},
-                "expanded_topics": [],
+                "expanded_topics": reusable,
+                "reusable_topics": reusable,
                 "rejected_angles": [],
                 "attempts": int(stage.get("attempts") or 0),
                 "generated_at": now,
@@ -3985,7 +5422,7 @@ async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict
                 "UPDATE daily_context_runs SET raw_cards=?,updated_at=? WHERE id=?",
                 (json.dumps(current_cards, ensure_ascii=False), now, run_id),
             )
-            return []
+            return reusable
         working = {
             "version": EDITORIAL_ANGLE_EXPANSION_REVISION,
             "input_hash": input_hash,
@@ -3999,6 +5436,7 @@ async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict
             "mother_topics": mothers,
             "research": stage.get("research", {}),
             "expanded_topics": [],
+            "reusable_topics": reusable,
             "rejected_angles": [],
             "attempts": int(stage.get("attempts") or 0),
             "started_at": now,
@@ -4057,14 +5495,15 @@ async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict
         **working,
         "status": "ready",
         "phase": "complete",
-        "expanded_topics": expanded,
+        "expanded_topics": [*expanded, *working.get("reusable_topics", [])],
+        "reusable_topics": working.get("reusable_topics", []),
         "rejected_angles": rejected,
         "provider_models": {"grok": research.get("model", ""), "gemini": model},
         "next_retry_at": None,
         "error": "",
         "generated_at": int(time.time()),
     }
-    return expanded if persist_editorial_angle_expansion(
+    return ready["expanded_topics"] if persist_editorial_angle_expansion(
         run_id, input_hash, attempt_token, ready
     ) else None
 
@@ -4074,22 +5513,49 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
                                          rewrite_instruction: str = ""):
     provider = editorial_provider_config("GEMINI")
     content_domain = editorial_domain_label(topic.get("topic_domain", "crypto"))
+    style_recipe = topic.get("style_recipe") if isinstance(topic.get("style_recipe"), dict) else {}
+    section_template = {key: "..." for key in style_recipe.get("section_order", [])}
+    thesis = topic.get("persona_thesis") if isinstance(topic.get("persona_thesis"), dict) else {}
+    frozen_thesis_hash = hashlib.sha256(
+        json.dumps(thesis, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     prompt = (
         f"你是中文 {content_domain} KOL 编辑。把以下正式选题写成一条能进入人工审核的帖子，只输出 JSON："
-        "{\"text\":\"...\",\"facts_used_ids\":[\"fact:...\"],\"stance\":\"...\"}。\n"
+        f"{{\"sections\":{json.dumps(section_template, ensure_ascii=False)},"
+        "\"reasoning_shape\":[\"hook\",\"...\"],\"facts_used_ids\":[\"fact:...\"],\"stance\":\"...\"}。"
+        "sections 的语义槽和必填项是服务器硬约束；reasoning_shape 只能逐字选择 allowed_reasoning_shapes 中的一项。"
+        "段落顺序可以在允许形状中变化；每段只写正文，不写 Hook、Context、CTA 等标签，不得把整篇复制进多个字段。\n"
         "唯一可作为确定事实、数字或日期的材料是 verified_facts（已批准事实依据）；Grok 内容只用于理解前情、圈内争议和语言语境。"
         "X 上重复出现的说法仍只是观点。必须给清楚判断和现实后果，不写研报、免责声明、标题、来源列表或观察清单。"
         "若 verified_facts.facts 为空，不得写日期、价格、比例、数量或已被确认的事实；只能写明确标出的观点、解释或判断。"
         "TermMax S1、x402、L2 这类项目或协议标识可以照常写，它们不属于数字断言。"
-        "题目里的具体对象必须直接点名；没有已核事实时，把机制或催化写成明确的条件句，随后给出现在能执行的正向选择，"
-        "不能用‘某个平台/某个活动’躲开对象，也不能以‘再等等、继续观察’收尾。"
-        "不写“结论很明确/本质上/值得注意的是/核心逻辑/不是X而是Y/一方面另一方面”。"
+        "题目里的具体对象必须直接点名；没有已核事实时，把机制或催化写成明确的条件句。"
+        "机会或教程题可以给下一步动作；产品评论、人物评价和行业分析应收在一个鲜明判断上，不能为了显得有用而硬塞下载、申请、"
+        "采购或‘现在就去试’的号召，也不能以‘再等等、继续观察’收尾。"
+        "style_recipe 是这条题材的内容结构，必须先按其中一种 hook_options 开场，再补必要 Context；"
+        "Hook、论证顺序、收尾和 CTA 都由题材结构决定，不能因为换了人设就换结构，也不把结构提示原样写进正文。"
+        "首次出现普通中文读者未必认识的公司、产品、项目或术语时，在 Hook 后用一句话完成对象定位：它是谁、做什么、"
+        "为什么和本题有关，最迟不能晚于前三句；定位只能使用 verified_facts。若事实包只说明它在本次事件里的作用，"
+        "写清这个作用就算完成定位，不得为了百科解释补造产品类别、风险等级或历史背景。"
+        "如果是开源项目，且 verified_facts 已提供当前 Star、Fork、下载量、榜单、增长速度或知名采用者，"
+        "开头必须选一个最强信号做 Hook，并写清快照日期；没有已核热度数据，不得写知名、爆火或社区都在用。"
+        "persona_thesis 是冻结的唯一写作契约：不得修改任何字段、换题、软化成两面陈述或增加第二主张。"
+        "stance 必须逐字返回 persona_thesis.primary_claim；正文不必逐字重复，但读者读完必须只能得到 reader_payoff.statement。"
+        "正文只走一条主线，论证顺序优先遵守 style_recipe；必须有具体影响和明确判断，但不强制所有帖子套同一套三拍结构。"
+        "不要替官方逐项解释更新，不堆参数、功能清单、泛化风险提示或行业黑话；无法形成非共识判断的题目宁可不写。"
+        "不写‘结论很明确/本质上/值得注意的是/核心逻辑/不是X而是Y/一方面另一方面/唯一正确/必然重塑/现在就可以去试试’。"
         "不要讲读者已经知道的常识；只保留这次题目里新发生的冲突、机会或看法。"
-        "人设只影响取材角度和语气，不能补造外卖、乘客、课程、实测、持仓、成交、收益或朋友对话。"
+        "人设只影响观察位置、语气和用词，不能覆盖题材结构，也不能补造外卖、乘客、课程、实测、持仓、成交、收益或朋友对话。"
         "除非 source_kind=life 且 first_person_allowed=true，否则第一人称只能表达判断，不能写个人经历。"
+        "人设中的职业、资金和工作场景也不是可写成第一人称事实的素材：不能写‘我跑单/我开车/我手里有钱/我账户里’；"
+        "要表达立场时改成对小资金、普通用户或当前机制的判断。"
+        "source_kind=daily_supplement 的卡是可审计的方法论转述：source_mode=paraphrase 时不得加引号、不得写‘某某说过’、"
+        "不得把 source_name 或 Grok 背景写成事实；只把卡里的具体冲突转成当前人设的独立判断。"
+        "source_mode=approved_editorial 时，它是已批准的常青观点卡：不得补造当天事件、数据或名人出处，只围绕具体冲突写出自己的判断。"
         "不号召追涨、合约、杠杆或借钱。\n\n"
         f"人设：{json.dumps(persona, ensure_ascii=False)}\n"
         f"选题：{json.dumps(topic, ensure_ascii=False)}\n"
+        f"本条行文结构：{json.dumps(style_recipe, ensure_ascii=False)}\n"
         f"verified_facts：{json.dumps(verified_facts, ensure_ascii=False)}\n"
         f"Grok 背景：{json.dumps({'text': grok_context.get('text', ''), 'citations': grok_context.get('citations', [])}, ensure_ascii=False)}\n"
         f"第一人称权限：{json.dumps(minimal_editorial_writer_context(writer_context), ensure_ascii=False)}"
@@ -4097,22 +5563,23 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
     if rewrite_instruction:
         prompt += f"\n\n上一稿被编辑否决，按此定向重写：{rewrite_instruction}"
     async with httpx.AsyncClient(timeout=240) as client:
-        response = await client.post(
-            provider["base_url"] + "/chat/completions",
-            headers={
-                "Authorization": f"Bearer {provider['key']}", "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0",
-            },
-            json={
-                "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}, "temperature": 0.8, "max_tokens": 5000,
-            },
-        )
+        async with gemini_request_key(provider) as key:
+            response = await client.post(
+                provider["base_url"] + "/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                },
+                json={
+                    "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"}, "temperature": 0.65, "max_tokens": 5000,
+                },
+            )
         response.raise_for_status()
     result = chat_completion_json(response.json())
-    text = str(result.get("text", "")).strip()
-    if not text:
-        raise RuntimeError("Gemini 未返回正文")
+    text, sections = assemble_editorial_sections(result, style_recipe)
+    if thesis and normalize_editorial_claim(result.get("stance")) != normalize_editorial_claim(thesis.get("primary_claim")):
+        raise RuntimeError("Gemini stance 未忠实返回 Persona Thesis")
     valid_fact_ids = {item["id"] for item in verified_facts.get("facts", [])}
     raw_facts_used = result.get("facts_used_ids", [])
     if not isinstance(raw_facts_used, list) or not all(isinstance(item, str) for item in raw_facts_used):
@@ -4120,12 +5587,23 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
     facts_used = [item for item in raw_facts_used if item]
     if any(item not in valid_fact_ids for item in facts_used):
         raise RuntimeError("Gemini 引用了未提供的事实编号")
+    thesis_fact_ids = {
+        fact_id
+        for basis in thesis.get("supporting_basis", []) if isinstance(basis, dict)
+        for fact_id in basis.get("fact_ids", []) if isinstance(fact_id, str)
+    }
+    if not thesis_fact_ids.issubset(set(facts_used)):
+        raise RuntimeError("Gemini 未标注 Thesis 使用的事实编号")
     if verified_facts.get("requires_fact_ids") and not facts_used:
         raise RuntimeError("Gemini 未标注已使用的事实编号")
     return {
         "text": text,
+        "sections": sections,
         "facts_used_ids": facts_used,
         "stance": str(result.get("stance", "")).strip(),
+        "reasoning_shape": result.get("reasoning_shape") or style_recipe.get("allowed_reasoning_shapes", [[]])[0],
+        "frozen_thesis_hash": frozen_thesis_hash,
+        "style_id": str(style_recipe.get("id", "")),
         "model": provider["model"],
     }
 
@@ -4142,10 +5620,98 @@ def deterministic_editorial_style_failures(post: str, writer_context: dict, veri
     numeric_text = PROTOCOL_IDENTIFIER_RE.sub("", text)
     if verified_facts is not None and not verified_facts.get("facts") and UNVERIFIED_NUMERIC_ASSERTION_RE.search(numeric_text):
         failures.append("无已核事实时出现数字、日期或价格式断言")
+    traction_available = any(
+        re.search(r"GitHub.{0,50}(?:Stars?|星标)", str(item.get("text", "")), re.IGNORECASE)
+        for item in (verified_facts or {}).get("facts", []) if isinstance(item, dict)
+    )
+    opening = "".join(re.split(r"(?<=[。！？!?])", text)[:2])[:240]
+    if traction_available and not re.search(
+        r"\d[\d,.]*\s*[Kk万+]?\s*(?:个\s*)?(?:GitHub\s*)?(?:Stars?|星标)",
+        opening, re.IGNORECASE,
+    ):
+        failures.append("已核 GitHub 热度信号未在开头用作 Hook")
     boilerplate = ("结论很明确", "我的结论很简单", "我的结论很直白", "本质上", "值得注意的是", "核心逻辑", "一方面", "另一方面", "显而易见", "大家都知道")
     if any(phrase in text for phrase in boilerplate) or re.search(r"^\s*不是.{1,30}而是", text):
         failures.append("AI 模板或常识性空话")
     return failures
+
+
+def reopen_daily_supplement_guard_rejections(run_id: int | None = None):
+    """Retry only supplement drafts held by the superseded first-person guard."""
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT e.* FROM persona_editorial_evaluations e
+               JOIN daily_context_runs r ON r.id=e.run_id
+               WHERE e.status='HOLD' AND e.reason_code='grok_gemini_critic_reject'
+                 AND r.context_date=? AND (? IS NULL OR e.run_id=?)""",
+            (shanghai_today(), run_id, run_id),
+        ).fetchall()
+        for row in rows:
+            evaluation = dict(row)
+            topic = json_value(evaluation["topic_json"], {})
+            state = json_value(evaluation["generation_state"], {})
+            if topic.get("source_kind") != "daily_supplement" or not isinstance(state, dict):
+                continue
+            old_failures = state.get("draft_failures", [])
+            draft = state.get("draft")
+            writer_context = state.get("writer_context", {})
+            facts = state.get("verified_facts", {})
+            if not isinstance(draft, dict) or "虚构或未授权的第一人称经历" not in old_failures:
+                continue
+            failures = deterministic_editorial_style_failures(
+                draft.get("text", ""), writer_context, facts
+            )
+            if "虚构或未授权的第一人称经历" in failures:
+                continue
+            for key in ("critic", "rewrite", "rewrite_failures", "final_critic"):
+                state.pop(key, None)
+            state["draft_failures"] = failures
+            state["deterministic_guard_revision"] = EDITORIAL_DETERMINISTIC_GUARD_REVISION
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET status='WRITE',reason_code='',rationale='',generation_stage='draft_ready',
+                       generation_state=?,updated_at=? WHERE id=?""",
+                (json.dumps(state, ensure_ascii=False, separators=(",", ":")), int(time.time()), evaluation["id"]),
+            )
+
+
+def validate_thesis_adherence_result(result: dict) -> dict:
+    raw = result.get("adherence") if isinstance(result.get("adherence"), dict) else result
+    spans = raw.get("spans", []) if isinstance(raw, dict) else []
+    if not isinstance(spans, list):
+        raise RuntimeError("Thesis Adherence spans 不符合数组约束")
+    cleaned = []
+    reason_codes = {
+        str(code) for code in raw.get("reason_codes", [])
+        if str(code) in THESIS_HARD_ADHERENCE_FAILURES
+    }
+    for span in spans:
+        if not isinstance(span, dict):
+            raise RuntimeError("Thesis Adherence span 不符合对象约束")
+        classification = str(span.get("classification", ""))
+        if classification not in THESIS_ADHERENCE_CLASSES:
+            raise RuntimeError("Thesis Adherence classification 非法")
+        cleaned.append({"text": str(span.get("text", ""))[:500], "classification": classification})
+        if classification == "UNSUPPORTED_NEW_CLAIM":
+            reason_codes.add("UNSUPPORTED_NEW_CLAIM")
+    tangent_count = sum(item["classification"] == "TANGENT" for item in cleaned)
+    if tangent_count > max(1, len(cleaned) // 2):
+        reason_codes.add("OFF_THESIS")
+    verdict = "PASS" if str(raw.get("verdict", "REJECT")).upper() == "PASS" and not reason_codes else "REJECT"
+    return {"verdict": verdict, "reason_codes": sorted(reason_codes), "spans": cleaned}
+
+
+def thesis_repair_instruction(adherence: dict, thesis: dict) -> str:
+    codes = adherence.get("reason_codes", [])
+    instructions = {
+        "THESIS_DRIFT": "删掉偏离中心主张的解释，只证明冻结的 primary_claim。",
+        "OFF_THESIS": "删除所有与 primary_claim 无直接关系的段落，不补新材料。",
+        "SECONDARY_THESIS_INTRODUCED": "删除第二中心主张，让所有 supporting claim 只服务 primary_claim。",
+        "UNSUPPORTED_NEW_CLAIM": "删除没有 fact id 支持的新事实或新因果，不得反向搜索补证据。",
+    }
+    return " ".join(instructions[code] for code in codes if code in instructions) + (
+        f" 冻结主张保持不变：{thesis.get('primary_claim', '')}"
+    )
 
 
 async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_facts: dict,
@@ -4154,18 +5720,46 @@ async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_
     provider = editorial_provider_config("GEMINI")
     critic_grok_context = {**grok_context, "text": str(grok_context.get("text", ""))[:5000]}
     content_domain = editorial_domain_label(topic.get("topic_domain", "crypto"))
+    style_recipe = topic.get("style_recipe") if isinstance(topic.get("style_recipe"), dict) else {}
     prompt = (
-        f"你是中文 {content_domain} 内容主编。只输出 JSON：{{\"verdict\":\"PASS或REJECT\",\"reasons\":[\"...\"],"
-        "\"unsupported_claims\":[\"...\"],\"rewrite_instruction\":\"...\"}。逐句核对待审稿：每条日期、数字、"
+        f"你是中文 {content_domain} 内容主编。只输出 JSON：{{\"adherence\":{{\"verdict\":\"PASS或REJECT\","
+        "\"reason_codes\":[\"THESIS_DRIFT\"],\"spans\":[{\"text\":\"...\",\"classification\":\"SUPPORTS_THESIS\"}]}},"
+        "\"verdict\":\"PASS或REJECT\",\"reasons\":[\"...\"],"
+        "\"unsupported_claims\":[\"...\"],\"rewrite_instruction\":\"...\"}。"
+        "先把成稿语义片段分类为 SUPPORTS_THESIS、NECESSARY_CONTEXT、QUALIFIES_THESIS、CONSTRAINS_THESIS、"
+        "RESTATEMENT、TANGENT 或 UNSUPPORTED_NEW_CLAIM。出现新中心主张标 SECONDARY_THESIS_INTRODUCED；"
+        "改写或弱化主张标 THESIS_DRIFT；离题过多标 OFF_THESIS。然后再做现有主编审核。逐句核对待审稿：每条日期、数字、"
         "价格、已经发生的事件、官方关系和因果断言，只要不能由 verified_facts 直接支持，就原句摘入 unsupported_claims。"
         "unsupported_claims 非空必须 REJECT。严格：没有具体的新冲突、只是在讲常识、AI 模板腔、"
         "把 Grok 背景或未提供材料写成事实、虚构人设经历、没有明确判断，均 REJECT。PASS 必须是有信息量、"
-        "有明确主题、像这个人设会说的话的帖子。只允许 verified_facts 成为事实；facts_used_ids 必须是其子集，"
+        "有明确主题、像这个人设会说的话的帖子。persona_thesis 是唯一通过条件：正文必须忠实推进 thesis，"
+        "读者结论必须等于 persona_thesis.reader_payoff.statement，不能换 Thesis、弱化为背景说明、两边都说，或在结尾撤销主张；否则 REJECT。"
+        "只允许 verified_facts 成为事实；facts_used_ids 必须是其子集，"
+        "正文如果主要在替官方解释更新、罗列参数与能力、写泛化安全提示、硬塞下载/申请/采购号召、使用‘唯一正确’或"
+        "‘行业必然重塑’式绝对预测，也必须 REJECT。合格稿只走一条主线，有具体影响和明确判断；"
+        "style_recipe 是题材结构；Hook、Context 释放、论证推进、收尾和 CTA 必须整体符合它，不能退回统一说明文模板，"
+        "也不能按人设另换一套结构。"
+        "style_recipe 的 CTA 若写默认不加、可以无、只有确实适合时才加或其他条件式表述，正文没有 CTA 完全合格，不能因此 REJECT。"
+        "陌生公司、产品、项目或术语在 Hook 后、最迟前三句仍未说明它是谁、做什么、为什么与本题有关，也必须 REJECT；"
+        "对象定位只需一句，并且只能要求 verified_facts 能支持的身份或本次作用；事实包未提供的产品类别、风险等级或历史背景，"
+        "不能作为缺失项要求 writer 补写，也不得用长篇背景凑字。"
+        "开源项目已有已核 Star、Fork、下载量、榜单、增长速度或知名采用者，却没有在开头使用最强信号做 Hook，"
+        "也必须 REJECT；没有已核指标时反而声称知名、爆火或社区都在用，同样 REJECT。"
         "且有 verified_facts 时不可为空。题目中的项目或资产名称本身，以及明确使用‘如果/只要/前提是’表达的条件判断，"
         "不应误判为已经发生的事实；TermMax S1、x402、L2 这类项目标识也不属于数字断言，"
+        "以‘我的判断是、我的理解是、在我看来’明确标出的产品解释或价值判断，只要推理起点来自 verified_facts、"
+        "没有夹带新的数字、事件、用户行为或历史前提，就属于观点，不能因为官方材料没有逐字写出该判断而列入 unsupported_claims。"
+        "first_person_allowed=false 只禁止虚构第一人称亲历，不禁止上述第一人称判断句；不能仅因出现‘我认为’而 REJECT。"
+        "source_kind=daily_supplement 且 source_item 带 source_url 或 source_locator 时，它是可追溯的方法论转述，"
+        "不是当天资讯：不得只因 verified_facts 为空、没有今日新闻或未出现数字而 REJECT。应检查正文是否围绕题目的"
+        "specific_tension 与该人设的具体取舍形成独立判断；只有退化成万能鸡汤、复读名人、伪造直接引语或没有具体冲突时才 REJECT。"
+        "source_mode=approved_editorial 时，它是已批准的常青观点卡，也不得只因没有当天新闻或 verified_facts 为空而 REJECT；"
+        "仍须拒绝把它伪装成新发生的事实、名人直接引语或万能鸡汤。"
+        "source_mode=paraphrase 时，正文出现引号、‘某某说过’或把 source_name 当作未经提供的事实，一律 REJECT。"
         "但条件句里夹带的价格、比例、日期、数量或已发生事件仍须 verified_facts。\n\n"
         f"永久成稿门槛：{json.dumps(topic_selection_policy().get('draft_quality_gates', []), ensure_ascii=False)}\n"
         f"人设：{json.dumps(persona, ensure_ascii=False)}\n题目：{json.dumps(topic, ensure_ascii=False)}\n"
+        f"本条行文结构：{json.dumps(style_recipe, ensure_ascii=False)}\n"
         f"verified_facts：{json.dumps(verified_facts, ensure_ascii=False)}\n"
         f"Grok 背景：{json.dumps(critic_grok_context, ensure_ascii=False)}\n"
         f"第一人称权限：{json.dumps(minimal_editorial_writer_context(writer_context), ensure_ascii=False)}\n"
@@ -4173,17 +5767,18 @@ async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_
         f"待审稿：{json.dumps(draft, ensure_ascii=False)}"
     )
     async with httpx.AsyncClient(timeout=240) as client:
-        response = await client.post(
-            provider["base_url"] + "/chat/completions",
-            headers={
-                "Authorization": f"Bearer {provider['key']}", "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0",
-            },
-            json={
-                "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}, "temperature": 0.2, "max_tokens": 5000,
-            },
-        )
+        async with gemini_request_key(provider) as key:
+            response = await client.post(
+                provider["base_url"] + "/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                },
+                json={
+                    "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"}, "temperature": 0.2, "max_tokens": 5000,
+                },
+            )
         response.raise_for_status()
     result = chat_completion_json(response.json())
     verdict = str(result.get("verdict", "REJECT")).upper()
@@ -4193,13 +5788,23 @@ async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_
         raise RuntimeError("Gemini critic unsupported_claims 不符合 JSON 字符串数组约束")
     unsupported = [item.strip()[:320] for item in raw_unsupported if item.strip()]
     rewrite_instruction = str(result.get("rewrite_instruction", "")).strip()
+    adherence = validate_thesis_adherence_result(result)
     return {
-        "verdict": "PASS" if verdict == "PASS" and not deterministic_failures and not unsupported else "REJECT",
+        "verdict": "PASS" if verdict == "PASS" and adherence["verdict"] == "PASS" and not deterministic_failures and not unsupported else "REJECT",
         "reasons": reasons or unsupported or deterministic_failures or ["主编未给出可发布结论"],
         "unsupported_claims": unsupported,
         "rewrite_instruction": (rewrite_instruction or "请围绕题目补足具体冲突和明确判断，删掉模板句。")[:600],
         "model": provider["model"],
+        "mode": "llm_critic",
+        "adherence": adherence,
     }
+
+
+def editorial_evaluation_concurrency() -> int:
+    try:
+        return min(5, max(1, int(os.getenv("XOPS_EDITORIAL_EVALUATION_CONCURRENCY", "5"))))
+    except ValueError:
+        return 5
 
 
 def editorial_generation_concurrency() -> int:
@@ -4219,10 +5824,14 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             ).fetchone()
             if not run or run["status"] != "approved":
                 return
+            raw_cards = json_value(run["raw_cards"], {})
+        validate_run_persona_theses(run_id, raw_cards)
+        resolve_persona_editorial_collisions(run_id)
+        with db() as conn:
             rows = conn.execute(
             """SELECT e.*,p.slug,p.name,p.draft FROM persona_editorial_evaluations e
                JOIN personas p ON p.id=e.persona_id
-               WHERE e.run_id=? AND e.status='WRITE'
+               WHERE e.run_id=? AND e.status='WRITE' AND e.thesis_state='THESIS_APPROVED'
                  AND (e.next_retry_at IS NULL OR e.next_retry_at<=?) AND (
                    e.candidate_id IS NULL OR NOT EXISTS (
                        SELECT 1 FROM post_candidates c
@@ -4235,7 +5844,23 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                ORDER BY e.id""",
             (run_id, retry_now),
             ).fetchall()
-            raw_cards = json_value(run["raw_cards"], {})
+        if rows:
+            providers = ["GEMINI"]
+            if any(
+                not json_value(row["generation_state"], {}).get("grok")
+                and not cached_editorial_topic_context(
+                    raw_cards, json_value(row["topic_json"], {})
+                )
+                for row in rows
+            ):
+                providers.append("GROK")
+            try:
+                await ensure_editorial_providers_ready(providers)
+            except (httpx.HTTPError, RuntimeError) as error:
+                with db() as conn:
+                    for row in rows:
+                        mark_persona_editorial_generation_retryable(conn, row["id"], error)
+                return
         semaphore = asyncio.Semaphore(editorial_generation_concurrency())
 
         async def generate_one(row):
@@ -4279,13 +5904,21 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                 record_persona_editorial_claim(conn, recovered, context_date)
                 continue
         topic = json_value(evaluation["topic_json"], {})
+        thesis = persona_thesis_contract(topic, evaluation)
+        thesis_error = persona_thesis_error(topic, evaluation)
+        if thesis_error:
+            with db() as conn:
+                supersede_persona_editorial_evaluation(
+                    conn, evaluation["id"], thesis_error, "写作前未通过 Persona Thesis 硬校验。"
+                )
+            continue
         topic_fields = (
             "claim_key", "subject", "title", "core_claim", "content_type", "material_delta",
             "audience_value", "why_now", "fact_basis", "opinion_basis", "source_topic_keys",
             "scope", "source_kind", "source_id", "source_refs", "angle", "asset_ids",
             "first_person_allowed", "parent_seed_key", "parent_claim_keys", "angle_family",
             "specific_tension", "non_obvious_delta", "why_worth_saying", "statement_mode",
-            "topic_domain",
+            "topic_domain", "structure_id", "style_recipe",
         )
         compact_topic = {}
         for key in topic_fields:
@@ -4299,6 +5932,10 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             else:
                 compact_topic[key] = value
         compact_topic.pop("fact_basis", None)
+        structure = editorial_content_structure(compact_topic, thesis)
+        compact_topic["structure_id"] = structure["id"]
+        compact_topic["style_recipe"] = structure
+        compact_topic["persona_thesis"] = thesis
         compact_daily = dict(snapshot["daily"])
         for key in ("market_state", "event_clusters", "debates", "evidence", "unknowns"):
             compact_daily[key] = str(compact_daily.get(key, ""))[:1200]
@@ -4313,44 +5950,187 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             "card": snapshot.get("persona_card", {}), "continuity": snapshot.get("persona_context", {}),
             "why_this_persona": evaluation["why_me"][:400],
         }
+        state = json_value(evaluation.get("generation_state"), {})
+        if not isinstance(state, dict):
+            state = {}
+        frozen_thesis_hash = hashlib.sha256(
+            json.dumps(thesis, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if state.get("frozen_thesis_hash") not in (None, frozen_thesis_hash):
+            with db() as conn:
+                supersede_persona_editorial_evaluation(
+                    conn, evaluation["id"], "THESIS_DRIFT", "生成状态中的冻结 Thesis 已发生变化。"
+                )
+            continue
+        state["frozen_thesis_hash"] = frozen_thesis_hash
         try:
-            grok_context = await enrich_persona_editorial_context(
-                compact_topic, verified_facts, compact_daily
+            grok_context = state.get("grok")
+            cached_facts = state.get("verified_facts")
+            if not isinstance(grok_context, dict) or not isinstance(cached_facts, dict):
+                grok_context = cached_editorial_topic_context(raw_cards, compact_topic)
+                if not grok_context:
+                    grok_context = await enrich_persona_editorial_context(
+                        compact_topic, verified_facts, compact_daily
+                    )
+                verified_facts = await enrich_verified_facts_with_github_traction(
+                    compact_topic, verified_facts, grok_context
+                )
+                state.update({
+                    "grok": grok_context,
+                    "verified_facts": verified_facts,
+                    "topic": compact_topic,
+                    "persona": persona,
+                    "writer_context": writer_context,
+                    "structure_revision": compact_topic["style_recipe"]["revision"],
+                })
+                if not persist_persona_editorial_generation_state(evaluation, "context_ready", state):
+                    continue
+            else:
+                verified_facts = cached_facts
+
+            structure_revision = compact_topic["style_recipe"]["revision"]
+            cached_structure_revision = int(
+                state.get("structure_revision")
+                or json_value(state.get("topic"), {}).get("style_recipe", {}).get("revision", 0)
+                or 0
             )
-            generated = await write_persona_editorial_gemini(
-                persona, compact_topic, verified_facts, grok_context, writer_context
-            )
-            failures = deterministic_editorial_style_failures(generated["text"], writer_context, verified_facts)
-            critic = await critique_persona_editorial_draft(
-                persona, compact_topic, verified_facts, grok_context, writer_context, generated, failures
-            )
-            attempts = 1
-            if critic["verdict"] != "PASS" or failures:
+            if cached_structure_revision != structure_revision:
+                for key in (
+                    "draft", "draft_failures", "critic", "rewrite", "rewrite_failures", "final_critic",
+                ):
+                    state.pop(key, None)
+                state.update({
+                    "topic": compact_topic,
+                    "structure_revision": structure_revision,
+                })
+                if not persist_persona_editorial_generation_state(
+                    evaluation, "context_ready", state
+                ):
+                    continue
+
+            generated = state.get("draft")
+            failures = state.get("draft_failures")
+            if not isinstance(generated, dict) or not isinstance(failures, list):
+                if not persist_persona_editorial_generation_state(evaluation, "draft_generating", state):
+                    continue
                 generated = await write_persona_editorial_gemini(
-                    persona, compact_topic, verified_facts, grok_context, writer_context,
-                    critic["rewrite_instruction"],
+                    persona, compact_topic, verified_facts, grok_context, writer_context
                 )
-                failures = deterministic_editorial_style_failures(generated["text"], writer_context, verified_facts)
+                failures = deterministic_editorial_style_failures(
+                    generated["text"], writer_context, verified_facts
+                )
+                state.update({
+                    "draft": generated,
+                    "draft_failures": failures,
+                    "writer_attempts": 1,
+                    "deterministic_guard_revision": EDITORIAL_DETERMINISTIC_GUARD_REVISION,
+                })
+                if not persist_persona_editorial_generation_state(evaluation, "draft_ready", state):
+                    continue
+            elif (
+                topic.get("source_kind") == "daily_supplement"
+                and int(state.get("deterministic_guard_revision") or 0)
+                != EDITORIAL_DETERMINISTIC_GUARD_REVISION
+            ):
+                failures = deterministic_editorial_style_failures(
+                    generated["text"], writer_context, verified_facts
+                )
+                for key in ("critic", "rewrite", "rewrite_failures", "final_critic"):
+                    state.pop(key, None)
+                state.update({
+                    "draft_failures": failures,
+                    "deterministic_guard_revision": EDITORIAL_DETERMINISTIC_GUARD_REVISION,
+                })
+                if not persist_persona_editorial_generation_state(evaluation, "draft_ready", state):
+                    continue
+            attempts = int(state.get("writer_attempts") or 1)
+
+            critic = state.get("critic")
+            needs_critic = editorial_always_critique() or bool(failures)
+            if needs_critic and not isinstance(critic, dict):
                 critic = await critique_persona_editorial_draft(
-                    persona, compact_topic, verified_facts, grok_context, writer_context, generated, failures
+                    persona, compact_topic, verified_facts, grok_context,
+                    writer_context, generated, failures,
                 )
-                attempts = 2
+                state["critic"] = critic
+                if not persist_persona_editorial_generation_state(evaluation, "critique_ready", state):
+                    continue
+            elif not needs_critic:
+                critic = local_editorial_critic("PASS", mode="local_first_pass")
+
+            adherence = critic.get("adherence") if isinstance(critic.get("adherence"), dict) else {
+                "verdict": critic["verdict"], "reason_codes": [], "spans": [],
+            }
+            state["thesis_adherence"] = adherence
+            if adherence["verdict"] != "PASS":
+                if not persist_persona_editorial_generation_state(
+                    evaluation, "thesis_adherence_failed", state
+                ):
+                    continue
+            if critic["verdict"] != "PASS" or failures:
+                rewritten = state.get("rewrite")
+                rewritten_failures = state.get("rewrite_failures")
+                if not isinstance(rewritten, dict) or not isinstance(rewritten_failures, list):
+                    repair_instruction = (
+                        thesis_repair_instruction(adherence, thesis)
+                        if adherence["verdict"] != "PASS" else critic["rewrite_instruction"]
+                    )
+                    rewritten = await write_persona_editorial_gemini(
+                        persona, compact_topic, verified_facts, grok_context, writer_context,
+                        repair_instruction,
+                    )
+                    rewritten_failures = deterministic_editorial_style_failures(
+                        rewritten["text"], writer_context, verified_facts
+                    )
+                    attempts += 1
+                    state.update({
+                        "rewrite": rewritten,
+                        "rewrite_failures": rewritten_failures,
+                        "writer_attempts": attempts,
+                        "thesis_repair_attempts": 1,
+                    })
+                    if not persist_persona_editorial_generation_state(evaluation, "rewrite_ready", state):
+                        continue
+                generated, failures = rewritten, rewritten_failures
+                if editorial_always_critique():
+                    critic = state.get("final_critic")
+                    if not isinstance(critic, dict):
+                        critic = await critique_persona_editorial_draft(
+                            persona, compact_topic, verified_facts, grok_context,
+                            writer_context, generated, failures,
+                        )
+                        state["final_critic"] = critic
+                        if not persist_persona_editorial_generation_state(
+                            evaluation, "final_critique_ready", state
+                        ):
+                            continue
+                else:
+                    critic = local_editorial_critic(
+                        "PASS" if not failures else "REJECT",
+                        failures,
+                        "local_after_targeted_rewrite",
+                    )
         except (HTTPException, httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, RuntimeError) as error:
             with db() as conn:
                 mark_persona_editorial_generation_retryable(conn, evaluation["id"], error)
             continue
-        if critic["verdict"] != "PASS" or failures:
+        adherence = critic.get("adherence") if isinstance(critic.get("adherence"), dict) else {
+            "verdict": critic["verdict"], "reason_codes": [], "spans": [],
+        }
+        if critic["verdict"] != "PASS" or adherence["verdict"] != "PASS" or failures:
             with db() as conn:
                 supersede_persona_editorial_evaluation(
-                    conn, evaluation["id"], "grok_gemini_critic_reject",
+                    conn, evaluation["id"],
+                    (adherence.get("reason_codes") or ["grok_gemini_critic_reject"])[0],
                     "；".join(critic["reasons"])[:1000],
                 )
             continue
         audit = {
+            "persona_thesis": thesis,
             "topic": {
                 key: compact_topic.get(key, "")
                 for key in (
-                    "claim_key", "parent_seed_key", "angle_family", "title", "core_claim",
+                    "claim_key", "parent_seed_key", "angle_family", "structure_id", "title", "core_claim",
                 )
             },
             "verified_facts": verified_facts,
@@ -4359,16 +6139,26 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             "grok": {
                 "model": grok_context["model"], "citations": grok_context["citations"],
                 "tool_usage": grok_context["tool_usage"],
+                "source": grok_context.get("source", "topic_search"),
                 "context_hash": hashlib.sha256(grok_context["text"].encode("utf-8")).hexdigest()[:16],
             },
-            "gemini": {"model": generated["model"], "attempts": attempts},
+            "gemini": {
+                "model": generated["model"], "attempts": attempts,
+                "structure_id": generated.get("style_id", ""),
+                "structure_revision": compact_topic["style_recipe"].get("revision", 1),
+            },
             "critic": {
                 "verdict": critic["verdict"], "reasons": critic["reasons"],
                 "unsupported_claims": critic.get("unsupported_claims", []),
+                "mode": critic.get("mode", "llm_critic"),
+                "model": critic.get("model", ""),
             },
+            "lineage_kind": "thesis_contract_v1_candidate",
+            "thesis_adherence": adherence,
         }
         now = int(time.time())
         with db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
                 "SELECT * FROM persona_editorial_evaluations WHERE id=?", (evaluation["id"],)
             ).fetchone()
@@ -4392,6 +6182,20 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                 supersede_persona_editorial_evaluation(
                     conn, evaluation["id"], "historical_duplicate_during_generation",
                     "正文生成期间已有其他候选覆盖相同核心主张。",
+                )
+                continue
+            target = daily_persona_draft_target()
+            replacing_legacy = bool(legacy and legacy["status"] == "needs_review")
+            if (
+                target > 0
+                and not replacing_legacy
+                and daily_persona_visible_draft_count(
+                    conn, evaluation["persona_id"], context_date
+                ) >= target
+            ):
+                supersede_persona_editorial_evaluation(
+                    conn, evaluation["id"], "daily_target_reached",
+                    "该人设当天候选已达到目标数量。",
                 )
                 continue
             conn.execute(
@@ -4421,8 +6225,14 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                     (now, f"persona_editorial:{evaluation['id']}"),
                 )
             conn.execute(
-                "UPDATE persona_editorial_evaluations SET candidate_id=?,updated_at=? WHERE id=?",
-                (candidate["id"], now, evaluation["id"]),
+                """UPDATE persona_editorial_evaluations
+                   SET candidate_id=?,generation_stage='candidate_ready',thesis_state='CANDIDATE_READY',
+                       thesis_adherence_json=?,thesis_repair_attempts=?,generation_attempts=0,
+                       next_retry_at=NULL,updated_at=? WHERE id=?""",
+                (
+                    candidate["id"], json.dumps(adherence, ensure_ascii=False, separators=(",", ":")),
+                    int(state.get("thesis_repair_attempts") or 0), now, evaluation["id"],
+                ),
             )
             saved = dict(conn.execute(
                 "SELECT * FROM persona_editorial_evaluations WHERE id=?", (evaluation["id"],)
@@ -4451,6 +6261,11 @@ async def recover_pending_persona_editorial_candidates(run_id: int | None = None
         ).fetchall()
     recovered = []
     for row in rows:
+        with db() as conn:
+            raw_cards = json_value(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (row["run_id"],)
+            ).fetchone()[0], {})
+        validate_run_persona_theses(row["run_id"], raw_cards)
         resolve_persona_editorial_collisions(row["run_id"])
         await generate_pending_persona_editorial_candidates(row["run_id"], row["context_date"])
         recovered.append(row["run_id"])
@@ -4461,6 +6276,11 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
     """Evaluate approved context only; WRITE creates a review-only candidate, never a post."""
     if not persona_editorial_enabled():
         return []
+    with db() as conn:
+        enforce_daily_persona_draft_cap(
+            conn, shanghai_today(), daily_persona_draft_target()
+        )
+    reopen_daily_supplement_guard_rejections(run_id)
     processed = await recover_pending_persona_editorial_candidates(run_id)
     with db() as conn:
         if run_id is None:
@@ -4509,7 +6329,9 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
         daily["approval_revision"] = run.get("approval_revision", 0)
         expanded_topics = await ensure_editorial_angle_expansion(run["id"], cards, daily)
         public_topics = expanded_topics if expanded_topics is not None else []
-        for persona_row in personas:
+        evaluation_semaphore = asyncio.Semaphore(editorial_evaluation_concurrency())
+
+        async def evaluate_one_persona(persona_row):
             persona = dict(persona_row)
             with db() as conn:
                 context_row = conn.execute(
@@ -4534,9 +6356,22 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
                        AND EXISTS (SELECT 1 FROM daily_context_runs r WHERE r.id=persona_editorial_evaluations.run_id AND r.context_date=?)""",
                     (persona["id"], run["context_date"]),
                 ).fetchone()[0]
+                target = daily_persona_draft_target()
+                available_slots = (
+                    max(
+                        0,
+                        target
+                        - daily_persona_draft_count(
+                            conn, persona["id"], run["context_date"]
+                        ),
+                    )
+                    if target > 0 else None
+                )
+            if available_slots == 0:
+                return
             topics = persona_editorial_topics(persona, public_topics, editorial_context)
             if not topics:
-                continue
+                return
             persona["_editorial_context"] = editorial_context
             inputs = []
             for topic in topics:
@@ -4555,16 +6390,29 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
             pending = [item for item in inputs if item[1] not in existing_hashes]
             if pending:
                 try:
-                    decisions = await evaluate_persona_editorial(
-                        persona, persona_context, daily, topics, stable_history, today_count
-                    )
+                    async with evaluation_semaphore:
+                        decisions = await evaluate_persona_editorial(
+                            persona, persona_context, daily, topics, stable_history, today_count
+                        )
                 except RuntimeError:
-                    continue
+                    return
                 decisions = apply_editorial_marginal_threshold(decisions, today_count)
                 decisions = apply_editorial_claim_history(persona["id"], decisions, history)
+                if available_slots is not None:
+                    decisions = limit_persona_editorial_writes(decisions, available_slots)
                 write_persona_editorial_evaluations(run["id"], persona["id"], pending, decisions)
+        await asyncio.gather(*(evaluate_one_persona(persona_row) for persona_row in personas))
+        validate_run_persona_theses(run["id"], cards)
+        resolve_persona_editorial_collisions(run["id"])
+        ensure_daily_persona_draft_floor(run["id"], [dict(persona_row) for persona_row in personas])
+        validate_run_persona_theses(run["id"], cards)
         resolve_persona_editorial_collisions(run["id"])
         await generate_pending_persona_editorial_candidates(run["id"], run["context_date"])
+        with db() as conn:
+            attach_publishable_assets_to_daily_supplements(conn, run["context_date"])
+            enforce_daily_persona_draft_cap(
+                conn, run["context_date"], daily_persona_draft_target()
+            )
         processed.append(run["id"])
     return processed
 
@@ -4574,21 +6422,109 @@ async def refresh_daily_post_draft(context_date: str, run_id: int, cards: dict |
     return await run_persona_editorial_pipeline(run_id)
 
 
+def daily_domain_cards(snapshot_output: Path, collect_result: dict, validation_result: dict,
+                       topic_domain: str) -> tuple[dict, dict]:
+    facts = with_topic_domain(read_card_file(snapshot_output / "fact_cards.json", "cards"), topic_domain)
+    opinions = with_topic_domain(
+        read_card_file(snapshot_output / "opinion_cards.json", "opinions"), topic_domain
+    )
+    attention_topics = read_card_file(snapshot_output / "attention_topics.json", "topics")
+    if not attention_topics:
+        attention_topics = read_card_file(snapshot_output / "attention_topics.json", "hot")
+    attention_topics = with_topic_domain(attention_topics[:20], topic_domain)
+    discussion_path = snapshot_output / "discussion_topics.json"
+    all_discussions = read_card_file(discussion_path, "hot")
+    hot_discussions = with_topic_domain(all_discussions[:20], topic_domain)
+    if not all_discussions and not discussion_path.exists():
+        all_discussions = attention_topics
+    discussion_topics = with_topic_domain(all_discussions[:20], topic_domain)
+    opportunity_questions = (
+        with_topic_domain(build_opportunity_questions(discussion_topics), topic_domain)
+        if topic_domain == "crypto" else []
+    )
+    editorial_questions = with_topic_domain(
+        build_editorial_questions(hot_discussions), topic_domain
+    )
+    research_questions = with_topic_domain(
+        build_research_questions(discussion_topics), topic_domain
+    )
+    niche_topics = with_topic_domain(
+        [
+            {
+                key: item[key]
+                for key in ("title", "key", "unique_authors", "post_count")
+                if key in item
+            }
+            for item in read_card_file(snapshot_output / "attention_topics.json", "niche")
+            if isinstance(item, dict)
+        ],
+        topic_domain,
+    )
+    coverage = {
+        "status": "ok",
+        "collect": collect_result if isinstance(collect_result, dict) else {},
+        "cross_validate": validation_result if isinstance(validation_result, dict) else {},
+        "fact_cards": len(facts),
+        "opinion_cards": len(opinions),
+        "attention_topics": len(attention_topics),
+        "discussion_topics": len(discussion_topics),
+        "opportunity_questions": len(opportunity_questions),
+        "editorial_questions": len(editorial_questions),
+        "research_questions": len(research_questions),
+        "niche_topics": len(niche_topics),
+    }
+    full = {
+        "topic_domain": topic_domain,
+        "coverage": coverage,
+        "topic_selection_policy": topic_selection_policy(),
+        "discussion_topics": discussion_topics,
+        "opportunity_questions": opportunity_questions,
+        "editorial_questions": editorial_questions,
+        "research_questions": research_questions,
+        "attention_topics": attention_topics,
+        "niche_topics": niche_topics,
+        "fact_cards": facts,
+        "opinion_cards": opinions,
+    }
+    controlled = controlled_cards(
+        facts,
+        opinions,
+        coverage,
+        attention_topics,
+        niche_topics,
+        discussion_topics,
+        opportunity_questions,
+        editorial_questions,
+        research_questions,
+        topic_selection_policy(),
+        recent_topic_claims(),
+    )
+    controlled["topic_domain"] = topic_domain
+    return full, controlled
+
+
 async def execute_daily_context_run(run_id: int):
     run = get_daily_context_run(run_id)
     paths = daily_context_paths(run["context_date"])
     manifest = {
         "context_date": run["context_date"],
         "accounts_path": str(paths["accounts"]),
+        "ai_accounts_path": str(paths["ai_accounts"]),
         "source_db": str(paths["source_db"]),
         "output": str(paths["output"]),
+        "domains": {},
         "stages": {},
     }
     try:
         if not paths["accounts"].exists():
             raise RuntimeError("母池账号配置不存在")
+        ai_enabled = os.getenv("XOPS_AI_SOURCE_ENABLED", "true").lower() == "true"
+        if ai_enabled and not paths["ai_accounts"].exists():
+            raise RuntimeError("AI 信源池账号配置不存在")
         paths["root"].mkdir(parents=True, exist_ok=True)
         sources = market_sources_module()
+        if ai_enabled and not callable(getattr(sources, "cross_validate_ai", None)):
+            raise RuntimeError("AI 信源验证模块未安装")
         key = twitter241_api_key()
         resume_hours = (
             int(os.getenv("XOPS_DAILY_CONTEXT_RESUME_HOURS", "20"))
@@ -4604,6 +6540,7 @@ async def execute_daily_context_run(run_id: int):
             hours=int(os.getenv("XOPS_DAILY_CONTEXT_HOURS", "30")),
             workers=int(os.getenv("XOPS_DAILY_CONTEXT_WORKERS", "8")),
             resume_hours=resume_hours,
+            topic_domain="crypto",
         )
         source_run_id = str(collect_result.get("run_id") or "").strip()
         if not source_run_id:
@@ -4612,6 +6549,11 @@ async def execute_daily_context_run(run_id: int):
         manifest["source_run_id"] = source_run_id
         manifest["output"] = str(snapshot_output)
         manifest["stages"]["collect"] = collect_result
+        manifest["domains"]["crypto"] = {
+            "source_run_id": source_run_id,
+            "output": str(snapshot_output),
+            "status": "collected",
+        }
         update_daily_context_run(run_id, raw_manifest=json.dumps(manifest, ensure_ascii=False))
 
         validation_result = await asyncio.to_thread(
@@ -4622,88 +6564,129 @@ async def execute_daily_context_run(run_id: int):
             hours=int(os.getenv("XOPS_DAILY_CONTEXT_HOURS", "30")),
         )
         manifest["stages"]["cross_validate"] = validation_result
-        facts = read_card_file(snapshot_output / "fact_cards.json", "cards")
-        opinions = read_card_file(snapshot_output / "opinion_cards.json", "opinions")
-        attention_topics = read_card_file(snapshot_output / "attention_topics.json", "topics")
-        if not attention_topics:
-            attention_topics = read_card_file(snapshot_output / "attention_topics.json", "hot")
-        attention_topics = attention_topics[:20]
-        discussion_path = snapshot_output / "discussion_topics.json"
-        discussion_topics = read_card_file(discussion_path, "hot")
-        hot_discussion_topics = discussion_topics[:20]
-        if not discussion_topics and not discussion_path.exists():
-            discussion_topics = attention_topics
-        discussion_topics = discussion_topics[:20]
-        opportunity_questions = build_opportunity_questions(discussion_topics)
-        editorial_questions = build_editorial_questions(hot_discussion_topics)
-        research_questions = build_research_questions(discussion_topics)
-        niche_topics = [
-            {
-                key: item[key]
-                for key in ("title", "key", "unique_authors", "post_count")
-                if key in item
-            }
-            for item in read_card_file(snapshot_output / "attention_topics.json", "niche")
-            if isinstance(item, dict)
-        ]
-        coverage = {
-            "collect": collect_result if isinstance(collect_result, dict) else {},
-            "cross_validate": validation_result if isinstance(validation_result, dict) else {},
-            "fact_cards": len(facts),
-            "opinion_cards": len(opinions),
-            "attention_topics": len(attention_topics),
-            "discussion_topics": len(discussion_topics),
-            "opportunity_questions": len(opportunity_questions),
-            "editorial_questions": len(editorial_questions),
-            "research_questions": len(research_questions),
-            "niche_topics": len(niche_topics),
-        }
-        manifest["count"] = coverage["collect"].get("posts_seen", 0)
-        covered_accounts = coverage["collect"].get("accounts_fetched", 0) + coverage["collect"].get(
+        manifest["domains"]["crypto"]["status"] = "ready"
+        crypto_full, crypto_controlled = daily_domain_cards(
+            snapshot_output, collect_result, validation_result, "crypto"
+        )
+        crypto_coverage = crypto_full["coverage"]
+        covered_accounts = crypto_coverage["collect"].get("accounts_fetched", 0) + crypto_coverage["collect"].get(
             "accounts_skipped", 0
         )
         if not covered_accounts:
             raise RuntimeError("母池账号抓取全部失败")
-        if not coverage["collect"].get("posts_seen") and not coverage["cross_validate"].get("source_posts"):
+        if not crypto_coverage["collect"].get("posts_seen") and not crypto_coverage["cross_validate"].get("source_posts"):
             raise RuntimeError("母池没有可用帖子")
-        if not facts and not opinions:
-            raise RuntimeError("交叉验证未产出可用事实或观点卡")
+        domain_full = {"crypto": crypto_full}
+        domain_controlled = {"crypto": crypto_controlled}
+
+        if ai_enabled:
+            try:
+                ai_collect = await asyncio.to_thread(
+                    sources.collect,
+                    paths["ai_accounts"],
+                    paths["source_db"],
+                    paths["ai_output"],
+                    key=key,
+                    hours=int(os.getenv("XOPS_DAILY_CONTEXT_HOURS", "30")),
+                    workers=int(os.getenv("XOPS_DAILY_CONTEXT_WORKERS", "8")),
+                    resume_hours=max(resume_hours, 1),
+                    topic_domain="ai",
+                )
+                ai_run_id = str(ai_collect.get("run_id") or "").strip()
+                if not ai_run_id:
+                    raise RuntimeError("AI 信源抓取结果缺少 run_id")
+                ai_snapshot = Path(ai_collect.get("snapshot_dir", paths["ai_output"]))
+                manifest["stages"]["ai_collect"] = ai_collect
+                manifest["domains"]["ai"] = {
+                    "source_run_id": ai_run_id,
+                    "output": str(ai_snapshot),
+                    "status": "collected",
+                }
+                update_daily_context_run(
+                    run_id, raw_manifest=json.dumps(manifest, ensure_ascii=False)
+                )
+                ai_covered = int(ai_collect.get("accounts_fetched") or 0) + int(
+                    ai_collect.get("accounts_skipped") or 0
+                )
+                if not ai_covered:
+                    raise RuntimeError("AI 信源池账号抓取全部失败")
+                ai_validation = await asyncio.to_thread(
+                    sources.cross_validate_ai,
+                    paths["source_db"],
+                    ai_snapshot,
+                    run_id=ai_run_id,
+                    hours=int(os.getenv("XOPS_DAILY_CONTEXT_HOURS", "30")),
+                )
+                manifest["stages"]["ai_cross_validate"] = ai_validation
+                manifest["domains"]["ai"]["status"] = "ready"
+                ai_full, ai_controlled = daily_domain_cards(
+                    ai_snapshot, ai_collect, ai_validation, "ai"
+                )
+                domain_full["ai"] = ai_full
+                domain_controlled["ai"] = ai_controlled
+            except Exception as error:
+                manifest["domains"]["ai"] = {
+                    **manifest["domains"].get("ai", {}),
+                    "status": "failed",
+                    "error": str(error)[:500],
+                }
+
+        list_fields = (
+            "discussion_topics", "opportunity_questions", "editorial_questions",
+            "research_questions", "attention_topics", "niche_topics", "fact_cards",
+            "opinion_cards",
+        )
+        coverage = {**crypto_coverage, "domains": {}}
+        for domain, material in domain_full.items():
+            coverage["domains"][domain] = material["coverage"]
+        if ai_enabled and "ai" not in domain_full:
+            coverage["domains"]["ai"] = manifest["domains"]["ai"]
+        for field in list_fields:
+            coverage[field] = sum(len(material.get(field, [])) for material in domain_full.values())
+        manifest["count"] = sum(
+            int(material["coverage"]["collect"].get("posts_seen") or 0)
+            for material in domain_full.values()
+        )
         full_cards = {
             "coverage": coverage,
             "topic_selection_policy": topic_selection_policy(),
-            "discussion_topics": discussion_topics,
-            "opportunity_questions": opportunity_questions,
-            "editorial_questions": editorial_questions,
-            "research_questions": research_questions,
-            "attention_topics": attention_topics,
-            "niche_topics": niche_topics,
-            "fact_cards": facts,
-            "opinion_cards": opinions,
+            "domains": domain_full,
+            **{
+                field: [
+                    item for material in domain_full.values()
+                    for item in material.get(field, []) if isinstance(item, dict)
+                ]
+                for field in list_fields
+            },
         }
-        cards = controlled_cards(
-            facts,
-            opinions,
-            coverage,
-            attention_topics,
-            niche_topics,
-            discussion_topics,
-            opportunity_questions,
-            editorial_questions,
-            research_questions,
-            topic_selection_policy(),
-            recent_topic_claims(),
-        )
+        if not full_cards["fact_cards"] and not full_cards["opinion_cards"]:
+            raise RuntimeError("交叉验证未产出可用事实或观点卡")
         update_daily_context_run(
             run_id,
             raw_manifest=json.dumps(manifest, ensure_ascii=False),
             raw_cards=json.dumps(full_cards, ensure_ascii=False),
         )
-        synthesis = await synthesize_daily_cards(run["context_date"], cards)
+        domains_to_synthesize = [
+            (domain, cards) for domain, cards in domain_controlled.items()
+            if cards.get("fact_cards") or cards.get("opinion_cards")
+            or cards.get("discussion_topics") or cards.get("attention_topics")
+        ]
+        synthesized = await asyncio.gather(*(
+            synthesize_daily_cards(run["context_date"], cards)
+            for _, cards in domains_to_synthesize
+        ))
+        domain_syntheses = {
+            domain: result for (domain, _), result in zip(domains_to_synthesize, synthesized)
+        }
+        if len(domain_syntheses) == 1:
+            synthesis = {**next(iter(domain_syntheses.values())), "domains": domain_syntheses}
+        else:
+            synthesis = combine_domain_syntheses(domain_syntheses)
         selected_topics = synthesis.get("selected_topics", [])
         full_cards["question_candidates"] = {
-            "opportunity": opportunity_questions,
-            "editorial": editorial_questions,
-            "research": research_questions,
+            "opportunity": full_cards["opportunity_questions"],
+            "editorial": full_cards["editorial_questions"],
+            "research": full_cards["research_questions"],
         }
         full_cards["selected_topics"] = selected_topics
         full_cards["rejected_topics"] = synthesis.get("rejected_topics", [])
@@ -4718,6 +6701,16 @@ async def execute_daily_context_run(run_id: int):
         ]
         coverage["selected_topics"] = len(selected_topics)
         coverage["rejected_topics"] = len(full_cards["rejected_topics"])
+        for domain, material in domain_full.items():
+            selected = [
+                item for item in selected_topics
+                if str(item.get("topic_domain") or "crypto").lower() == domain
+            ]
+            rejected = domain_syntheses.get(domain, {}).get("rejected_topics", [])
+            material["selected_topics"] = selected
+            material["rejected_topics"] = rejected
+            material["coverage"]["selected_topics"] = len(selected)
+            material["coverage"]["rejected_topics"] = len(rejected)
         result = update_daily_context_run(
             run_id,
             status="needs_review",
@@ -4769,13 +6762,42 @@ async def daily_context_scheduler():
 
 
 async def run_due_daily_post():
-    return await run_persona_editorial_pipeline()
+    if not persona_editorial_enabled():
+        return False
+    context_date = shanghai_today()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id,status FROM daily_context_runs WHERE context_date=?",
+            (context_date,),
+        ).fetchone()
+    if not row:
+        return False
+    if row["status"] == "needs_review":
+        approve_daily_context_run(context_date)
+    elif row["status"] != "approved":
+        return False
+    return queue_daily_post_generation(row["id"])
+
+
+def queue_daily_post_generation(run_id: int):
+    task = DAILY_POST_GENERATION_TASKS.get(run_id)
+    if task and not task.done():
+        return False
+    task = asyncio.create_task(run_persona_editorial_pipeline(run_id))
+    DAILY_POST_GENERATION_TASKS[run_id] = task
+
+    def discard(done_task):
+        if DAILY_POST_GENERATION_TASKS.get(run_id) is done_task:
+            DAILY_POST_GENERATION_TASKS.pop(run_id, None)
+
+    task.add_done_callback(discard)
+    return True
 
 
 async def persona_editorial_scheduler():
     while True:
         try:
-            await run_persona_editorial_pipeline()
+            await run_due_daily_post()
         except Exception:
             pass
         await asyncio.sleep(30)
@@ -4809,6 +6831,8 @@ async def lifespan(_app):
     editorial_task.cancel()
     for task in list(DAILY_CONTEXT_TASKS):
         task.cancel()
+    for task in list(DAILY_POST_GENERATION_TASKS.values()):
+        task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -4841,6 +6865,36 @@ def health():
         "daily_context_run_time": f"{hour:02d}:{minute:02d}",
         "timezone": str(TZ),
         "operator_auth_enabled": bool(operator_token()),
+        "gemini_pool_configured_slots": configured_gemini_pool_size(),
+        "daily_persona_editorial_enabled": persona_editorial_enabled(),
+        "daily_persona_draft_target": daily_persona_draft_target(),
+        "editorial_evaluation_concurrency": editorial_evaluation_concurrency(),
+        "editorial_content_structure_revision": editorial_content_structure_config().get("revision", 1),
+        "thesis_contract_version": THESIS_CONTRACT_VERSION,
+    }
+
+
+@app.get("/api/thesis-metrics")
+def thesis_metrics():
+    with db() as conn:
+        status_rows = conn.execute(
+            "SELECT thesis_state,COUNT(*) count FROM persona_editorial_evaluations GROUP BY thesis_state"
+        ).fetchall()
+        reason_rows = conn.execute(
+            """SELECT reason_code,COUNT(*) count FROM persona_editorial_evaluations
+               WHERE reason_code<>'' GROUP BY reason_code"""
+        ).fetchall()
+        repair_rows = conn.execute(
+            """SELECT SUM(thesis_repair_attempts) repairs,
+                      SUM(CASE WHEN thesis_state='CANDIDATE_READY' THEN 1 ELSE 0 END) ready
+               FROM persona_editorial_evaluations"""
+        ).fetchone()
+    return {
+        "contract_version": THESIS_CONTRACT_VERSION,
+        "states": {row["thesis_state"]: row["count"] for row in status_rows},
+        "reason_codes": {row["reason_code"]: row["count"] for row in reason_rows},
+        "repairs": int(repair_rows["repairs"] or 0),
+        "candidate_ready": int(repair_rows["ready"] or 0),
     }
 
 
@@ -5138,12 +7192,21 @@ def get_daily_context_run_for_date(context_date: str):
 
 
 @app.get("/api/context/daily-runs/{context_date}/source-posts")
-def get_daily_context_source_posts(context_date: str, limit: int = 50, offset: int = 0):
+def get_daily_context_source_posts(context_date: str, limit: int = 50, offset: int = 0,
+                                   topic_domain: str = "crypto"):
     run = get_daily_context_run_for_date(context_date)
     if run["status"] in {"queued", "running"}:
         raise HTTPException(404, "Mother-pool source posts are not available until the run completes")
-    output = str(run.get("raw_manifest", {}).get("output") or "").strip()
-    path = (Path(output) if output else daily_context_paths(context_date)["output"]) / "latest.json"
+    topic_domain = topic_domain.lower().strip()
+    if topic_domain not in {"crypto", "ai"}:
+        raise HTTPException(422, "topic_domain must be crypto or ai")
+    manifest = run.get("raw_manifest", {}) if isinstance(run.get("raw_manifest"), dict) else {}
+    domain_manifest = manifest.get("domains", {}).get(topic_domain, {}) if isinstance(manifest.get("domains"), dict) else {}
+    fallback = daily_context_paths(context_date)["ai_output" if topic_domain == "ai" else "output"]
+    output = str(
+        domain_manifest.get("output") or (manifest.get("output") if topic_domain == "crypto" else "") or ""
+    ).strip()
+    path = (Path(output) if output else fallback) / "latest.json"
     if not path.exists():
         raise HTTPException(404, "Mother-pool source posts artifact not found")
     try:
@@ -5158,6 +7221,7 @@ def get_daily_context_source_posts(context_date: str, limit: int = 50, offset: i
     fields = ("post_id", "author_id", "handle", "text", "created_at", "url", "is_reply", "source_lists")
     return {
         "context_date": context_date,
+        "topic_domain": topic_domain,
         "generated_at": payload.get("generated_at"),
         "since": payload.get("since"),
         "total": len(posts),
@@ -5350,6 +7414,95 @@ def approve_daily_context_run(context_date: str):
             "SELECT * FROM daily_context_runs WHERE id=?", (current["id"],)
         ).fetchone()
     return daily_context_run_dict(row)
+
+
+@app.post("/api/daily-posts/generate")
+async def generate_today_daily_posts():
+    if not persona_editorial_enabled():
+        raise HTTPException(409, "Daily post generation is disabled")
+    context_date = shanghai_today()
+    run = get_daily_context_run_for_date(context_date)
+    if run["status"] != "approved":
+        raise HTTPException(409, "Today's daily context must be approved before generating drafts")
+    started = queue_daily_post_generation(run["id"])
+    return {
+        "context_date": context_date,
+        "run_id": run["id"],
+        "context_status": run["status"],
+        "started": started,
+        "status": "running" if started else "already_running",
+        "target_per_persona": daily_persona_draft_target(),
+        "poll_url": "/api/daily-posts",
+    }
+
+
+@app.post("/api/daily-posts/regenerate")
+async def regenerate_today_daily_posts():
+    if not persona_editorial_enabled():
+        raise HTTPException(409, "Daily post generation is disabled")
+    context_date = shanghai_today()
+    run = get_daily_context_run_for_date(context_date)
+    if run["status"] != "approved":
+        raise HTTPException(409, "Today's daily context must be approved before regenerating drafts")
+
+    task = DAILY_POST_GENERATION_TASKS.get(run["id"])
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    now = int(time.time())
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        published = conn.execute(
+            """SELECT COUNT(*) FROM post_candidates c
+               JOIN persona_editorial_evaluations e ON e.candidate_id=c.id
+               WHERE e.run_id=? AND c.source LIKE 'persona_editorial_grok_gemini:%'
+                 AND c.status='published'""",
+            (run["id"],),
+        ).fetchone()[0]
+        if published:
+            raise HTTPException(409, "Published posts cannot be regenerated as a batch")
+        superseded = conn.execute(
+            """UPDATE post_candidates SET status='superseded',updated_at=?
+               WHERE id IN (SELECT candidate_id FROM persona_editorial_evaluations WHERE run_id=?)
+                 AND source LIKE 'persona_editorial_grok_gemini:%'
+                 AND status IN ('needs_review','queued')""",
+            (now, run["id"]),
+        ).rowcount
+        conn.execute(
+            """UPDATE topic_claim_history SET status='superseded',last_seen_at=?
+               WHERE source IN (
+                 SELECT 'persona_editorial_grok_gemini:' || id
+                 FROM persona_editorial_evaluations WHERE run_id=?
+               )""",
+            (now, run["id"]),
+        )
+        conn.execute(
+            """UPDATE persona_editorial_evaluations
+               SET status='HOLD',reason_code='manual_regeneration',
+                   rationale='按当前内容结构重新生成。',updated_at=?
+               WHERE run_id=?""",
+            (now, run["id"]),
+        )
+        conn.execute(
+            """UPDATE daily_context_runs
+               SET approval_revision=approval_revision+1,updated_at=? WHERE id=?""",
+            (now, run["id"]),
+        )
+
+    started = queue_daily_post_generation(run["id"])
+    return {
+        "context_date": context_date,
+        "run_id": run["id"],
+        "superseded": superseded,
+        "started": started,
+        "status": "running" if started else "already_running",
+        "target_per_persona": daily_persona_draft_target(),
+        "poll_url": "/api/daily-posts",
+    }
 
 
 @app.get("/api/personas/{persona_id}/context")
@@ -6008,27 +8161,207 @@ async def generate_persona_post(persona_id: int, request: PostGenerationIn):
     return {"post": post, "context_pack_id": request.context_pack_id}
 
 
-def queued_post_rows(conn):
+def queued_post_rows(conn, context_date: str | None = None):
+    where_date = "AND c.context_date=?" if context_date else ""
+    params = (context_date,) if context_date else ()
     return conn.execute(
-        """SELECT c.*,p.slug persona_slug,p.name persona_name,p.avatar
+        f"""SELECT c.*,p.slug persona_slug,p.name persona_name,p.avatar
            FROM post_candidates c JOIN personas p ON p.id=c.persona_id
-           WHERE c.status='needs_review'
+           WHERE c.status='needs_review' {where_date}
              AND c.source LIKE 'persona_editorial_grok_gemini:%'
              AND EXISTS (
                  SELECT 1 FROM persona_editorial_evaluations e
                  JOIN daily_context_runs r ON r.id=e.run_id
                  WHERE ('persona_editorial_grok_gemini:' || e.id)=c.source
                    AND e.status='WRITE' AND r.status='approved'
+                   AND (e.thesis_state='CANDIDATE_READY' OR e.thesis_json='{{}}')
              )
-           ORDER BY c.persona_id,c.created_at,c.id"""
+           ORDER BY c.persona_id,c.created_at,c.id""",
+        params,
     ).fetchall()
+
+
+def daily_post_output_ready(conn, context_date: str) -> bool:
+    runs = conn.execute(
+        "SELECT id FROM daily_context_runs WHERE context_date=? AND status='approved'",
+        (context_date,),
+    ).fetchall()
+    if not runs:
+        return False
+    if any(
+        (task := DAILY_POST_GENERATION_TASKS.get(row["id"])) is not None and not task.done()
+        for row in runs
+    ):
+        return False
+    active = conn.execute(
+        """SELECT COUNT(*) FROM persona_editorial_evaluations e
+           JOIN daily_context_runs r ON r.id=e.run_id
+           WHERE r.context_date=? AND r.status='approved' AND e.status='WRITE'
+             AND NOT EXISTS (
+                 SELECT 1 FROM post_candidates c
+                 WHERE (c.id=e.candidate_id OR c.source=('persona_editorial_grok_gemini:' || e.id))
+                   AND c.status IN ('needs_review','queued','published')
+             )""",
+        (context_date,),
+    ).fetchone()[0]
+    return not active
+
+
+@app.post("/api/post-candidates/{candidate_id}/rewrite")
+async def rewrite_post_candidate(candidate_id: int, feedback: CandidateRewriteIn):
+    instruction = EDITORIAL_FEEDBACK_INSTRUCTIONS.get(feedback.feedback_code)
+    if not instruction:
+        raise HTTPException(400, "Unknown feedback code")
+    with db() as conn:
+        row = conn.execute(
+            """SELECT c.*,e.id evaluation_id,e.generation_state,e.topic_input_hash,
+                      r.status run_status
+               FROM post_candidates c
+               JOIN persona_editorial_evaluations e
+                 ON c.source=('persona_editorial_grok_gemini:' || e.id)
+               JOIN daily_context_runs r ON r.id=e.run_id
+               WHERE c.id=?""",
+            (candidate_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Post candidate not found")
+    if row["status"] != "needs_review" or row["run_status"] != "approved":
+        raise HTTPException(409, "Post candidate is not open for rewrite")
+    state = json_value(row["generation_state"], {})
+    required = ("topic", "persona", "writer_context", "verified_facts", "grok")
+    if not isinstance(state, dict) or any(not isinstance(state.get(key), dict) for key in required):
+        raise HTTPException(409, "This candidate predates resumable generation; regenerate it once first")
+    try:
+        await ensure_editorial_providers_ready(("GEMINI",))
+        topic = dict(state["topic"])
+        structure = editorial_content_structure(topic)
+        topic.update({"structure_id": structure["id"], "style_recipe": structure})
+        note = feedback.note.strip()
+        rewrite_instruction = (
+            f"人工反馈：{instruction}"
+            + (f" 补充说明：{note}" if note else "")
+            + f"\n上一稿：{row['body']}"
+        )
+        first_draft = await write_persona_editorial_gemini(
+            state["persona"], topic, state["verified_facts"], state["grok"],
+            state["writer_context"], rewrite_instruction,
+        )
+        failures = deterministic_editorial_style_failures(
+            first_draft["text"], state["writer_context"], state["verified_facts"]
+        )
+        first_critic = await critique_persona_editorial_draft(
+            state["persona"], topic, state["verified_facts"], state["grok"],
+            state["writer_context"], first_draft, failures,
+        )
+        generated = first_draft
+        critic = first_critic
+        attempts = 1
+        if critic["verdict"] != "PASS" or failures:
+            repair = "\n".join(filter(None, (
+                critic.get("rewrite_instruction", ""),
+                "必须修复：" + "；".join(failures) if failures else "",
+            )))
+            generated = await write_persona_editorial_gemini(
+                state["persona"], topic, state["verified_facts"], state["grok"],
+                state["writer_context"], rewrite_instruction + "\n" + repair,
+            )
+            failures = deterministic_editorial_style_failures(
+                generated["text"], state["writer_context"], state["verified_facts"]
+            )
+            attempts = 2
+            critic = await critique_persona_editorial_draft(
+                state["persona"], topic, state["verified_facts"], state["grok"],
+                state["writer_context"], generated, failures,
+            )
+        if critic["verdict"] != "PASS" or failures:
+            raise RuntimeError("；".join(critic.get("reasons", []) + failures))
+    except (httpx.HTTPError, KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise HTTPException(502, f"单条重写失败：{str(error)[:240]}") from error
+
+    now = int(time.time())
+    notes = json_value(row["notes"], {})
+    if not isinstance(notes, dict):
+        notes = {}
+    history = notes.get("feedback_history", [])
+    if not isinstance(history, list):
+        history = []
+    history.append({
+        "feedback_code": feedback.feedback_code,
+        "note": note,
+        "previous_hash": hashlib.sha256(row["body"].encode("utf-8")).hexdigest()[:16],
+        "model": generated["model"],
+        "created_at": now,
+    })
+    notes["feedback_history"] = history[-20:]
+    notes.update({
+        "topic": {
+            key: topic.get(key, "") for key in (
+                "claim_key", "parent_seed_key", "angle_family", "structure_id", "title", "core_claim",
+            )
+        },
+        "verified_facts": state["verified_facts"],
+        "facts_used_ids": generated.get("facts_used_ids", []),
+        "stance": generated.get("stance", ""),
+        "grok": {
+            "model": state["grok"].get("model", ""),
+            "citations": state["grok"].get("citations", []),
+            "tool_usage": state["grok"].get("tool_usage", []),
+            "source": state["grok"].get("source", "topic_search"),
+            "context_hash": hashlib.sha256(
+                str(state["grok"].get("text", "")).encode("utf-8")
+            ).hexdigest()[:16],
+        },
+        "gemini": {
+            "model": generated["model"], "attempts": attempts,
+            "structure_id": structure["id"], "structure_revision": structure["revision"],
+            "body_hash": hashlib.sha256(generated["text"].encode("utf-8")).hexdigest()[:16],
+        },
+        "critic": {
+            "verdict": critic["verdict"], "reasons": critic.get("reasons", []),
+            "unsupported_claims": critic.get("unsupported_claims", []),
+            "mode": critic.get("mode", "llm_critic"), "model": critic.get("model", ""),
+        },
+    })
+    state.update({
+        "topic": topic, "draft": first_draft,
+        "draft_failures": deterministic_editorial_style_failures(
+            first_draft["text"], state["writer_context"], state["verified_facts"]
+        ),
+        "critic": first_critic, "writer_attempts": attempts,
+    })
+    for key in ("rewrite", "rewrite_failures", "final_critic"):
+        state.pop(key, None)
+    if attempts == 2:
+        state.update({
+            "rewrite": generated, "rewrite_failures": failures, "final_critic": critic,
+        })
+    with db() as conn:
+        current = conn.execute(
+            "SELECT status,body FROM post_candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        if not current or current["status"] != "needs_review" or current["body"] != row["body"]:
+            raise HTTPException(409, "Post candidate changed during rewrite")
+        conn.execute(
+            "UPDATE post_candidates SET body=?,notes=?,updated_at=? WHERE id=?",
+            (generated["text"], json.dumps(notes, ensure_ascii=False), now, candidate_id),
+        )
+        conn.execute(
+            """UPDATE persona_editorial_evaluations
+               SET generation_stage='candidate_ready',generation_state=?,updated_at=?
+               WHERE id=? AND topic_input_hash=?""",
+            (
+                json.dumps(state, ensure_ascii=False, separators=(",", ":")), now,
+                row["evaluation_id"], row["topic_input_hash"],
+            ),
+        )
+    return {"id": candidate_id, "body": generated["text"], "status": "needs_review"}
 
 
 @app.post("/api/post-candidates/{candidate_id}/published")
 def mark_post_candidate_published(candidate_id: int):
     with db() as conn:
         candidate = conn.execute(
-            "SELECT id,persona_id,status FROM post_candidates WHERE id=?", (candidate_id,)
+            "SELECT id,persona_id,context_date,status FROM post_candidates WHERE id=?", (candidate_id,)
         ).fetchone()
         if not candidate:
             raise HTTPException(404, "Post candidate not found")
@@ -6037,7 +8370,10 @@ def mark_post_candidate_published(candidate_id: int):
         if candidate["status"] != "needs_review":
             raise HTTPException(409, "Post candidate is not publishable")
         head = next(
-            (row for row in queued_post_rows(conn) if row["persona_id"] == candidate["persona_id"]),
+            (
+                row for row in queued_post_rows(conn, candidate["context_date"])
+                if row["persona_id"] == candidate["persona_id"]
+            ),
             None,
         )
         if not head or head["id"] != candidate_id:
@@ -6068,8 +8404,11 @@ def daily_post_asset_url(slug: str, _context_date: str, asset_id: str = ""):
 
 @app.get("/api/daily-posts")
 def get_daily_posts():
+    context_date = shanghai_today()
     with db() as conn:
-        queued = queued_post_rows(conn)
+        if not daily_post_output_ready(conn, context_date):
+            return []
+        queued = queued_post_rows(conn, context_date)
     remaining = {}
     for row in queued:
         persona_id = row["persona_id"]
@@ -6083,6 +8422,9 @@ def get_daily_posts():
         result.append(
             {
                 **dict(row),
+                "lineage_kind": json_value(row["notes"], {}).get(
+                    "lineage_kind", "legacy_candidate"
+                ),
                 "persona_name": public_profile.get("display_name", row["persona_name"]),
                 "position": positions[persona_id],
                 "remaining": remaining[persona_id],
@@ -6100,7 +8442,7 @@ def get_daily_posts():
 
 
 INDEX_HTML = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>每日 Post 草稿队列</title>
-<style>body{font:15px/1.7 system-ui;max-width:1080px;margin:36px auto;padding:0 18px;color:#18181b;background:#f7f8fa}header{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:22px}h1{margin:0;font-size:26px}header p{margin:3px 0 0;color:#71717a}nav{display:flex;gap:16px}a{color:#2563eb;text-decoration:none}.queue{display:grid;gap:24px}.account{background:#fff;border:1px solid #e2e4e8;border-radius:14px;padding:20px}.account-head{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:14px}.account-head h2{margin:0;font-size:20px}.count{color:#71717a}.tweets{display:grid;gap:12px}.card{display:grid;grid-template-columns:120px 1fr;border:1px solid #e2e4e8;border-radius:10px;overflow:hidden}.image{width:100%;height:100%;min-height:160px;object-fit:cover;background:#eceef1}.content{padding:16px;white-space:pre-wrap}.meta{color:#71717a;font-size:13px;margin-bottom:6px}.title{font-weight:750;margin-bottom:8px}.note{color:#8a641b;font-size:12px;margin-top:12px}.done{margin-top:12px;border:0;border-radius:9px;padding:9px 14px;background:#18181b;color:#fff;cursor:pointer}.done:disabled{opacity:.55;cursor:wait}.waiting{display:inline-block;margin-top:12px;color:#71717a;font-size:13px}.queued{padding:28px;color:#71717a}.empty-image{display:grid;place-items:center;background:#eceef1;color:#8b9098}@media(max-width:680px){header{display:block}nav{margin-top:12px}.account-head{display:block}.card{grid-template-columns:1fr}.image{height:220px}}</style>
+<style>body{font:15px/1.7 system-ui;max-width:1080px;margin:36px auto;padding:0 18px;color:#18181b;background:#f7f8fa}header{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:22px}h1{margin:0;font-size:26px}header p{margin:3px 0 0;color:#71717a}nav{display:flex;gap:16px}a{color:#2563eb;text-decoration:none}.queue{display:grid;gap:24px}.account{background:#fff;border:1px solid #e2e4e8;border-radius:14px;padding:20px}.account-head{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:14px}.account-head h2{margin:0;font-size:20px}.count{color:#71717a}.tweets{display:grid;gap:12px}.card{display:grid;grid-template-columns:120px 1fr;border:1px solid #e2e4e8;border-radius:10px;overflow:hidden}.image{width:100%;height:100%;min-height:160px;object-fit:cover;background:#eceef1}.content{padding:16px;white-space:pre-wrap}.meta{color:#71717a;font-size:13px;margin-bottom:6px}.title{font-weight:750;margin-bottom:8px}.note{color:#8a641b;font-size:12px;margin-top:12px}.feedback{display:flex;gap:8px;margin-top:12px}.feedback select,.feedback input{min-width:0;border:1px solid #d4d7dd;border-radius:8px;padding:7px 9px;background:#fff}.feedback input{flex:1}.rewrite,.done{border:0;border-radius:9px;padding:9px 14px;background:#18181b;color:#fff;cursor:pointer}.rewrite:disabled,.done:disabled{opacity:.55;cursor:wait}.done{margin-top:12px}.waiting{display:inline-block;margin-top:12px;color:#71717a;font-size:13px}.queued{padding:28px;color:#71717a}.empty-image{display:grid;place-items:center;background:#eceef1;color:#8b9098}@media(max-width:680px){header{display:block}nav{margin-top:12px}.account-head{display:block}.card{grid-template-columns:1fr}.image{height:220px}.feedback{display:grid}}</style>
 <header><div><h1>今日发帖安排</h1><p>每个账户一组：今天发几条、按什么顺序，直接排出来。</p></div><nav><a href="__BASE_URL__/personas">人设</a><a href="__BASE_URL__/market">每日研究</a></nav></header>
 <main id="result" class="queue"><div class="queued">正在读取队列…</div></main>
 <script>
@@ -6127,6 +8469,15 @@ async function load(){
       const title=document.createElement('div');title.className='title';title.textContent=x.title;content.append(title);
       const body=document.createElement('div');body.textContent=x.body;content.append(body);
       const note=document.createElement('div');note.className='note';note.textContent=x.image_note;content.append(note);
+      const feedback=document.createElement('div');feedback.className='feedback';
+      const choice=document.createElement('select');[
+        ['too_ai','太 AI'],['context_missing','Context 不够'],['hook_weak','Hook 不够强'],
+        ['stance_weak','观点不明确'],['persona_mismatch','不像人设'],['too_short','内容太短']
+      ].forEach(([value,label])=>{const option=document.createElement('option');option.value=value;option.textContent=label;choice.append(option)});
+      const detail=document.createElement('input');detail.placeholder='可补一句具体意见';
+      const rewrite=document.createElement('button');rewrite.className='rewrite';rewrite.textContent='只重写这条';
+      rewrite.onclick=async()=>{rewrite.disabled=true;rewrite.textContent='重写中…';try{const response=await writeApi(`/api/post-candidates/${x.id}/rewrite`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({feedback_code:choice.value,note:detail.value})});if(!response.ok){const error=await response.json();throw new Error(error.detail||'重写失败')}const updated=await response.json();body.textContent=updated.body;detail.value='';note.textContent='已按反馈重写；图片仍需人工确认。'}catch(error){alert(error.message)}finally{rewrite.disabled=false;rewrite.textContent='只重写这条'}};
+      feedback.append(choice,detail,rewrite);content.append(feedback);
       if(x.is_head){const done=document.createElement('button');done.className='done';done.textContent='已发，下一条';done.onclick=async()=>{done.disabled=true;done.textContent='处理中…';try{const marked=await writeApi(`/api/post-candidates/${x.id}/published`,{method:'POST'});if(!marked.ok){const error=await marked.json();throw new Error(error.detail||'更新失败')}await load()}catch(error){done.disabled=false;done.textContent='已发，下一条';alert(error.message)}};content.append(done)}
       else{const waiting=document.createElement('span');waiting.className='waiting';waiting.textContent='排队中';content.append(waiting)}
       card.append(content);tweets.append(card);
@@ -6136,4 +8487,5 @@ async function load(){
   }catch(error){result.textContent=error.message}
 }
 load();
+setInterval(()=>{if(!result.contains(document.activeElement))load()},5000);
 </script>"""

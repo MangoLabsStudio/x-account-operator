@@ -6,12 +6,15 @@ from pathlib import Path
 import sqlite3
 from unittest.mock import patch
 
+import market_sources.collect_big_source_posts as collector
+import pytest
 from market_sources.collect_big_source_posts import (
     MOTHER_POOL_PATH,
     _mother_pool_path,
     collect,
     fetch_account,
     init_db,
+    load_accounts,
     parse_posts,
 )
 from market_sources.cross_validate_source_posts import cross_validate
@@ -137,6 +140,16 @@ def test_rejects_non_mother_pool_path(tmp_path):
         raise AssertionError("expected a forced mother-pool path error")
 
 
+def test_accepts_only_configured_ai_pool_path(monkeypatch, tmp_path):
+    ai_pool = tmp_path / "ai_content_source_accounts.json"
+    ai_pool.write_text(json.dumps([ACCOUNT]), encoding="utf-8")
+    monkeypatch.setattr(collector, "AI_POOL_PATH", ai_pool)
+
+    assert load_accounts(topic_domain="ai") == [ACCOUNT]
+    with pytest.raises(ValueError, match="AI 信源池路径"):
+        load_accounts(tmp_path / "not-ai.json", topic_domain="ai")
+
+
 class ResumedRunSnapshotTest(unittest.TestCase):
     def test_skipped_account_reuses_only_its_latest_successful_run_posts(self):
         account = {"user_id": "42", "handle": "source_handle", "source_lists": ["mother-pool"]}
@@ -178,9 +191,14 @@ class ResumedRunSnapshotTest(unittest.TestCase):
                 return_value=fetch_result,
             ) as fetch:
                 first = collect(Path("ignored.json"), db_path, output, key="runtime-key", workers=1)
-                second = collect(Path("ignored.json"), db_path, output, key="runtime-key", workers=1)
+                second = collect(
+                    Path("ignored.json"), db_path, output, key="runtime-key", workers=1,
+                    topic_domain="ai",
+                )
 
             self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(first["topic_domain"], "crypto")
+            self.assertEqual(second["topic_domain"], "ai")
             self.assertEqual(first["posts_new"], 2)
             self.assertEqual(second["accounts_skipped"], 1)
             self.assertEqual(second["posts_seen"], 1)
@@ -191,6 +209,7 @@ class ResumedRunSnapshotTest(unittest.TestCase):
                 [post["post_id"] for post in json.loads((second_snapshot / "latest.json").read_text())["posts"]],
                 ["fresh-1"],
             )
+            self.assertEqual("ai", json.loads((second_snapshot / "latest.json").read_text())["topic_domain"])
             self.assertNotIn(
                 "STALE_WINDOW_SENTINEL",
                 (second_snapshot / "latest.json").read_text(encoding="utf-8"),
