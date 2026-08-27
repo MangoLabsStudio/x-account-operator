@@ -4755,6 +4755,38 @@ def supersede_persona_editorial_evaluation(conn, evaluation_id: int, reason_code
     )
 
 
+def retry_required_public_generation(conn, evaluation_id: int, rationale: str,
+                                     reset_draft: bool = False) -> bool:
+    row = conn.execute(
+        """SELECT generation_attempts,topic_json,generation_state
+           FROM persona_editorial_evaluations WHERE id=?""",
+        (evaluation_id,),
+    ).fetchone()
+    if not row or not json_value(row["topic_json"], {}).get("parent_seed_key"):
+        return False
+    state = json_value(row["generation_state"], {})
+    if reset_draft and isinstance(state, dict):
+        for key in (
+            "draft", "draft_failures", "critic", "thesis_adherence", "rewrite",
+            "rewrite_failures", "final_critic", "writer_attempts", "thesis_repair_attempts",
+        ):
+            state.pop(key, None)
+    attempts = int(row["generation_attempts"] or 0) + 1
+    now = int(time.time())
+    conn.execute(
+        """UPDATE persona_editorial_evaluations
+           SET status='WRITE',thesis_state='THESIS_APPROVED',generation_stage='context_ready',
+               generation_state=?,generation_attempts=?,next_retry_at=?,
+               reason_code='required_public_angle',rationale=?,updated_at=? WHERE id=?""",
+        (
+            json.dumps(state, ensure_ascii=False, separators=(",", ":")), attempts,
+            now + min(300, 30 * (2 ** min(attempts - 1, 3))), rationale[:1000], now,
+            evaluation_id,
+        ),
+    )
+    return True
+
+
 def mark_persona_editorial_generation_retryable(conn, evaluation_id: int, error: Exception):
     row = conn.execute(
         """SELECT generation_attempts,generation_max_attempts
@@ -4767,6 +4799,8 @@ def mark_persona_editorial_generation_retryable(conn, evaluation_id: int, error:
     attempts = row["generation_attempts"] + 1
     maximum = max(1, row["generation_max_attempts"])
     rationale = f"Grok/Gemini 正式写作可重试失败：{str(error)[:300]}"
+    if retry_required_public_generation(conn, evaluation_id, rationale, reset_draft=True):
+        return
     if attempts >= maximum:
         conn.execute(
             """UPDATE persona_editorial_evaluations
@@ -6414,11 +6448,17 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
         }
         if critic["verdict"] != "PASS" or adherence["verdict"] != "PASS" or failures:
             with db() as conn:
-                supersede_persona_editorial_evaluation(
+                if not retry_required_public_generation(
                     conn, evaluation["id"],
-                    (adherence.get("reason_codes") or ["grok_gemini_critic_reject"])[0],
-                    "；".join(critic["reasons"])[:1000],
-                )
+                    "正文未通过主编审稿，保留已批准 Thesis 并重新写稿："
+                    + "；".join(critic["reasons"])[:800],
+                    reset_draft=True,
+                ):
+                    supersede_persona_editorial_evaluation(
+                        conn, evaluation["id"],
+                        (adherence.get("reason_codes") or ["grok_gemini_critic_reject"])[0],
+                        "；".join(critic["reasons"])[:1000],
+                    )
             continue
         audit = {
             "persona_thesis": thesis,

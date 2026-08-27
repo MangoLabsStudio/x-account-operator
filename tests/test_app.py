@@ -3690,6 +3690,35 @@ class AppTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual(tuple(row), ("WRITE", "formal_generation_manual_retry", 0, None))
 
+    def test_required_public_angle_never_loses_its_thesis_on_generation_failure(self):
+        context_date = self.app_module.shanghai_today()
+        topic = {
+            "claim_key": "required-retry", "title": "已批准公共观点",
+            "core_claim": "正文失败只能重写，不能撤销观点。",
+            "parent_seed_key": "mother:required", "scope": "public",
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+        evaluation_id = self.insert_pending_editorial_write(run_id, context_date, topic)
+        with self.app_module.db() as conn:
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET reason_code='required_public_angle',generation_max_attempts=1 WHERE id=?""",
+                (evaluation_id,),
+            )
+            self.app_module.mark_persona_editorial_generation_retryable(
+                conn, evaluation_id, RuntimeError("writer failed")
+            )
+            row = conn.execute(
+                """SELECT status,thesis_state,reason_code,generation_attempts,next_retry_at
+                   FROM persona_editorial_evaluations WHERE id=?""",
+                (evaluation_id,),
+            ).fetchone()
+
+        self.assertEqual(tuple(row)[:4], (
+            "WRITE", "THESIS_APPROVED", "required_public_angle", 1,
+        ))
+        self.assertIsNotNone(row["next_retry_at"])
+
     def test_manual_retry_allows_unpublished_legacy_candidate(self):
         context_date = self.app_module.shanghai_today()
         topic = {"claim_key": "legacy-retry", "title": "旧稿复位", "eligible": True}
