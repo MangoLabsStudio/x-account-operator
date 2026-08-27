@@ -1460,7 +1460,11 @@ class AppTest(unittest.TestCase):
             for topic in topics
             for key, value in self.editorial_decision(topic, "IGNORE").items()
         })
-        env = {"XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng"}
+        env = {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+            "XOPS_DAILY_POST_TARGET_PER_PERSONA": "1",
+        }
+        floor = patch.object(self.app_module, "ensure_daily_persona_draft_floor")
         with patch.dict(os.environ, env), patch.object(
             self.app_module, "ensure_editorial_angle_expansion",
             new=self._real_ensure_editorial_angle_expansion,
@@ -1470,8 +1474,9 @@ class AppTest(unittest.TestCase):
             self.app_module, "expand_editorial_angles_gemini", expansion,
         ), patch.object(
             self.app_module, "evaluate_persona_editorial", evaluator,
-        ):
+        ), floor as draft_floor:
             self.run_editorial_pipeline(run_id)
+            draft_floor.assert_not_called()
             with self.app_module.db() as conn:
                 cards = self.app_module.json_value(conn.execute(
                     "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)

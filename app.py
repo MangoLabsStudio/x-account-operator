@@ -6461,6 +6461,8 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
         daily = daily_context_dict(daily_row)
         daily["approval_revision"] = run.get("approval_revision", 0)
         expanded_topics = await ensure_editorial_angle_expansion(run["id"], cards, daily)
+        if expanded_topics is None:
+            continue
         with db() as conn:
             cards = json_value(conn.execute(
                 "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run["id"],)
