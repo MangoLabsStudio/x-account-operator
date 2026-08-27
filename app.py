@@ -4154,7 +4154,8 @@ def validate_run_persona_theses(run_id: int, raw_cards: dict):
         rows = conn.execute(
             """SELECT e.*,p.slug FROM persona_editorial_evaluations e
                JOIN personas p ON p.id=e.persona_id
-               WHERE e.run_id=? AND e.status='WRITE'""",
+               WHERE e.run_id=? AND e.status='WRITE'
+                 AND e.thesis_state<>'CANDIDATE_READY'""",
             (run_id,),
         ).fetchall()
         for row in rows:
@@ -4198,7 +4199,9 @@ def resolve_persona_editorial_collisions(run_id: int):
     with db() as conn:
         rows = conn.execute(
             """SELECT e.*,p.slug FROM persona_editorial_evaluations e
-               JOIN personas p ON p.id=e.persona_id WHERE e.run_id=? AND e.status='WRITE'""",
+               JOIN personas p ON p.id=e.persona_id
+               WHERE e.run_id=? AND e.status='WRITE'
+                 AND e.thesis_state<>'CANDIDATE_READY'""",
             (run_id,),
         ).fetchall()
         items = [dict(row) for row in rows]
