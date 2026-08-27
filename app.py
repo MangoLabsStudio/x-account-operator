@@ -40,8 +40,9 @@ EDITORIAL_GEMINI_KEY_POOLS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.
 GEMINI_KEYCHAIN_SERVICE = "codex.xops.gemini.pool"
 GEMINI_KEYCHAIN_ACCOUNTS = ("slot-1", "slot-2", "slot-3", "slot-4", "slot-5")
 GEMINI_POOL_ENV_VARS = tuple(f"XOPS_GEMINI_API_KEY_{index}" for index in range(1, 6))
-EDITORIAL_ANGLE_EXPANSION_REVISION = 2
+EDITORIAL_ANGLE_EXPANSION_REVISION = 3
 EDITORIAL_ANGLE_MAX_ATTEMPTS = 3
+EDITORIAL_HOT_TOPIC_RETENTION_DAYS = 3
 EDITORIAL_ANGLE_FAMILIES = {
     "opportunity": "opportunity",
     "industry_evaluation": "research",
@@ -1042,7 +1043,7 @@ def reusable_topic_claims(conn) -> tuple[set[str], set[str]]:
 
 
 def reusable_editorial_topics(conn, context_date: str, cards: dict, limit: int = 8) -> list[dict]:
-    """Bring back unused public angles and a small rotating evergreen candidate set."""
+    """Reuse recent hot angles first; use evergreen only when the hot pool is empty."""
     current = editorial_public_topics(cards)
     seen_keys = {str(item.get("claim_key", "")).strip().lower() for item in current}
     seen_claims = {
@@ -1078,11 +1079,15 @@ def reusable_editorial_topics(conn, context_date: str, cards: dict, limit: int =
         seen_claims.add(claim)
         return True
 
+    window_start = (
+        datetime.fromisoformat(context_date).date()
+        - timedelta(days=EDITORIAL_HOT_TOPIC_RETENTION_DAYS - 1)
+    ).isoformat()
     rows = conn.execute(
         """SELECT context_date,raw_cards FROM daily_context_runs
-           WHERE status='approved' AND context_date<?
-           ORDER BY context_date DESC LIMIT 45""",
-        (context_date,),
+           WHERE status='approved' AND context_date>=? AND context_date<?
+           ORDER BY context_date DESC""",
+        (window_start, context_date),
     ).fetchall()
     for row in rows:
         old_cards = json_value(row["raw_cards"], {})
@@ -1092,6 +1097,9 @@ def reusable_editorial_topics(conn, context_date: str, cards: dict, limit: int =
                 accept(topic, "backlog", str(row["context_date"]))
         if len(reusable) >= limit:
             return reusable
+
+    if current or reusable or editorial_mother_topics(cards):
+        return reusable
 
     buckets = {"crypto": [], "ai": []}
     for topic in evergreen_editorial_topics():
@@ -3611,7 +3619,7 @@ def editorial_public_topics(cards: dict):
     return [item for item in topics if isinstance(item, dict) and item.get("claim_key")]
 
 
-def editorial_mother_topics(cards: dict):
+def selected_editorial_mother_topics(cards: dict):
     """Collapse selected writing hints back to the approved subjects they came from."""
     selected = cards.get("selected_topics", []) if isinstance(cards, dict) else []
     discussions = {
@@ -3718,6 +3726,81 @@ def editorial_mother_topics(cards: dict):
         group["heat_evidence"] = list(dict.fromkeys(group["heat_evidence"]))[:8]
         group["source_context"] = group["source_context"][:8]
     return list(groups.values())[:16]
+
+
+def rolling_hot_topic_pool(conn, context_date: str) -> dict:
+    current_date = datetime.fromisoformat(context_date).date()
+    window_start = (current_date - timedelta(days=EDITORIAL_HOT_TOPIC_RETENTION_DAYS - 1)).isoformat()
+    rows = conn.execute(
+        """SELECT context_date,raw_cards FROM daily_context_runs
+           WHERE status='approved' AND context_date>=? AND context_date<?
+           ORDER BY context_date DESC""",
+        (window_start, context_date),
+    ).fetchall()
+    mothers = []
+    facts = []
+    seen_mothers = set()
+    seen_facts = set()
+    wanted_refs = set()
+    parsed_rows = []
+    for row in rows:
+        cards = json_value(row["raw_cards"], {})
+        parsed_rows.append((str(row["context_date"]), cards))
+        age_days = (current_date - datetime.fromisoformat(str(row["context_date"])).date()).days
+        for mother in selected_editorial_mother_topics(cards):
+            seed_key = str(mother.get("seed_key") or "")
+            if not seed_key or seed_key in seen_mothers:
+                continue
+            seen_mothers.add(seed_key)
+            source_refs = [str(ref) for ref in mother.get("source_refs", []) if str(ref)]
+            wanted_refs.update(ref.removeprefix("fact:") for ref in source_refs)
+            mothers.append({
+                **mother,
+                "hot_pool_origin_date": str(row["context_date"]),
+                "hot_pool_age_days": age_days,
+            })
+    for _, cards in parsed_rows:
+        for card in cards.get("fact_cards", []) if isinstance(cards, dict) else []:
+            if not isinstance(card, dict) or card.get("status") not in FACT_CARD_STATUSES:
+                continue
+            refs = {
+                str(card.get("representative_source_ref") or card.get("source_ref") or "").strip()
+            }
+            refs.update(
+                str(item.get("source_ref") or "").strip()
+                for item in card.get("evidence", []) if isinstance(item, dict)
+            )
+            refs.discard("")
+            if not refs.intersection(wanted_refs):
+                continue
+            key = str(card.get("id") or card.get("source_ref") or card.get("representative_source_ref") or "")
+            if not key or key in seen_facts:
+                continue
+            seen_facts.add(key)
+            facts.append(card)
+    return {
+        "retention_days": EDITORIAL_HOT_TOPIC_RETENTION_DAYS,
+        "window_start": window_start,
+        "window_end": context_date,
+        "mother_topics": mothers[:32],
+        "fact_cards": facts[:64],
+    }
+
+
+def editorial_mother_topics(cards: dict):
+    current = selected_editorial_mother_topics(cards)
+    pool = cards.get("hot_topic_pool", {}) if isinstance(cards, dict) else {}
+    seen = {str(item.get("seed_key") or "") for item in current}
+    merged = list(current)
+    for mother in pool.get("mother_topics", []) if isinstance(pool, dict) else []:
+        seed_key = str(mother.get("seed_key") or "") if isinstance(mother, dict) else ""
+        if not seed_key or seed_key in seen:
+            continue
+        merged.append(mother)
+        seen.add(seed_key)
+        if len(merged) == 16:
+            break
+    return merged
 
 
 def editorial_angle_input_hash(mother_topics: list[dict], daily: dict):
@@ -3850,6 +3933,8 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
             "source_topic_keys": mother.get("source_topic_keys", []),
             "source_refs": mother.get("source_refs", []),
             "source_topic_title": mother.get("title", ""),
+            "hot_pool_origin_date": mother.get("hot_pool_origin_date", ""),
+            "hot_pool_age_days": int(mother.get("hot_pool_age_days") or 0),
             "fact_basis": [],
             "opinion_basis": [core_claim],
             "question": core_claim,
@@ -4440,15 +4525,22 @@ def ensure_daily_persona_draft_floor(run_id: int, personas: list[dict]):
                 if json_value(row["input_json"], {}).get("daily", {}).get("approval_revision")
                 == run["approval_revision"]
             }
-            selected = [
-                topic for topic in supplements
-                if topic["claim_key"] not in existing_claim_keys
-            ][:missing]
+            selected = []
+            decisions = {}
+            for topic in supplements:
+                if topic["claim_key"] in existing_claim_keys:
+                    continue
+                decision = daily_supplement_decision(persona, topic)
+                if thesis_contract_errors(topic, persona["slug"], decision["thesis"]):
+                    continue
+                selected.append(topic)
+                decisions[str(topic["claim_key"])] = decision
+                if len(selected) == missing:
+                    break
             if not selected:
                 continue
             full_topics = [*normal_topics, *supplements]
             inputs = []
-            decisions = {}
             for topic in selected:
                 input_payload = editorial_topic_input_payload(
                     topic, daily, persona, persona_context, topics=full_topics,
@@ -4462,7 +4554,6 @@ def ensure_daily_persona_draft_floor(run_id: int, personas: list[dict]):
                     hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
                     input_payload,
                 ))
-                decisions[str(topic["claim_key"])] = daily_supplement_decision(persona, topic)
             pending_writes.append((persona["id"], inputs, decisions))
     for persona_id, inputs, decisions in pending_writes:
         write_persona_editorial_evaluations(run_id, persona_id, inputs, decisions)
@@ -4879,7 +4970,11 @@ def editorial_verified_facts(raw_cards: dict, topic: dict, writer_context: dict)
             if text:
                 references.add(text.removeprefix("fact:"))
     facts = []
-    for card in raw_cards.get("fact_cards", []) if isinstance(raw_cards, dict) else []:
+    fact_cards = list(raw_cards.get("fact_cards", [])) if isinstance(raw_cards, dict) else []
+    hot_pool = raw_cards.get("hot_topic_pool", {}) if isinstance(raw_cards, dict) else {}
+    if isinstance(hot_pool, dict):
+        fact_cards.extend(hot_pool.get("fact_cards", []))
+    for card in fact_cards:
         if (
             not isinstance(card, dict)
             or str(card.get("topic_domain") or "crypto").lower() != topic_domain
@@ -5114,6 +5209,8 @@ async def research_editorial_angle_context_grok_batch(mother_topics: list[dict],
             "topic_domain": topic.get("topic_domain", "crypto"),
             "subject": topic.get("subject"),
             "title": topic.get("title"),
+            "hot_pool_origin_date": topic.get("hot_pool_origin_date"),
+            "hot_pool_age_days": topic.get("hot_pool_age_days", 0),
             "heat_evidence": topic.get("heat_evidence", [])[:5],
             "selection_hints": topic.get("selection_hints", [])[:5],
             "source_context": topic.get("source_context", [])[:5],
@@ -5122,6 +5219,7 @@ async def research_editorial_angle_context_grok_batch(mother_topics: list[dict],
     prompt = (
         f"你是中文 {content_domain} 内容团队的实时研究员。必须各使用一次 X Search 和 Web Search。"
         "以下是已经由母帖池热度筛出的母题，不要写帖子，也不要分配人设。"
+        "母题可以来自今天或最近三天滚动热点池；旧母题必须重新核对当前讨论，不能把旧状态写成今天的新消息。"
         "请按 seed_key 补足圈内前情、今天真正争论的焦点、最强正反观点、项目或行业的二阶影响，"
         "并指出哪些说法只是常识或已经说烂。允许某个母题没有新角度。"
         "搜索结果只能作为语境，不能自动升级成可发布事实；附可追溯 URL。"
@@ -5134,7 +5232,8 @@ async def research_editorial_angle_context_grok_batch(mother_topics: list[dict],
     )
     async with httpx.AsyncClient(timeout=180) as client:
         from_date = (
-            datetime.fromisoformat(str(daily_context["context_date"])).date() - timedelta(days=1)
+            datetime.fromisoformat(str(daily_context["context_date"])).date()
+            - timedelta(days=EDITORIAL_HOT_TOPIC_RETENTION_DAYS - 1)
         ).isoformat() + "T00:00:00Z"
         response = await client.post(
             provider["base_url"] + "/responses",
@@ -5292,7 +5391,9 @@ async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_contex
         "而不是复述一个未经批准的占比。"
         "rejected_angles 每项包含 parent_seed_key,title,core_claim,reason_code,reason。"
         "每个输入母题必须至少有一条合格 angle，或在 rejected_angles 中用 no_worthwhile_angle 明确说明零产出；"
-        "漏掉母题会让整批失败重试。\n\n"
+        "漏掉母题会让整批失败重试。"
+        "hot_pool_age_days 为 1 或 2 的母题仍属于有效热点，但必须基于 Grok 刷新的当前语境选角；"
+        "不要把进入池的旧日期伪装成今天刚发生，也不要因为不是当天首发就退化成常青大道理。\n\n"
         f"可选内容结构：{json.dumps(structure_catalog, ensure_ascii=False)}\n"
         f"永久规则：{json.dumps(topic_selection_policy().get('angle_expansion', {}), ensure_ascii=False)}\n"
         f"母题：{json.dumps(mother_topics, ensure_ascii=False)}\n"
@@ -5362,6 +5463,13 @@ async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict
         if not run or run["status"] != "approved":
             return None
         current_cards = json_value(run["raw_cards"], {})
+        hot_topic_pool = rolling_hot_topic_pool(conn, str(run["context_date"]))
+        if current_cards.get("hot_topic_pool") != hot_topic_pool:
+            current_cards["hot_topic_pool"] = hot_topic_pool
+            conn.execute(
+                "UPDATE daily_context_runs SET raw_cards=?,updated_at=? WHERE id=?",
+                (json.dumps(current_cards, ensure_ascii=False), int(time.time()), run_id),
+            )
         daily_row = conn.execute(
             "SELECT * FROM daily_market_contexts WHERE context_date=?", (run["context_date"],)
         ).fetchone()
@@ -5922,6 +6030,7 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             "first_person_allowed", "parent_seed_key", "parent_claim_keys", "angle_family",
             "specific_tension", "non_obvious_delta", "why_worth_saying", "statement_mode",
             "topic_domain", "structure_id", "style_recipe",
+            "hot_pool_origin_date", "hot_pool_age_days",
         )
         compact_topic = {}
         for key in topic_fields:
@@ -6134,6 +6243,7 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                 key: compact_topic.get(key, "")
                 for key in (
                     "claim_key", "parent_seed_key", "angle_family", "structure_id", "title", "core_claim",
+                    "hot_pool_origin_date", "hot_pool_age_days",
                 )
             },
             "verified_facts": verified_facts,
@@ -6331,6 +6441,10 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
         daily = daily_context_dict(daily_row)
         daily["approval_revision"] = run.get("approval_revision", 0)
         expanded_topics = await ensure_editorial_angle_expansion(run["id"], cards, daily)
+        with db() as conn:
+            cards = json_value(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run["id"],)
+            ).fetchone()[0], {})
         public_topics = expanded_topics if expanded_topics is not None else []
         evaluation_semaphore = asyncio.Semaphore(editorial_evaluation_concurrency())
 

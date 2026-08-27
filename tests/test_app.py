@@ -897,6 +897,69 @@ class AppTest(unittest.TestCase):
         self.assertEqual(rejected, [])
         self.assertEqual(topics[0]["topic_domain"], "ai")
 
+    def test_hot_topic_pool_keeps_today_plus_previous_two_days(self):
+        today = "2026-08-28"
+        for context_date, claim_key, source_key in (
+            ("2026-08-27", "hot-one-day", "discussion:one-day"),
+            ("2026-08-26", "hot-two-days", "discussion:two-days"),
+            ("2026-08-25", "expired-three-days", "discussion:expired"),
+        ):
+            self.create_editorial_run(
+                context_date,
+                topics=[self.mother_topic(claim_key, source_key)],
+            )
+
+        with self.app_module.db() as conn:
+            pool = self.app_module.rolling_hot_topic_pool(conn, today)
+
+        self.assertEqual(pool["retention_days"], 3)
+        self.assertEqual(pool["window_start"], "2026-08-26")
+        keys = {item["seed_key"] for item in pool["mother_topics"]}
+        self.assertIn("discussion:one-day", keys)
+        self.assertIn("discussion:two-days", keys)
+        self.assertNotIn("discussion:expired", keys)
+        ages = {item["seed_key"]: item["hot_pool_age_days"] for item in pool["mother_topics"]}
+        self.assertEqual(ages["discussion:one-day"], 1)
+        self.assertEqual(ages["discussion:two-days"], 2)
+
+    def test_hot_topic_pool_preserves_verified_news_facts(self):
+        old_date, today = "2026-08-27", "2026-08-28"
+        topic = self.mother_topic("hot-fact", "fact:x:hot:1")
+        topic["source_refs"] = ["x:hot:1"]
+        run_id = self.create_editorial_run(old_date, topics=[topic])
+        fact_card = {
+            "id": "fact-hot-1",
+            "topic_domain": "crypto",
+            "status": "verified",
+            "source_ref": "x:hot:1",
+            "representative_text": "项目在前一日发布了已核验的产品更新。",
+        }
+        with self.app_module.db() as conn:
+            cards = self.app_module.json_value(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()[0], {})
+            cards["fact_cards"] = [fact_card]
+            conn.execute(
+                "UPDATE daily_context_runs SET raw_cards=? WHERE id=?",
+                (json.dumps(cards, ensure_ascii=False), run_id),
+            )
+            pool = self.app_module.rolling_hot_topic_pool(conn, today)
+
+        current_cards = {"selected_topics": [], "fact_cards": [], "hot_topic_pool": pool}
+        mothers = self.app_module.editorial_mother_topics(current_cards)
+        self.assertEqual(mothers[0]["seed_key"], "fact:x:hot:1")
+        facts = self.app_module.editorial_verified_facts(
+            current_cards,
+            {
+                "topic_domain": "crypto",
+                "source_topic_keys": ["fact:x:hot:1"],
+                "source_refs": ["x:hot:1"],
+            },
+            {},
+        )
+        self.assertEqual(facts["facts"][0]["text"], fact_card["representative_text"])
+        self.assertTrue(facts["requires_fact_ids"])
+
     def test_reusable_topics_restore_unused_angle_but_skip_claimed_history(self):
         old_date, today = "2026-08-20", "2026-08-21"
         old_run = self.create_editorial_run(old_date)
