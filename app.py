@@ -2183,7 +2183,8 @@ def is_discovery_topic(item: dict) -> bool:
     return (
         int(item.get("unique_authors") or 0) >= 2
         or int(item.get("cross_list_count") or 0) >= 2
-        or int(item.get("engagement_total") or 0) >= 50
+        or int(item.get("post_count") or 0) >= 2
+        or int(item.get("engagement_total") or 0) >= 15
     )
 
 

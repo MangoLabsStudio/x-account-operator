@@ -138,7 +138,7 @@ OPINION_LIMIT = 200
 ATTENTION_SAMPLE_LIMIT = 3
 ATTENTION_MIN_AUTHORS = 5
 DISCUSSION_HOT_MIN_AUTHORS = 2
-DISCUSSION_HOT_MIN_ENGAGEMENT = 50
+DISCUSSION_HOT_MIN_ENGAGEMENT = 20
 ATTENTION_TOPIC_PATTERNS = (
     ("bitcoin_etf", "比特币 ETF", re.compile(r"(?:\b(?:bitcoin|btc)\b|比特币).{0,32}\betf\b|\betf\b.{0,32}(?:\b(?:bitcoin|btc)\b|比特币)", re.IGNORECASE)),
     ("ethereum_etf", "以太坊 ETF", re.compile(r"(?:\b(?:ethereum|eth)\b|以太坊).{0,32}\betf\b|\betf\b.{0,32}(?:\b(?:ethereum|eth)\b|以太坊)", re.IGNORECASE)),

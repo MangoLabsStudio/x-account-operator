@@ -4493,10 +4493,20 @@ class AppTest(unittest.TestCase):
                     "post_count": 1,
                     "engagement_total": 3,
                 },
+                {
+                    "title": "同一题材连续出现",
+                    "key": "project:repeat",
+                    "unique_authors": 1,
+                    "post_count": 2,
+                    "engagement_total": 4,
+                },
             ],
         )
 
-        self.assertEqual([item["key"] for item in cards["discovery_topics"]], ["project:launch"])
+        self.assertEqual(
+            [item["key"] for item in cards["discovery_topics"]],
+            ["project:launch", "project:repeat"],
+        )
         self.assertEqual([item["key"] for item in cards["excluded_niche_topics"]], ["noise:mention"])
 
     def test_topic_selection_policy_and_history_are_persisted(self):
