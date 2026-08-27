@@ -2213,7 +2213,7 @@ def controlled_cards(
             -int(item.get("engagement_total") or 0),
             -int(item.get("post_count") or 0),
         ),
-    )[:30]
+    )[:50]
     discovery_keys = {str(item.get("key") or "") for item in discovery_topics}
     ordered_niches = sorted(
         (
@@ -2530,7 +2530,7 @@ async def synthesize_daily_cards(context_date: str, cards: dict):
         "字段必须是 market_state,event_clusters,debates,evidence,unknowns,sources,selected_topics,rejected_topics。\n"
         "discussion_topics 是实体与具体机制共同出现的可写议题，按讨论热度排序，是内容选题的主轴；"
         "attention_topics 只是父级市场地图，不能单独替代一个具体选题。"
-        "discovery_topics 是尚未形成大众热点、但已有多人、跨列表或互动信号的早期题材；"
+        "discovery_topics 是尚未形成大众热点、但已有多人、跨列表、同题材多帖或基础互动信号的早期题材；"
         "它可以进入开源发现、产品资讯、项目评价或早期趋势选题，但必须明确写成发现/判断，不能伪装成全市场热点。"
         "opportunity_questions、editorial_questions 和 research_questions 只是研究入口，不是最终可写选题。"
         "必须按照 topic_selection_policy 逐条筛选，并把 claim_history 视为全账号已覆盖历史。"
@@ -6622,7 +6622,7 @@ def daily_domain_cards(snapshot_output: Path, collect_result: dict, validation_r
         ],
         topic_domain,
     )
-    discovery_topics = [item for item in niche_topics if is_discovery_topic(item)][:30]
+    discovery_topics = [item for item in niche_topics if is_discovery_topic(item)][:50]
     coverage = {
         "status": "ok",
         "collect": collect_result if isinstance(collect_result, dict) else {},
