@@ -3030,6 +3030,45 @@ class AppTest(unittest.TestCase):
         self.assertEqual(used, set(config["keys"]))
         self.assertEqual(peak, {key: 1 for key in config["keys"]})
 
+    def test_angle_expansion_splits_mothers_into_parallel_gemini_batches(self):
+        calls = []
+        payload = {"choices": [{"message": {"content": json.dumps({
+            "angles": [], "rejected_angles": [],
+        }, ensure_ascii=False)}}]}
+        mothers = [
+            {"seed_key": f"seed-{index}", "title": f"母题 {index}", "topic_domain": "ai"}
+            for index in range(11)
+        ]
+        grok = {
+            "contexts": [
+                {"seed_key": f"seed-{index}", "background": f"background-{index}"}
+                for index in range(11)
+            ]
+        }
+        self.app_module.EDITORIAL_GEMINI_KEY_POOLS.clear()
+        self.app_module._cached_gemini_api_keys.cache_clear()
+        with patch.dict(os.environ, {
+            "XOPS_GEMINI_KEYCHAIN_ACCOUNTS": "",
+            "XOPS_GEMINI_API_KEY_1": "dummy-a",
+            "XOPS_GEMINI_API_KEY_2": "dummy-b",
+            "XOPS_GEMINI_API_KEY_3": "dummy-c",
+        }, clear=True), patch.object(
+            self.app_module.httpx, "AsyncClient", return_value=FakeAsyncClient(payload, calls)
+        ):
+            result = asyncio.run(self.app_module.expand_editorial_angles_gemini(
+                mothers, {}, grok, [],
+            ))
+        prompts = [call["kwargs"]["json"]["messages"][0]["content"] for call in calls]
+        self.assertEqual(len(prompts), 3)
+        self.assertEqual(result["angles"], [])
+        for index in range(11):
+            self.assertEqual(sum(f'"seed_key": "seed-{index}"' in prompt for prompt in prompts), 1)
+            self.assertEqual(sum(
+                f'"background": "background-{index}"' in prompt for prompt in prompts
+            ), 1)
+        self.app_module.EDITORIAL_GEMINI_KEY_POOLS.clear()
+        self.app_module._cached_gemini_api_keys.cache_clear()
+
     def test_gemini_provider_signature_does_not_expose_key(self):
         dummy_key = "dummy-gemini-secret"
         with patch.dict(os.environ, {

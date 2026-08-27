@@ -5368,12 +5368,19 @@ def cached_editorial_topic_context(raw_cards: dict, topic: dict):
 async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_context: dict,
                                            grok_context: dict, claim_history: list[dict]):
     provider = editorial_provider_config("GEMINI")
-    content_domain = editorial_topics_domain_label(mother_topics)
     structure_catalog = editorial_content_structure_catalog()
-    prompt = (
+    contexts = {
+        str(item.get("seed_key")): item for item in grok_context.get("contexts", [])
+        if isinstance(item, dict) and item.get("seed_key")
+    }
+
+    async def expand_batch(batch):
+        content_domain = editorial_topics_domain_label(batch)
+        batch_context = {"contexts": [contexts[item["seed_key"]] for item in batch if item["seed_key"] in contexts]}
+        prompt = (
         f"你是中文 {content_domain} 内容团队的选题主编。现在只做多角度选题，不写帖子、不分配人设。"
         "只输出 JSON：{\"angles\":[...],\"rejected_angles\":[...]}。"
-        "每个母题输出 0 到 5 个真正互不替代的角度，总数最多 24；这是上限，不是配额。"
+        "每个母题输出 0 到 5 个真正互不替代的角度，本批总数最多 8；这是上限，不是配额。"
         "可选 angle_family 只有 opportunity、industry_evaluation、project_evaluation、market_cognition、"
         "trading_philosophy、people_or_community、other，不要求覆盖任何一类。"
         "angles 每项必须包含 parent_seed_key,claim_key,subject,title,core_claim,angle_family,structure_id,"
@@ -5401,28 +5408,35 @@ async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_contex
         "不要把进入池的旧日期伪装成今天刚发生，也不要因为不是当天首发就退化成常青大道理。\n\n"
         f"可选内容结构：{json.dumps(structure_catalog, ensure_ascii=False)}\n"
         f"永久规则：{json.dumps(topic_selection_policy().get('angle_expansion', {}), ensure_ascii=False)}\n"
-        f"母题：{json.dumps(mother_topics, ensure_ascii=False)}\n"
+        f"母题：{json.dumps(batch, ensure_ascii=False)}\n"
         f"已批准市场语境：{json.dumps(editorial_daily_input(daily_context), ensure_ascii=False)}\n"
-        f"Grok 实时语境：{json.dumps({'text': grok_context.get('text', ''), 'citations': grok_context.get('citations', [])}, ensure_ascii=False)}\n"
+        f"Grok 实时语境：{json.dumps(batch_context, ensure_ascii=False)}\n"
         f"团队已覆盖主张：{json.dumps(editorial_claim_memory(claim_history), ensure_ascii=False)}"
-    )
-    async with httpx.AsyncClient(timeout=240) as client:
-        async with gemini_request_key(provider) as key:
-            response = await client.post(
-                provider["base_url"] + "/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0",
-                },
-                json={
-                    "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
-                    "response_format": {"type": "json_object"}, "temperature": 0.55, "max_tokens": 8000,
-                },
-            )
-        response.raise_for_status()
-    result = chat_completion_json(response.json())
-    result["_model"] = provider["model"]
-    return result
+        )
+        async with httpx.AsyncClient(timeout=180) as client:
+            async with gemini_request_key(provider) as key:
+                response = await client.post(
+                    provider["base_url"] + "/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                        "User-Agent": "Mozilla/5.0",
+                    },
+                    json={
+                        "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
+                        "response_format": {"type": "json_object"}, "temperature": 0.55, "max_tokens": 4000,
+                    },
+                )
+            response.raise_for_status()
+        return chat_completion_json(response.json())
+
+    results = await asyncio.gather(*(
+        expand_batch(mother_topics[index:index + 5]) for index in range(0, len(mother_topics), 5)
+    ))
+    return {
+        "angles": [item for result in results for item in result.get("angles", [])],
+        "rejected_angles": [item for result in results for item in result.get("rejected_angles", [])],
+        "_model": provider["model"],
+    }
 
 
 def persist_editorial_angle_expansion(run_id: int, expected_input_hash: str,
