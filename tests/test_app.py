@@ -949,6 +949,25 @@ class AppTest(unittest.TestCase):
         self.assertTrue(all("selection_hints" not in item for item in mothers))
         self.assertNotIn("other:selected", {item["seed_key"] for item in mothers})
 
+    def test_mother_topics_reserve_half_the_pool_for_each_domain(self):
+        cards = {"discussion_topics": [], "discovery_topics": [], "selected_topics": []}
+        for index in range(12):
+            cards["discussion_topics"].append({
+                "key": f"crypto:{index}", "title": f"Crypto {index}",
+                "topic_domain": "crypto", "unique_authors": 3, "post_count": 3,
+            })
+        for index in range(8):
+            cards["discovery_topics"].append({
+                "key": f"ai:{index}", "title": f"AI {index}",
+                "topic_domain": "ai", "unique_authors": 2, "post_count": 2,
+            })
+
+        mothers = self.app_module.signal_editorial_mother_topics(cards)
+
+        self.assertEqual(len(mothers), 16)
+        self.assertEqual(sum(item["topic_domain"] == "crypto" for item in mothers), 8)
+        self.assertEqual(sum(item["topic_domain"] == "ai" for item in mothers), 8)
+
     def test_hot_topic_pool_keeps_today_plus_previous_two_days(self):
         today = "2026-08-28"
         for context_date, claim_key, source_key in (
@@ -1281,7 +1300,9 @@ class AppTest(unittest.TestCase):
             self.assertEqual(topic["source_refs"], ["x:btc:1"])
         with self.app_module.db() as conn:
             evaluation = conn.execute(
-                "SELECT status,candidate_id FROM persona_editorial_evaluations WHERE claim_key='acheng-btc-industry-angle'"
+                """SELECT status,candidate_id FROM persona_editorial_evaluations
+                   WHERE run_id=? AND json_extract(topic_json,'$.claim_key')='btc-industry-angle'""",
+                (run_id,),
             ).fetchone()
             self.assertEqual(evaluation["status"], "WRITE")
             self.assertIsNotNone(evaluation["candidate_id"])
@@ -3751,6 +3772,75 @@ class AppTest(unittest.TestCase):
         self.assertEqual(result["public-angle"]["status"], "HOLD")
         self.assertEqual(result["public-angle"]["reason_code"], "thesis_required_before_write")
         self.assertEqual(result["private-angle"]["status"], "HOLD")
+
+    def test_every_approved_public_angle_is_forced_into_one_persona_thesis(self):
+        topics = [
+            {
+                "claim_key": "public-angle-one", "title": "第一个观点",
+                "core_claim": "第一个公共观点已经通过角度质量门。",
+                "specific_tension": "它与市场常见解释存在明确冲突。",
+                "scope": "public", "topic_domain": "crypto", "parent_seed_key": "mother-one",
+            },
+            {
+                "claim_key": "public-angle-two", "title": "第二个观点",
+                "core_claim": "第二个公共观点同样必须形成最终 Thesis。",
+                "specific_tension": "它要求另一种清晰判断。",
+                "scope": "public", "topic_domain": "crypto", "parent_seed_key": "mother-two",
+            },
+        ]
+        held = {"decisions": [
+            {
+                "topic_claim_key": topic["claim_key"], "status": "HOLD",
+                "notice": 0, "authority": 0, "tension": 0, "marginal_value": 0,
+                "why_me": "", "reason_code": "unsupported",
+            }
+            for topic in topics
+        ]}
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_PERSONAS": "acheng,ridehail-driver-zhao",
+        }):
+            first = self.app_module.validate_persona_editorial_decisions(
+                held, topics, "acheng"
+            )
+            second = self.app_module.validate_persona_editorial_decisions(
+                held, topics, "ridehail-driver-zhao"
+            )
+
+        self.assertEqual(first["public-angle-one"]["status"], "WRITE")
+        self.assertEqual(first["public-angle-one"]["reason_code"], "required_public_angle")
+        self.assertEqual(second["public-angle-two"]["status"], "WRITE")
+        self.assertEqual(second["public-angle-two"]["reason_code"], "required_public_angle")
+        self.assertEqual(
+            self.app_module.thesis_contract_errors(
+                topics[0], "acheng", first["public-angle-one"]["thesis"]
+            ),
+            [],
+        )
+
+    def test_ready_angle_stage_cannot_be_hidden_by_fallback_posts(self):
+        context_date = "2026-08-28"
+        topic = {
+            "claim_key": "must-reach-thesis", "title": "必须进入 Thesis 的观点",
+            "core_claim": "这个已批准观点不能被日常补位稿掩盖。",
+            "scope": "public", "topic_domain": "crypto",
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+        with self.app_module.db() as conn:
+            cards = json.loads(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()[0])
+            cards["editorial_angle_expansion"] = {
+                "status": "ready", "expanded_topics": [topic], "rejected_angles": [],
+            }
+            conn.execute(
+                "UPDATE daily_context_runs SET raw_cards=? WHERE id=?",
+                (json.dumps(cards, ensure_ascii=False), run_id),
+            )
+            self.assertEqual(
+                self.app_module.uncovered_public_angle_keys(conn, run_id),
+                ["must-reach-thesis"],
+            )
+            self.assertFalse(self.app_module.daily_post_output_ready(conn, context_date))
 
     def test_high_fit_hold_promotion_still_requires_real_authority(self):
         topic = {

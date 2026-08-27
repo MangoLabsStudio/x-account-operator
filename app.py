@@ -40,7 +40,7 @@ EDITORIAL_GEMINI_KEY_POOLS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.
 GEMINI_KEYCHAIN_SERVICE = "codex.xops.gemini.pool"
 GEMINI_KEYCHAIN_ACCOUNTS = ("slot-1", "slot-2", "slot-3", "slot-4", "slot-5")
 GEMINI_POOL_ENV_VARS = tuple(f"XOPS_GEMINI_API_KEY_{index}" for index in range(1, 6))
-EDITORIAL_ANGLE_EXPANSION_REVISION = 4
+EDITORIAL_ANGLE_EXPANSION_REVISION = 5
 EDITORIAL_ANGLE_MAX_ATTEMPTS = 3
 EDITORIAL_HOT_TOPIC_RETENTION_DAYS = 3
 EDITORIAL_ANGLE_FAMILIES = {
@@ -3314,6 +3314,26 @@ def build_persona_private_topics(editorial_context: dict):
     return topics
 
 
+def required_public_topic_assignments(topics: list[dict]) -> dict[str, str]:
+    assignments = {}
+    for domain in ("crypto", "ai"):
+        slugs = [
+            slug for slug in daily_post_persona_slugs()
+            if ("ai" if slug in AI_PERSONA_SLUGS else "crypto") == domain
+        ]
+        domain_topics = [
+            topic for topic in topics
+            if str(topic.get("scope", "public")) == "public"
+            and str(topic.get("topic_domain") or "crypto") == domain
+            and topic.get("parent_seed_key")
+        ]
+        if not slugs:
+            continue
+        for index, topic in enumerate(domain_topics):
+            assignments[str(topic.get("claim_key", ""))] = slugs[index % len(slugs)]
+    return assignments
+
+
 def persona_editorial_topics(persona: dict, public_topics: list[dict], editorial_context: dict):
     draft = json_value(persona.get("draft"), {})
     topic_domain = str(draft.get("content", {}).get("topic_domain") or "crypto")
@@ -3729,7 +3749,17 @@ def signal_editorial_mother_topics(cards: dict):
                 ],
                 "source_context": [source_context],
             })
-    return mothers[:16]
+    by_domain = {
+        domain: [mother for mother in mothers if mother["topic_domain"] == domain]
+        for domain in ("crypto", "ai")
+    }
+    selected = [*by_domain["crypto"][:8], *by_domain["ai"][:8]]
+    selected_keys = {mother["seed_key"] for mother in selected}
+    selected.extend(
+        mother for mother in mothers
+        if mother["seed_key"] not in selected_keys
+    )
+    return selected[:16]
 
 
 def rolling_hot_topic_pool(conn, context_date: str) -> dict:
@@ -3832,6 +3862,13 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
     structure_config = editorial_content_structure_config()
     structure_ids = set(structure_config["structures"])
     accepted, rejected, seen_keys, seen_claims = [], [], set(), set()
+    domain_capacity = {
+        domain: sum(
+            1 for slug in PERSONA_META
+            if ("ai" if slug in AI_PERSONA_SLUGS else "crypto") == domain
+        )
+        for domain in ("crypto", "ai")
+    }
 
     def reject(item, reason_code, reason):
         rejected.append({
@@ -3911,6 +3948,13 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
         if sum(accepted_item["parent_seed_key"] == parent_key for accepted_item in accepted) >= 5:
             reject(item, "too_many_same_mother", "同一母题只保留最有价值的五个独立判断。")
             continue
+        topic_domain = str(mother.get("topic_domain") or "crypto").lower()
+        if sum(accepted_item["topic_domain"] == topic_domain for accepted_item in accepted) >= max(
+            1, domain_capacity.get(topic_domain, 0)
+        ):
+            explicitly_rejected_mothers.add(parent_key)
+            reject(item, "persona_capacity", "该领域观点已达到当天可分配人设数量。")
+            continue
         seen_keys.add(claim_key)
         seen_claims.add(normalized)
         content_type = EDITORIAL_ANGLE_FAMILIES[family]
@@ -3918,7 +3962,7 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
             "id": f"{content_type}:angle:{claim_key}",
             "claim_key": claim_key,
             "parent_seed_key": parent_key,
-            "topic_domain": str(mother.get("topic_domain") or "crypto").lower(),
+            "topic_domain": topic_domain,
             "parent_claim_keys": mother.get("parent_claim_keys", []),
             "subject": str(item.get("subject") or mother.get("subject") or mother.get("title"))[:200],
             "title": str(item["title"]).strip()[:300],
@@ -3948,8 +3992,6 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
             "eligible": True,
             "priority": len(accepted) + 1,
         })
-        if len(accepted) == 24:
-            break
     covered_mothers = explicitly_rejected_mothers | {
         item["parent_seed_key"] for item in accepted
     }
@@ -3957,6 +3999,73 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
     if missing_mothers:
         raise ValueError(f"Gemini 多角度选题未明确处理母题: {','.join(sorted(missing_mothers))}")
     return accepted, rejected
+
+
+def decisive_public_claim(value: str) -> str:
+    claim = str(value or "").strip()
+    for phrase in THESIS_AMBIGUOUS_PHRASES:
+        claim = claim.replace(phrase, "")
+    return claim.strip(" ，。；：")
+
+
+def required_public_angle_decision(topic: dict, persona_slug: str) -> dict:
+    profile = persona_thesis_profile(persona_slug)
+    name = PERSONA_PUBLIC_PROFILE.get(persona_slug, {}).get("display_name", persona_slug)
+    base_claim = decisive_public_claim(topic.get("core_claim")) or decisive_public_claim(topic.get("title"))
+    tension = decisive_public_claim(topic.get("specific_tension")) or base_claim
+    primary_claim = f"对{name}来说，{base_claim}；判断重点必须落在{tension}。"
+    contract = {
+        "contract_version": THESIS_CONTRACT_VERSION,
+        "topic_id": str(topic.get("claim_key", "")),
+        "persona_id": persona_slug,
+        "thesis_type": "INTERPRETATION",
+        "claim_nature": "opinion",
+        "primary_subject": {
+            "type": "public_angle",
+            "id": str(topic.get("subject") or topic.get("title") or topic.get("claim_key")),
+        },
+        "relation": "interprets_with_persona_lens",
+        "primary_claim": primary_claim,
+        "primary_claim_count": 1,
+        "scope": {"statement": tension},
+        "persona_lens_id": profile["allowed_lenses"][0],
+        "supporting_basis": [],
+        "reader_payoff": {"type": "judgment", "statement": primary_claim},
+        "falsifier": "",
+        "source_delta": f"{name} 用 {profile['allowed_lenses'][0]} 把公共观点落成明确判断。",
+        "novelty": {"recent_persona_collision": False, "cross_persona_collision": False},
+        "provenance_source": "approved_input",
+    }
+    contract["thesis_id"] = thesis_contract_id(contract)
+    digest = hashlib.sha256(
+        f"{topic.get('claim_key')}:{persona_slug}".encode("utf-8")
+    ).hexdigest()[:20]
+    return {
+        "status": "WRITE",
+        "notice": 5,
+        "authority": 5,
+        "tension": 5,
+        "marginal_value": 5,
+        "why_me": contract["source_delta"],
+        "claim_key": f"required:{digest}",
+        "core_claim": primary_claim,
+        "reader_conclusion": primary_claim,
+        "persona_slug": persona_slug,
+        "thesis": contract,
+        "reason_code": "required_public_angle",
+        "rationale": "公共观点已通过角度质量门，Persona 层只负责分配和形成 Thesis，不得否决。",
+        "open_loop": "",
+        "topic_claim_key": str(topic.get("claim_key", "")),
+    }
+
+
+def enforce_required_public_decisions(decisions: dict, topics: list[dict], persona_slug: str) -> dict:
+    assignments = required_public_topic_assignments(topics)
+    for topic in topics:
+        key = str(topic.get("claim_key", ""))
+        if assignments.get(key) == persona_slug:
+            decisions[key] = required_public_angle_decision(topic, persona_slug)
+    return decisions
 
 
 def validate_persona_editorial_decisions(result, topics: list[dict], persona_slug: str = ""):
@@ -4045,7 +4154,7 @@ def validate_persona_editorial_decisions(result, topics: list[dict], persona_slu
                 "persona_slug": persona_slug,
                 "topic_claim_key": key,
             }
-    return decisions
+    return enforce_required_public_decisions(decisions, topics, persona_slug)
 
 
 def apply_editorial_claim_history(persona_id: int, decisions: dict, claim_history: list[dict]):
@@ -4058,6 +4167,8 @@ def apply_editorial_claim_history(persona_id: int, decisions: dict, claim_histor
             history_claims.add(claim)
     for decision in decisions.values():
         if decision["status"] != "WRITE":
+            continue
+        if decision.get("reason_code") == "required_public_angle":
             continue
         claim = normalize_editorial_claim(decision["core_claim"])
         if claim and claim in history_claims:
@@ -4072,7 +4183,11 @@ def apply_editorial_marginal_threshold(decisions: dict, today_count: int):
     if not minimum:
         return decisions
     for decision in decisions.values():
-        if decision["status"] == "WRITE" and decision["marginal_value"] < minimum:
+        if (
+            decision["status"] == "WRITE"
+            and decision.get("reason_code") != "required_public_angle"
+            and decision["marginal_value"] < minimum
+        ):
             decision["status"] = "HOLD"
             decision["reason_code"] = "insufficient_marginal_value"
             decision["rationale"] = "当天已有候选后，这条主张的边际价值不足。"
@@ -4104,8 +4219,8 @@ async def evaluate_persona_editorial(persona: dict, persona_context: dict, daily
         "条件型 Thesis 可以写‘只有当 X 可验证时，Y 才值得参与’，但不能写‘可以关注’。"
         "why_me 必须说明这个人设的观察位置怎样导向这条判断，不能只说符合人设或有观察位置。"
         "HOLD 是内部状态，不是正文，绝不以等待后续凑稿。"
-        "逐题独立决定，可有多条 WRITE，也可以全部 HOLD 或 IGNORE；不设数量上下限。"
-        "公共 topic 已经通过母题多角度质量门；这里只判断哪个人设最适合说，不再临时发明新主题。"
+        "逐题独立决定；列在‘本次必须 WRITE’中的公共 topic 必须 WRITE，不能 HOLD 或 IGNORE。"
+        "公共 topic 已经通过母题多角度质量门；这里只负责形成该人设的 Thesis，不得再次否决观点。"
         "公共 topic 若四项评分均不低于 3 且没有明确事实冲突，应优先形成独立 Thesis 后 WRITE；"
         "不要仅以还需更多数据、已有讨论或不是最完美人选为由 HOLD。"
         "WRITE 必须保持该 angle 的判断边界，不能合并多个角度，也不能退化成常识。"
@@ -4115,6 +4230,7 @@ async def evaluate_persona_editorial(persona: dict, persona_context: dict, daily
         "expression_debt 是成熟但未表达的候选，不是必须 WRITE 的欠稿数量。"
         "today_accepted_count 不是配额，0 合法；数量越高越要求更强的边际价值。"
         "不编造持仓、经历、交易、收益或事实。\n\n"
+        f"本次必须 WRITE 的公共 topic_claim_key：{json.dumps([key for key, slug in required_public_topic_assignments(topics).items() if slug == persona['slug']], ensure_ascii=False)}\n"
         f"人设：{json.dumps({'slug': persona['slug'], 'card': editorial_persona_card(persona)}, ensure_ascii=False)}\n"
         f"人设连续性：{json.dumps(editorial_persona_context(persona_context), ensure_ascii=False)}\n"
         f"已批准的人设编辑语境：{json.dumps(persona.get('_editorial_context') or {}, ensure_ascii=False)}\n"
@@ -4267,7 +4383,11 @@ def validate_run_persona_theses(run_id: int, raw_cards: dict):
                 ),
             ).fetchall()
             claim = str(contract.get("primary_claim", ""))
-            if claim and any(normalized_claims_collide(claim, item["core_claim"]) for item in recent):
+            if (
+                evaluation.get("reason_code") != "required_public_angle"
+                and claim
+                and any(normalized_claims_collide(claim, item["core_claim"]) for item in recent)
+            ):
                 errors.append("RECENT_PERSONA_THESIS_COLLISION")
             if errors:
                 conn.execute(
@@ -4349,6 +4469,31 @@ def resolve_persona_editorial_collisions(run_id: int):
             )
 
 
+def uncovered_public_angle_keys(conn, run_id: int) -> list[str]:
+    row = conn.execute(
+        "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+    ).fetchone()
+    if not row:
+        return []
+    cards = json_value(row["raw_cards"], {})
+    stage = cards.get("editorial_angle_expansion", {}) if isinstance(cards, dict) else {}
+    if not isinstance(stage, dict) or stage.get("status") != "ready":
+        return []
+    required = {
+        str(topic.get("claim_key", ""))
+        for topic in stage.get("expanded_topics", [])
+        if str(topic.get("scope", "public")) == "public" and topic.get("claim_key")
+    }
+    covered = {
+        str(json_value(evaluation["topic_json"], {}).get("claim_key", ""))
+        for evaluation in conn.execute(
+            "SELECT topic_json FROM persona_editorial_evaluations WHERE run_id=? AND status='WRITE'",
+            (run_id,),
+        ).fetchall()
+    }
+    return sorted(required - covered)
+
+
 def daily_persona_visible_draft_count(conn, persona_id: int, context_date: str) -> int:
     return int(conn.execute(
         """SELECT COUNT(*) FROM post_candidates
@@ -4373,9 +4518,15 @@ def daily_persona_draft_count(conn, persona_id: int, context_date: str) -> int:
 
 
 def limit_persona_editorial_writes(decisions: dict, available_slots: int) -> dict:
+    required = [
+        (key, decision) for key, decision in decisions.items()
+        if decision.get("status") == "WRITE"
+        and decision.get("reason_code") == "required_public_angle"
+    ]
     writes = [
         (key, decision) for key, decision in decisions.items()
         if decision.get("status") == "WRITE"
+        and decision.get("reason_code") != "required_public_angle"
     ]
     writes.sort(
         key=lambda item: (
@@ -4386,7 +4537,8 @@ def limit_persona_editorial_writes(decisions: dict, available_slots: int) -> dic
         ),
         reverse=True,
     )
-    for _, decision in writes[max(0, available_slots):]:
+    remaining_slots = max(0, available_slots - len(required))
+    for _, decision in writes[remaining_slots:]:
         decision.update({
             "status": "HOLD",
             "reason_code": "daily_target_reached",
@@ -4399,13 +4551,14 @@ def enforce_daily_persona_draft_cap(conn, context_date: str, target: int) -> int
     if target <= 0:
         return 0
     rows = conn.execute(
-        """SELECT c.id,c.persona_id,c.status,c.source,e.id evaluation_id
+        """SELECT c.id,c.persona_id,c.status,c.source,e.id evaluation_id,e.reason_code
            FROM post_candidates c
            JOIN persona_editorial_evaluations e
              ON c.source=('persona_editorial_grok_gemini:' || e.id)
            WHERE c.context_date=? AND c.status IN ('published','queued','needs_review')
            ORDER BY c.persona_id,
                     CASE c.status WHEN 'published' THEN 0 ELSE 1 END,
+                    CASE e.reason_code WHEN 'required_public_angle' THEN 0 ELSE 1 END,
                     c.created_at,c.id""",
         (context_date,),
     ).fetchall()
@@ -4415,7 +4568,11 @@ def enforce_daily_persona_draft_cap(conn, context_date: str, target: int) -> int
     for row in rows:
         persona_id = row["persona_id"]
         counts[persona_id] = counts.get(persona_id, 0) + 1
-        if counts[persona_id] <= target or row["status"] == "published":
+        if (
+            counts[persona_id] <= target
+            or row["status"] == "published"
+            or row["reason_code"] == "required_public_angle"
+        ):
             continue
         conn.execute(
             "UPDATE post_candidates SET status='superseded',updated_at=? WHERE id=?",
@@ -6541,6 +6698,9 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
                         )
                 except RuntimeError:
                     return
+                decisions = enforce_required_public_decisions(
+                    decisions, topics, persona["slug"]
+                )
                 decisions = apply_editorial_marginal_threshold(decisions, today_count)
                 decisions = apply_editorial_claim_history(persona["id"], decisions, history)
                 if available_slots is not None:
@@ -6549,6 +6709,10 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
         await asyncio.gather(*(evaluate_one_persona(persona_row) for persona_row in personas))
         validate_run_persona_theses(run["id"], cards)
         resolve_persona_editorial_collisions(run["id"])
+        with db() as conn:
+            missing_public = uncovered_public_angle_keys(conn, run["id"])
+        if missing_public:
+            continue
         ensure_daily_persona_draft_floor(run["id"], [dict(persona_row) for persona_row in personas])
         validate_run_persona_theses(run["id"], cards)
         resolve_persona_editorial_collisions(run["id"])
@@ -8335,6 +8499,8 @@ def daily_post_output_ready(conn, context_date: str) -> bool:
         (task := DAILY_POST_GENERATION_TASKS.get(row["id"])) is not None and not task.done()
         for row in runs
     ):
+        return False
+    if any(uncovered_public_angle_keys(conn, row["id"]) for row in runs):
         return False
     active = conn.execute(
         """SELECT COUNT(*) FROM persona_editorial_evaluations e
