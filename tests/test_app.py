@@ -3074,6 +3074,32 @@ class AppTest(unittest.TestCase):
         self.app_module.EDITORIAL_GEMINI_KEY_POOLS.clear()
         self.app_module._cached_gemini_api_keys.cache_clear()
 
+    def test_angle_expansion_retries_only_a_malformed_gemini_batch(self):
+        calls = []
+        payload = {"choices": [{"message": {"content": "{}"}}]}
+        self.app_module.EDITORIAL_GEMINI_KEY_POOLS.clear()
+        self.app_module._cached_gemini_api_keys.cache_clear()
+        with patch.dict(os.environ, {
+            "XOPS_GEMINI_KEYCHAIN_ACCOUNTS": "", "XOPS_GEMINI_API_KEY": "dummy",
+        }, clear=True), patch.object(
+            self.app_module.httpx, "AsyncClient", return_value=FakeAsyncClient(payload, calls)
+        ), patch.object(
+            self.app_module, "chat_completion_json", side_effect=[
+                json.JSONDecodeError("bad json", "", 0),
+                {"angles": [], "rejected_angles": []},
+            ],
+        ):
+            result = asyncio.run(self.app_module.expand_editorial_angles_gemini(
+                [{"seed_key": "seed-1", "title": "母题", "topic_domain": "ai"}],
+                {}, {"contexts": [{"seed_key": "seed-1", "background": "背景"}]}, [],
+            ))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["kwargs"]["json"]["temperature"], 0.55)
+        self.assertEqual(calls[1]["kwargs"]["json"]["temperature"], 0.2)
+        self.assertEqual(result["angles"], [])
+        self.app_module.EDITORIAL_GEMINI_KEY_POOLS.clear()
+        self.app_module._cached_gemini_api_keys.cache_clear()
+
     def test_gemini_provider_signature_does_not_expose_key(self):
         dummy_key = "dummy-gemini-secret"
         with patch.dict(os.environ, {

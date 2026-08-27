@@ -5413,21 +5413,27 @@ async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_contex
         f"Grok 实时语境：{json.dumps(batch_context, ensure_ascii=False)}\n"
         f"团队已覆盖主张：{json.dumps(editorial_claim_memory(claim_history), ensure_ascii=False)}"
         )
-        async with httpx.AsyncClient(timeout=180) as client:
-            async with gemini_request_key(provider) as key:
-                response = await client.post(
-                    provider["base_url"] + "/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                        "User-Agent": "Mozilla/5.0",
-                    },
-                    json={
-                        "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
-                        "response_format": {"type": "json_object"}, "temperature": 0.55, "max_tokens": 4000,
-                    },
-                )
-            response.raise_for_status()
-        return chat_completion_json(response.json())
+        for attempt in range(2):
+            async with httpx.AsyncClient(timeout=180) as client:
+                async with gemini_request_key(provider) as key:
+                    response = await client.post(
+                        provider["base_url"] + "/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                            "User-Agent": "Mozilla/5.0",
+                        },
+                        json={
+                            "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
+                            "response_format": {"type": "json_object"},
+                            "temperature": 0.55 if attempt == 0 else 0.2, "max_tokens": 8000,
+                        },
+                    )
+                response.raise_for_status()
+            try:
+                return chat_completion_json(response.json())
+            except json.JSONDecodeError:
+                if attempt == 1:
+                    raise
 
     results = await asyncio.gather(*(
         expand_batch(mother_topics[index:index + 5]) for index in range(0, len(mother_topics), 5)
