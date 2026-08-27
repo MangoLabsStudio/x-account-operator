@@ -361,7 +361,7 @@ class DiscussionTopicsTest(unittest.TestCase):
         self.assertEqual(topics["niche"], [])
         self.assertFalse(any(topic["key"] == "bitcoin" for topic in topics["hot"]))
 
-    def test_below_five_authors_and_sgp_stay_niche(self):
+    def test_two_author_topics_need_a_second_heat_signal(self):
         rows = [
             attention_row(
                 f"sol{index}",
@@ -380,10 +380,27 @@ class DiscussionTopicsTest(unittest.TestCase):
 
         topics = build_discussion_topics(rows, self.now)
 
-        self.assertEqual(topics["hot"], [])
-        self.assertIn("solana:listing_launch", [topic["key"] for topic in topics["niche"]])
+        self.assertIn("solana:listing_launch", [topic["key"] for topic in topics["hot"]])
         self.assertIn("solana:fee_model", [topic["key"] for topic in topics["niche"]])
         self.assertIn("solana:governance", [topic["key"] for topic in topics["niche"]])
+
+    def test_two_author_cross_list_topic_is_hot(self):
+        rows = [
+            attention_row(
+                "sol1", "sol_author1",
+                "Solana price is changing the market structure.",
+                "2026-08-24T11:00:00+00:00", source_lists=["list_a"],
+            ),
+            attention_row(
+                "sol2", "sol_author2",
+                "Solana price is changing the market structure.",
+                "2026-08-24T10:00:00+00:00", source_lists=["list_b"],
+            ),
+        ]
+
+        topics = build_discussion_topics(rows, self.now)
+
+        self.assertIn("solana:market_structure", [topic["key"] for topic in topics["hot"]])
 
     def test_market_structure_and_tokenized_equities_are_concrete_hot_topics(self):
         rows = []

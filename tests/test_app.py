@@ -4455,9 +4455,55 @@ class AppTest(unittest.TestCase):
         self.assertEqual(len(cards["attention_topics"]), 20)
         self.assertEqual(cards["attention_topics"][0]["title"], "热点 0")
 
+    def test_controlled_cards_drops_niche_exclusions_before_opinion_sources(self):
+        cards = self.app_module.controlled_cards(
+            [],
+            [
+                {"source_ref": f"opinion-{index}", "text": "有具体因果关系的观点" * 12}
+                for index in range(10)
+            ],
+            {},
+            niche_topics=[
+                {"title": f"冷门 {index}", "key": f"niche-{index}", "unique_authors": 1, "post_count": 1}
+                for index in range(100)
+            ],
+            limit=3000,
+        )
+
+        self.assertGreater(len(cards["opinion_cards"]), 0)
+        self.assertLess(len(cards["excluded_niche_topics"]), 40)
+
+    def test_controlled_cards_separates_discovery_topics_from_noise(self):
+        cards = self.app_module.controlled_cards(
+            [],
+            [],
+            {},
+            niche_topics=[
+                {
+                    "title": "早期项目发现",
+                    "key": "project:launch",
+                    "unique_authors": 2,
+                    "post_count": 2,
+                    "engagement_total": 80,
+                },
+                {
+                    "title": "单一低信号帖子",
+                    "key": "noise:mention",
+                    "unique_authors": 1,
+                    "post_count": 1,
+                    "engagement_total": 3,
+                },
+            ],
+        )
+
+        self.assertEqual([item["key"] for item in cards["discovery_topics"]], ["project:launch"])
+        self.assertEqual([item["key"] for item in cards["excluded_niche_topics"]], ["noise:mention"])
+
     def test_topic_selection_policy_and_history_are_persisted(self):
         policy = self.app_module.topic_selection_policy()
         self.assertIn("历史", "".join(policy["required_gates"]))
+        self.assertIn("发现池", policy["principle"])
+        self.assertIn("discovery", policy["selection_lanes"])
         self.assertEqual(policy["slate_guidance"]["dedupe_unit"], "去重单位是核心主张，不是事件、项目、币种或题材。")
         self.assertIn("不设", policy["content_inspiration"]["rule"])
         self.assertIn("开头两句内用一句话说明", "".join(policy["draft_quality_gates"]))
@@ -4547,6 +4593,37 @@ class AppTest(unittest.TestCase):
             cards,
         )
         self.assertEqual([item["claim_key"] for item in selected], ["meme-daily-close"])
+        self.assertEqual(rejected, [])
+
+    def test_screened_topic_can_use_discovery_topic_as_source(self):
+        cards = {
+            "discussion_topics": [],
+            "discovery_topics": [{"key": "project:launch", "title": "早期项目发现"}],
+            "claim_history": [],
+        }
+        selected, rejected = self.app_module.bounded_selected_topics(
+            {
+                "selected_topics": [{
+                    "claim_key": "project-early-distribution",
+                    "subject": "新项目",
+                    "title": "这个项目先争开发者，而不是先争用户",
+                    "core_claim": "它的首轮分发方式表明开发者采用比零售获客更优先。",
+                    "content_type": "research",
+                    "kind": "project_discovery",
+                    "source_topic_keys": ["project:launch"],
+                    "fact_basis": "两位作者讨论了同一产品发布。",
+                    "opinion_basis": "先做开发者分发更容易形成工具生态。",
+                    "material_delta": "发布机制首次公开。",
+                    "audience_value": "帮助读者判断项目真正争夺的市场。",
+                    "why_now": "产品刚发布。",
+                    "persona_fit": ["atuo"],
+                }],
+                "rejected_topics": [],
+            },
+            cards,
+        )
+
+        self.assertEqual([item["claim_key"] for item in selected], ["project-early-distribution"])
         self.assertEqual(rejected, [])
 
     def test_screened_editorial_can_use_evergreen_inspiration(self):

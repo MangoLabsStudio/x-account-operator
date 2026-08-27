@@ -137,7 +137,8 @@ OPINION_MIN_SCORE = 12
 OPINION_LIMIT = 200
 ATTENTION_SAMPLE_LIMIT = 3
 ATTENTION_MIN_AUTHORS = 5
-DISCUSSION_HOT_MIN_AUTHORS = 5
+DISCUSSION_HOT_MIN_AUTHORS = 2
+DISCUSSION_HOT_MIN_ENGAGEMENT = 50
 ATTENTION_TOPIC_PATTERNS = (
     ("bitcoin_etf", "比特币 ETF", re.compile(r"(?:\b(?:bitcoin|btc)\b|比特币).{0,32}\betf\b|\betf\b.{0,32}(?:\b(?:bitcoin|btc)\b|比特币)", re.IGNORECASE)),
     ("ethereum_etf", "以太坊 ETF", re.compile(r"(?:\b(?:ethereum|eth)\b|以太坊).{0,32}\betf\b|\betf\b.{0,32}(?:\b(?:ethereum|eth)\b|以太坊)", re.IGNORECASE)),
@@ -704,9 +705,17 @@ def build_discussion_topics(rows: list[dict], now: datetime | None = None) -> di
             topic["latest_at"],
         )
     )
+    def is_hot(topic: dict) -> bool:
+        return topic["unique_authors"] >= DISCUSSION_HOT_MIN_AUTHORS and (
+            topic["unique_authors"] >= 3
+            or topic["post_count"] >= 3
+            or topic["cross_list_count"] >= 2
+            or topic["engagement_total"] >= DISCUSSION_HOT_MIN_ENGAGEMENT
+        )
+
     return {
-        "hot": [topic for topic in topics if topic["unique_authors"] >= DISCUSSION_HOT_MIN_AUTHORS],
-        "niche": [topic for topic in topics if topic["unique_authors"] < DISCUSSION_HOT_MIN_AUTHORS],
+        "hot": [topic for topic in topics if is_hot(topic)],
+        "niche": [topic for topic in topics if not is_hot(topic)],
     }
 
 
@@ -865,7 +874,7 @@ def cross_validate(db_path: Path, output_dir: Path, *, run_id: str, hours: int =
     discussion_lines = [
         "# 今日可写讨论议题",
         "",
-        f"默认成稿只从 hot 中挑：实体必须与具体事件或机制共现，并至少有 {DISCUSSION_HOT_MIN_AUTHORS} 位不同作者讨论。",
+        f"默认成稿只从 hot 中挑：实体必须与具体事件或机制共现，至少有 {DISCUSSION_HOT_MIN_AUTHORS} 位不同作者讨论，且具备跨列表、互动或连续发帖信号。",
         "",
     ]
     for index, topic in enumerate(discussion_topics["hot"], 1):

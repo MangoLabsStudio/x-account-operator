@@ -2179,6 +2179,14 @@ def selected_research_question(topic: str, questions: list[dict]) -> dict | None
     return selected_opportunity_question(topic, questions)
 
 
+def is_discovery_topic(item: dict) -> bool:
+    return (
+        int(item.get("unique_authors") or 0) >= 2
+        or int(item.get("cross_list_count") or 0) >= 2
+        or int(item.get("engagement_total") or 0) >= 50
+    )
+
+
 def controlled_cards(
     facts: list[dict],
     opinions: list[dict],
@@ -2194,8 +2202,23 @@ def controlled_cards(
     limit: int = 90000,
 ):
     """Keep synthesis grounded in cards, never in the full raw social feed."""
+    discovery_topics = sorted(
+        (
+            item for item in (niche_topics or [])
+            if isinstance(item, dict) and is_discovery_topic(item)
+        ),
+        key=lambda item: (
+            -int(item.get("unique_authors") or 0),
+            -int(item.get("engagement_total") or 0),
+            -int(item.get("post_count") or 0),
+        ),
+    )[:30]
+    discovery_keys = {str(item.get("key") or "") for item in discovery_topics}
     ordered_niches = sorted(
-        (item for item in (niche_topics or []) if isinstance(item, dict)),
+        (
+            item for item in (niche_topics or [])
+            if isinstance(item, dict) and str(item.get("key") or "") not in discovery_keys
+        ),
         key=lambda item: (
             not str(item.get("key", "")).startswith("proposal:"),
             -int(item.get("unique_authors") or 0),
@@ -2230,7 +2253,6 @@ def controlled_cards(
                 "engagement_total",
                 "engagement_coverage",
                 "latest_at",
-                "sample_posts",
                 "samples",
                 "id",
                 "question",
@@ -2260,13 +2282,32 @@ def controlled_cards(
                 for item in evidence[:4]
                 if isinstance(item, dict)
             ]
+        sample_posts = card.get("sample_posts")
+        if isinstance(sample_posts, list):
+            allowed["sample_posts"] = [
+                {
+                    key: (str(item[key])[:500] if key == "text" else item[key])
+                    for key in ("source_ref", "created_at", "text", "like_count", "retweet_count")
+                    if key in item
+                }
+                for item in sample_posts[:3]
+                if isinstance(item, dict)
+            ]
         return allowed
 
     payload = {
         "coverage": coverage,
         "topic_selection_policy": selection_policy or {},
-        "claim_history": [item for item in (claim_history or [])[:200] if isinstance(item, dict)],
+        "claim_history": [
+            {
+                key: item[key]
+                for key in ("claim_key", "subject", "core_claim", "context_date", "status")
+                if key in item
+            }
+            for item in (claim_history or [])[:120] if isinstance(item, dict)
+        ],
         "discussion_topics": [compact(card) for card in (discussion_topics or [])[:20] if isinstance(card, dict)],
+        "discovery_topics": [compact(card) for card in discovery_topics],
         "opportunity_questions": [compact(card) for card in (opportunity_questions or [])[:20] if isinstance(card, dict)],
         "editorial_questions": [compact(card) for card in (editorial_questions or [])[:8] if isinstance(card, dict)],
         "research_questions": [compact(card) for card in (research_questions or [])[:20] if isinstance(card, dict)],
@@ -2277,30 +2318,32 @@ def controlled_cards(
                 for key in ("title", "key", "unique_authors", "post_count")
                 if key in card
             }
-            for card in ordered_niches
+            for card in ordered_niches[:40]
         ],
         "fact_cards": [compact(card) for card in facts[:120] if isinstance(card, dict)],
         "opinion_cards": [compact(card) for card in opinions[:120] if isinstance(card, dict)],
     }
     while len(json.dumps(payload, ensure_ascii=False)) > limit:
-        if payload["opinion_cards"]:
-            payload["opinion_cards"].pop()
+        if payload["excluded_niche_topics"]:
+            payload["excluded_niche_topics"].pop()
+        elif payload["attention_topics"]:
+            payload["attention_topics"].pop()
         elif payload["claim_history"]:
             payload["claim_history"].pop()
-        elif payload["excluded_niche_topics"]:
-            payload["excluded_niche_topics"].pop()
+        elif payload["research_questions"]:
+            payload["research_questions"].pop()
+        elif payload["editorial_questions"]:
+            payload["editorial_questions"].pop()
+        elif payload["opportunity_questions"]:
+            payload["opportunity_questions"].pop()
+        elif payload["opinion_cards"]:
+            payload["opinion_cards"].pop()
+        elif payload["discovery_topics"]:
+            payload["discovery_topics"].pop()
         elif payload["fact_cards"]:
             payload["fact_cards"].pop()
         elif payload["discussion_topics"]:
             payload["discussion_topics"].pop()
-        elif payload["opportunity_questions"]:
-            payload["opportunity_questions"].pop()
-        elif payload["editorial_questions"]:
-            payload["editorial_questions"].pop()
-        elif payload["research_questions"]:
-            payload["research_questions"].pop()
-        elif payload["attention_topics"]:
-            payload["attention_topics"].pop()
         else:
             break
     return payload
@@ -2486,6 +2529,8 @@ async def synthesize_daily_cards(context_date: str, cards: dict):
         "字段必须是 market_state,event_clusters,debates,evidence,unknowns,sources,selected_topics,rejected_topics。\n"
         "discussion_topics 是实体与具体机制共同出现的可写议题，按讨论热度排序，是内容选题的主轴；"
         "attention_topics 只是父级市场地图，不能单独替代一个具体选题。"
+        "discovery_topics 是尚未形成大众热点、但已有多人、跨列表或互动信号的早期题材；"
+        "它可以进入开源发现、产品资讯、项目评价或早期趋势选题，但必须明确写成发现/判断，不能伪装成全市场热点。"
         "opportunity_questions、editorial_questions 和 research_questions 只是研究入口，不是最终可写选题。"
         "必须按照 topic_selection_policy 逐条筛选，并把 claim_history 视为全账号已覆盖历史。"
         "热点不等于可写；数字刷新不等于观点更新。与历史主张语义相同且没有 material delta 的研究题必须拒绝。"
@@ -2496,14 +2541,14 @@ async def synthesize_daily_cards(context_date: str, cards: dict):
         "圈内读者不需要当天材料也能回答的常识题必须拒绝。按 slate_guidance 形成足够丰富但不凑数的题单。\n"
         "selected_topics 每项必须包含 claim_key,subject,title,core_claim,content_type,kind,source_topic_keys,topic_domain,"
         "fact_basis,opinion_basis,material_delta,audience_value,why_now,persona_fit。"
-        "content_type 只能是 opportunity、editorial、research；source_topic_keys 必须来自 discussion_topics，或使用输入卡片的 opinion:<source_ref> / fact:<source_ref>。"
+        "content_type 只能是 opportunity、editorial、research；source_topic_keys 必须来自 discussion_topics、discovery_topics，或使用输入卡片的 opinion:<source_ref> / fact:<source_ref>。"
         "editorial 还可以从 content_inspiration 自由取材，并使用 evergreen:<key>；这些只是灵感，不是固定栏目、配额或轮换表。"
         "每天想到什么写什么，可以全是热点，也可以全是交易哲学；只有确实有话可说才选。名人内容遵守 quote_rule。"
         "title 必须直接包含新的结论或冲突，不能只是泛问‘为什么、有没有人用、意味着什么’。"
         "fact_basis 只写输入事实候选能支持的内容；opinion_basis 必须明确是观点；material_delta 必须说明相对历史到底新增了什么。\n"
         "rejected_topics 每项必须包含 title,core_claim,reason_code,reason,source_topic_keys；reason_code 必须来自 policy 的 reject_codes。"
         "单篇质量高、官方材料完整，都不能替代真实讨论度：冷门技术机制不得因为容易分析而挤占热点。\n"
-        "excluded_niche_topics 是低于日常选题门槛的排除清单；其中的提案、项目或事件不得出现在 market_state、event_clusters 或 debates。"
+        "excluded_niche_topics 才是低于发现门槛的排除清单；其中的提案、项目或事件不得出现在 market_state、event_clusters 或 debates。"
         "event_clusters 优先按 discussion_topics 原样归纳具体讨论议题及热度；只有 discussion_topics 为空时，才可用 attention_topics 概括父级市场地图。不能从一张观点卡扩写出新的事件簇。\n"
         "market_state 只能写本轮母池的讨论面和注意力结构，不能把卡片内容写成已经发生的市场事实。"
         "event_clusters 和 debates 只能提炼本轮输入卡片，不得引入历史轮次、模型常识或外部事件。"
@@ -2538,19 +2583,22 @@ def chinese_synthesis_text(value, fallback: str):
 
 def bounded_selected_topics(result: dict, cards: dict):
     default_domain = str(cards.get("topic_domain") or "crypto").lower()
+    public_topic_cards = [
+        item for field in ("discussion_topics", "discovery_topics")
+        for item in cards.get(field, [])
+        if isinstance(item, dict)
+    ]
     source_topics = {
         str(item.get("key")): str(item.get("title") or item.get("key"))
-        for item in cards.get("discussion_topics", [])
-        if isinstance(item, dict) and item.get("key")
+        for item in public_topic_cards if item.get("key")
     }
     source_domains = {
         str(item.get("key")): str(item.get("topic_domain") or default_domain).lower()
-        for item in cards.get("discussion_topics", [])
-        if isinstance(item, dict) and item.get("key")
+        for item in public_topic_cards if item.get("key")
     }
     source_refs = {}
-    for item in cards.get("discussion_topics", []):
-        if not isinstance(item, dict) or not item.get("key"):
+    for item in public_topic_cards:
+        if not item.get("key"):
             continue
         refs = {
             str(value).strip()
@@ -3624,7 +3672,8 @@ def selected_editorial_mother_topics(cards: dict):
     selected = cards.get("selected_topics", []) if isinstance(cards, dict) else []
     discussions = {
         (str(item.get("topic_domain") or "crypto").lower(), str(item.get("key"))): item
-        for item in cards.get("discussion_topics", [])
+        for field in ("discussion_topics", "discovery_topics")
+        for item in cards.get(field, [])
         if isinstance(item, dict) and item.get("key")
     }
     opinions = {
@@ -6567,16 +6616,12 @@ def daily_domain_cards(snapshot_output: Path, collect_result: dict, validation_r
     )
     niche_topics = with_topic_domain(
         [
-            {
-                key: item[key]
-                for key in ("title", "key", "unique_authors", "post_count")
-                if key in item
-            }
-            for item in read_card_file(snapshot_output / "attention_topics.json", "niche")
+            item for item in read_card_file(snapshot_output / "attention_topics.json", "niche")
             if isinstance(item, dict)
         ],
         topic_domain,
     )
+    discovery_topics = [item for item in niche_topics if is_discovery_topic(item)][:30]
     coverage = {
         "status": "ok",
         "collect": collect_result if isinstance(collect_result, dict) else {},
@@ -6589,6 +6634,7 @@ def daily_domain_cards(snapshot_output: Path, collect_result: dict, validation_r
         "editorial_questions": len(editorial_questions),
         "research_questions": len(research_questions),
         "niche_topics": len(niche_topics),
+        "discovery_topics": len(discovery_topics),
     }
     full = {
         "topic_domain": topic_domain,
@@ -6600,6 +6646,7 @@ def daily_domain_cards(snapshot_output: Path, collect_result: dict, validation_r
         "research_questions": research_questions,
         "attention_topics": attention_topics,
         "niche_topics": niche_topics,
+        "discovery_topics": discovery_topics,
         "fact_cards": facts,
         "opinion_cards": opinions,
     }
@@ -6750,8 +6797,8 @@ async def execute_daily_context_run(run_id: int):
 
         list_fields = (
             "discussion_topics", "opportunity_questions", "editorial_questions",
-            "research_questions", "attention_topics", "niche_topics", "fact_cards",
-            "opinion_cards",
+            "research_questions", "attention_topics", "niche_topics", "discovery_topics",
+            "fact_cards", "opinion_cards",
         )
         coverage = {**crypto_coverage, "domains": {}}
         for domain, material in domain_full.items():
