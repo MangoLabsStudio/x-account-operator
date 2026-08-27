@@ -710,14 +710,19 @@ def build_discussion_topics(rows: list[dict], now: datetime | None = None) -> di
     }
 
 
-def cross_validate(db_path: Path, output_dir: Path, hours: int = 30) -> dict:
+def cross_validate(db_path: Path, output_dir: Path, *, run_id: str, hours: int = 30) -> dict:
+    run_id = run_id.strip()
+    if not run_id:
+        raise ValueError("run_id is required")
     generated_at = datetime.now(timezone.utc)
     since = generated_at - timedelta(hours=hours)
     with sqlite3.connect(db_path) as db:
         db.row_factory = sqlite3.Row
         rows = db.execute(
-            "SELECT * FROM source_posts WHERE created_at>=? ORDER BY created_at DESC",
-            (since.isoformat(),),
+            """SELECT p.* FROM source_posts p
+               JOIN source_post_runs r ON r.post_id=p.post_id
+               WHERE r.run_id=? ORDER BY p.created_at DESC""",
+            (run_id,),
         ).fetchall()
     posts = [
         {
@@ -733,6 +738,7 @@ def cross_validate(db_path: Path, output_dir: Path, hours: int = 30) -> dict:
     attention_topics = build_attention_topics(posts, generated_at)
     discussion_topics = build_discussion_topics(posts, generated_at)
     payload = {
+        "run_id": run_id,
         "generated_at": generated_at.isoformat(),
         "since": since.isoformat(),
         "rule": "Similar original posts from at least two distinct authors; multi-source mention is not final factual confirmation.",
@@ -791,6 +797,7 @@ def cross_validate(db_path: Path, output_dir: Path, hours: int = 30) -> dict:
     (output_dir / "opinion_cards.json").write_text(
         json.dumps(
             {
+                "run_id": run_id,
                 "generated_at": payload["generated_at"],
                 "source_post_count": len(posts),
                 "opinion_count": len(opinions),
@@ -805,6 +812,7 @@ def cross_validate(db_path: Path, output_dir: Path, hours: int = 30) -> dict:
     )
     (output_dir / "opinion_cards.md").write_text("\n".join(opinion_lines), encoding="utf-8")
     attention_payload = {
+        "run_id": run_id,
         "generated_at": payload["generated_at"],
         "window_start": (generated_at - timedelta(hours=24)).isoformat(),
         "window_end": payload["generated_at"],
@@ -842,6 +850,7 @@ def cross_validate(db_path: Path, output_dir: Path, hours: int = 30) -> dict:
         "\n".join(attention_lines), encoding="utf-8"
     )
     discussion_payload = {
+        "run_id": run_id,
         "generated_at": payload["generated_at"],
         "window_start": (generated_at - timedelta(hours=24)).isoformat(),
         "window_end": payload["generated_at"],
@@ -878,6 +887,7 @@ def cross_validate(db_path: Path, output_dir: Path, hours: int = 30) -> dict:
         "\n".join(discussion_lines), encoding="utf-8"
     )
     return {
+        "run_id": run_id,
         "source_posts": len(posts),
         "fact_cards": len(cards),
         "opinion_cards": len(opinions),
@@ -893,9 +903,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
     parser.add_argument("--hours", type=int, default=30)
     args = parser.parse_args()
-    print(json.dumps(cross_validate(args.db, args.output, args.hours)))
+    print(json.dumps(cross_validate(args.db, args.output, run_id=args.run_id, hours=args.hours)))
 
 
 if __name__ == "__main__":

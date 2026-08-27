@@ -16,7 +16,7 @@ def run_daily(
     accounts_path: Path = DEFAULT_ACCOUNTS_PATH,
     hours: int = 30,
     workers: int = 8,
-    resume_hours: int = 20,
+    resume_hours: int = 0,
 ) -> dict:
     collection = collect(
         accounts_path,
@@ -27,7 +27,15 @@ def run_daily(
         workers=workers,
         resume_hours=resume_hours,
     )
-    validation = cross_validate(db_path, Path(collection.get("snapshot_dir", output_dir)), hours=hours)
+    run_id = str(collection.get("run_id") or "").strip()
+    if not run_id:
+        raise RuntimeError("抓取结果缺少 run_id")
+    validation = cross_validate(
+        db_path,
+        Path(collection.get("snapshot_dir", output_dir)),
+        run_id=run_id,
+        hours=hours,
+    )
     return {"collection": collection, "validation": validation}
 
 
@@ -37,7 +45,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--hours", type=int, default=30)
     parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--resume-hours", type=int, default=20)
+    parser.add_argument("--resume-hours", type=int, default=0)
     args = parser.parse_args()
     result = run_daily(
         db_path=args.db,

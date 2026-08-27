@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="LB geometric avatar">
+  <rect width="256" height="256" rx="48" fill="#3f1d2e"/>
+  <circle cx="128" cy="128" r="85" fill="#7c2d4c"/>
+  <path d="M76 164l30-43 24 22 46-59" fill="none" stroke="#fbbf24" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="128" y="204" text-anchor="middle" fill="#fff1cc" font-family="Arial, sans-serif" font-size="42" font-weight="700">LW</text>
+</svg>
