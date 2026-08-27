@@ -967,6 +967,10 @@ class AppTest(unittest.TestCase):
         self.assertEqual(len(mothers), 16)
         self.assertEqual(sum(item["topic_domain"] == "crypto" for item in mothers), 8)
         self.assertEqual(sum(item["topic_domain"] == "ai" for item in mothers), 8)
+        cards["hot_topic_pool"] = {
+            "mother_topics": [{"seed_key": "older:topic", "topic_domain": "crypto"}],
+        }
+        self.assertEqual(len(self.app_module.editorial_mother_topics(cards)), 16)
 
     def test_hot_topic_pool_keeps_today_plus_previous_two_days(self):
         today = "2026-08-28"

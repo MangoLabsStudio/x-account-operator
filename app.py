@@ -3827,13 +3827,13 @@ def editorial_mother_topics(cards: dict):
     seen = {str(item.get("seed_key") or "") for item in current}
     merged = list(current)
     for mother in pool.get("mother_topics", []) if isinstance(pool, dict) else []:
+        if len(merged) >= 16:
+            break
         seed_key = str(mother.get("seed_key") or "") if isinstance(mother, dict) else ""
         if not seed_key or seed_key in seen:
             continue
         merged.append(mother)
         seen.add(seed_key)
-        if len(merged) == 16:
-            break
     return merged
 
 
