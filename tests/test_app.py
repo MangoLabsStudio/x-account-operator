@@ -2147,6 +2147,19 @@ class AppTest(unittest.TestCase):
             not card.get("structure_id") or card["structure_id"] in structures for card in cards
         ))
 
+    def test_every_persona_has_a_valid_daily_supplement_thesis(self):
+        with self.app_module.db() as conn:
+            personas = [dict(row) for row in conn.execute("SELECT * FROM personas ORDER BY id")]
+        for persona in personas:
+            topics = self.app_module.daily_persona_supplement_topics(persona, "2026-08-28")
+            self.assertTrue(any(
+                not self.app_module.thesis_contract_errors(
+                    topic, persona["slug"],
+                    self.app_module.daily_supplement_decision(persona, topic)["thesis"],
+                )
+                for topic in topics
+            ), persona["slug"])
+
     def test_daily_three_draft_target_is_idempotent_for_the_same_persona_and_day(self):
         context_date = self.app_module.shanghai_today()
         run_id = self.create_editorial_run(context_date)
