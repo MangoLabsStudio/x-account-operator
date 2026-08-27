@@ -4438,6 +4438,8 @@ class AppTest(unittest.TestCase):
         prompt = calls[0]["kwargs"]["json"]["messages"][0]["content"]
         self.assertIn("所有字段必须使用中文", prompt)
         self.assertIn("discussion_topics", prompt)
+        self.assertIn("selected_topics 最多 15 条", prompt)
+        self.assertEqual(calls[0]["kwargs"]["json"]["max_tokens"], 8000)
         self.assertIn("父级市场地图", prompt)
         self.assertIn("只有 discussion_topics 为空时", prompt)
 

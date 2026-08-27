@@ -2537,6 +2537,7 @@ async def synthesize_daily_cards(context_date: str, cards: dict):
         "热点不等于可写；数字刷新不等于观点更新。与历史主张语义相同且没有 material delta 的研究题必须拒绝。"
         "去重单位是核心主张，不是事件或项目：同一热点下互不重叠的研究、机会和评论角度可以分别保留。"
         "selected_topics 在这里负责确定今天值得继续研究的母题和初始判断，不会直接进入人设写稿；"
+        "selected_topics 最多 15 条，rejected_topics 最多 8 条；只保留最有代表性的拒绝原因，避免重复罗列。"
         "审批后还会先经过 Grok 实时研究与 Gemini 多角度展开，因此不要为了预填所有表达方向而制造常识题。"
         "评论题可以复用当天事件背景，但必须有鲜明立场和非显而易见的表达。"
         "圈内读者不需要当天材料也能回答的常识题必须拒绝。按 slate_guidance 形成足够丰富但不凑数的题单。\n"
@@ -2568,6 +2569,7 @@ async def synthesize_daily_cards(context_date: str, cards: dict):
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": {"type": "json_object"},
                 "temperature": 0.2,
+                "max_tokens": 8000,
             },
         )
         response.raise_for_status()
