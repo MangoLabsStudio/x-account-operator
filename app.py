@@ -8032,7 +8032,7 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
                     for persona in persona_rows
                 ):
                     break
-        for _ in range(max(1, target)):
+        for _ in range(max(1, target * 4)):
             await generate_pending_persona_editorial_candidates(run["id"], run["context_date"])
             with db() as conn:
                 if all(
