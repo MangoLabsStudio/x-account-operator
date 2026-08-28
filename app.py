@@ -1245,7 +1245,7 @@ def assemble_editorial_sections(result: dict, style_recipe: dict) -> tuple[str, 
         raise RuntimeError("该题材 CTA 必须是自然提问")
     reasoning_shape = result.get("reasoning_shape") or structure["allowed_reasoning_shapes"][0]
     if reasoning_shape not in structure["allowed_reasoning_shapes"]:
-        raise RuntimeError("Gemini 使用了未允许的推理结构")
+        reasoning_shape = structure["allowed_reasoning_shapes"][0]
     output_shape = [*reasoning_shape]
     if cleaned["cta"] and "cta" not in output_shape:
         output_shape.append("cta")

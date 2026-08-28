@@ -1152,6 +1152,11 @@ class AppTest(unittest.TestCase):
         self.assertEqual(saved, trade_sections)
         self.assertEqual([item["section"] for item in annotations], trade["section_order"])
 
+        fallback_text, _, _ = self.app_module.assemble_editorial_sections(
+            {"sections": trade_sections, "reasoning_shape": ["not-configured"]}, trade,
+        )
+        self.assertEqual(fallback_text, text)
+
         missing_cta = {**trade_sections, "cta": ""}
         with self.assertRaisesRegex(RuntimeError, "必填内容段"):
             self.app_module.assemble_editorial_sections({"sections": missing_cta}, trade)
