@@ -1,108 +1,153 @@
-# 人设内容候选
+# X Account Operator
 
-Railway 上运行的人设内容服务。它将母帖池整理成可审核的公共市场 Context，并将每个人设已批准的 Editorial Context 合入编辑输入；常驻编辑流水线只为 `WRITE` 结果生成待审核候选稿。
+面向 20 个人设的中文内容生产与审核服务。系统每天从 Crypto 与 AI 的 X 信源池增量抓取公开帖子，整理市场 Context，再经过选题、角度、人设 Thesis、事实落地、内容结构和成稿审核，最终只向前端输出可人工审核的完整推文。
 
-## Production access
+系统不登录 X、不自动点赞、转发、关注或发布。所有候选稿停在人工审核队列。
 
-Open `https://x-account-operator-api-production.up.railway.app/`.
+## 当前流程
 
-不连接 X 账号，不保存 X OAuth，不排期，也不自动发布。
+```mermaid
+flowchart LR
+    A[Crypto / AI X 信源池] --> B[每日 Context]
+    B --> C[热点池与发现池]
+    C --> D[Grok 补充实时语境]
+    D --> E[Gemini 展开独立角度]
+    E --> F[Persona Thesis Resolver]
+    F --> G[Reality Grounding]
+    G --> H[按题材选择内容结构]
+    H --> I[Gemini 成稿与审核]
+    I --> J[needs_review 队列]
+    J --> K[人工审核与发布]
+```
 
-## 编辑 Context 与流水线
+完整设计见 [中文架构文档](docs/architecture.md)；人设调度与 Editorial Context 契约见 [灵活人设内容调度器](docs/flexible-persona-content-scheduler.md)。
 
-公共市场 Context 与每个人设的 Editorial Context 共同决定候选：
+## 核心规则
 
-1. 母池抓取、交叉验证和人工审核形成正式公共市场 Context；未审核的自动草稿不能进入写作。
-2. 每个人设都维护一份 Editorial Context 草稿与一份已批准版。草稿可随时修改，但只有已批准版会进入输入 fingerprint。
-3. 选中的公共题先按来源合并回母题。Grok 对整批母题做一次 X/Web 实时研究，Gemini 再展开 0–N 个互不替代的机会、行业评价、项目评价、认知、交易哲学或社区角度；这些是可选镜头，不是配额。
-4. 角度必须有具体对象、具体冲突、非显而易见的增量和读者价值。常识、同义改写、无结论内容直接淘汰；公共题不足时由可追溯的方法论卡补足每日待审稿下限。
-5. 合格公共角度与该人设状态为 `ready` 的私有题合流。Resolver 只能返回 `WRITE(ThesisContract)`、`HOLD(reason)` 或 `IGNORE(reason)`；Topic 和 Angle 都不能直接充当 Thesis。
-6. `ThesisContract` 冻结唯一主张、对象、范围、人设 lens、已批准证据、读者收益、信息增量和可证伪条件。确定性硬校验通过后，系统才按主张语义做同人设历史碰撞与跨人设碰撞；同一事件可保留不同 Thesis，换口吻的同一 Thesis 只保留更匹配的人设。
-7. Structure 只从题材配置选择必需语义槽、允许的推理形状和 CTA 策略，不得修改 Thesis。每个批准的 Thesis 再由 Grok 补齐非权威背景，Gemini 只能把批准事实写成事实。成稿先做 Thesis Adherence 分类，再做现有主编审核；内容质量问题只允许定向重写一次，仍不通过则 `HOLD`。提供方失败走独立重试，不消耗内容修复次数。
-8. 同日只要正式输入 fingerprint 发生实质变化（包括公共 Context 更新或人设 Editorial Context 重批），就可增量评估；每日待审稿未满时可改用下一张补位卡。人设 Context 的新批准版会先撤销该人当天旧候选。
+- 热点和发现只决定研究对象，不直接决定文章结论。
+- Topic 先展开为互不替代的 Angle，再由每个人设解析成唯一、明确的 Thesis。
+- Thesis 决定“说什么”；内容结构只决定“怎么说”，不能改写主张。
+- Grok 用于补充最新背景和争议，不会把搜索结果自动升级为正式事实。
+- Gemini 只能把已批准证据写成事实；推断必须保留为推断。
+- 同一事件允许不同人设表达不同 Thesis，换口吻的同一 Thesis 会被去重。
+- 每个人设每天目标为 3 条待审稿；目标不是硬凑数，无法通过门槛时允许少于 3 条。
+- 批量重新生成只把旧稿标记为 `superseded`，不会物理删除历史正文。
 
-系统以每个人设每天 3 条为目标（`XOPS_DAILY_POST_TARGET_PER_PERSONA`，默认 `3`），但数量不能降低 Thesis 门槛：热点、已批准历史角度和私有成熟表达优先；不足时才让可追溯的方法论、财富观与交易哲学卡走同一个 Resolver。没有合格 Thesis 时允许少于目标，不生成占位稿。自动流程不发布、不排期，也不操作 X 账号。候选稿只使用正式批准的公共 Context 与该人设正式批准的 Editorial Context。Grok 搜索只作背景；正式事实只能来自批准输入。队列只接收带 `persona_editorial_grok_gemini:<evaluation-id>` 来源和审计记录的候选，历史候选以 `legacy_candidate` 标记，新候选以 `thesis_contract_v1_candidate` 标记。
+## 页面与接口
 
-### 每人 Editorial Context
+生产入口：<https://x-account-operator-api-production.up.railway.app/>
 
-每个人设有如下字段，均以 JSON 数组保存：
+| 入口 | 用途 |
+| --- | --- |
+| `/` | 今日完整推文队列 |
+| `/market` | 每日 Context、来源、选题及拒绝原因 |
+| `/personas` | 人设、语气、内容边界和素材管理 |
+| `GET /api/daily-posts` | 获取当天 `needs_review` 推文 |
+| `POST /api/daily-posts/generate` | 对当天已批准 Context 启动生成 |
+| `POST /api/daily-posts/regenerate` | 保留旧稿并重新生成 |
+| `POST /api/post-candidates/{id}/rewrite` | 按人工反馈重写单条候选 |
+| `POST /api/post-candidates/{id}/published` | 将当前队首标记为已发布 |
+| `GET /api/thesis-metrics` | 查看 Thesis 流水线指标 |
+| `GET /health` | 服务、并发池和契约版本状态 |
 
-- `life_context`：可核验的生活事实、角度和证据。只有此类条目明确标注 `first_person_allowed: true` 时，才可支持具体第一人称亲历。
-- `thought_threads`：尚在形成或已经成熟的个人思考；
-- `expression_debt`：成熟但尚未表达的主张，不是欠稿数或发布配额；
-- `real_feedback`：真实读者或同行反馈；
-- `available_asset_ids`：该人设可使用的已选图片素材。
+配置 `XOPS_OPERATOR_TOKEN` 后，所有非 GET 的 `/api` 请求必须携带 `X-Ops-Token`。
 
-`thought_threads`、`expression_debt`、`real_feedback` 和图片素材都不能证明个人亲历。私有题须处于 `ready` 且有可表达的核心主张，才可与公共热点一起进入评估。
+## 本地运行
 
-素材必须属于当前人设。若 Editorial Context 只批准一张素材，它可作为候选稿默认素材；若批准多张，只有私有条目的 `asset_ids` 明确指定时才会使用。
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+XOPS_DATA_DIR="$PWD/data" .venv/bin/uvicorn app:app --reload
+```
 
-### Editorial Context API
+打开 <http://127.0.0.1:8000/>。
 
-- `GET /api/personas/{persona_id}/editorial-context`：读取 `status`、`approval_revision`、`draft`、`approved` 与派生的 `expressed_source_ids`；
-- `PUT /api/personas/{persona_id}/editorial-context`：保存上述五个字段的草稿，不会进入引擎；
-- `POST /api/personas/{persona_id}/editorial-context/approve`：批准当前草稿。不同内容会生成新批准版本，撤销该人当天旧候选。
+## 关键配置
 
-## 选题与人设判断
+| 文件 | 作用 |
+| --- | --- |
+| `configs/content_source_accounts.json` | Crypto X 总信源池 |
+| `configs/ai_content_source_accounts.json` | AI X 信源池 |
+| `configs/topic_selection_policy.json` | 热点、发现、增量价值和拒绝标准 |
+| `configs/editorial_content_structures.json` | 各题材的语义槽、论证形状和 CTA 策略 |
+| `configs/persona_supplement_topics.json` | 可审计的常青补位题源 |
 
-`configs/topic_selection_policy.json` is the permanent selection authority.
-
-The daily flow is: mother-pool heat → facts and opinions → approved mother topics → Grok topic context → Gemini angle expansion and quality gate → approved persona private topics → persona/topic relevance → Persona Thesis resolution → semantic thesis dedup → structure selection → Grok draft context → Gemini draft → thesis adherence validation → existing editorial review → human review. Content structures live in `configs/editorial_content_structures.json`; they decide required semantic slots, allowed reasoning shapes, and CTA policy, never the claim itself.
-
-- Heat only decides what to research. It does not make a topic publishable.
-- A refreshed number is not a new topic unless it changes the conclusion, scale, mechanism, participation condition, or invalidation condition.
-- `topic_claim_history` stores covered core claims. 私有原始 Context 只进入所属人设的模型输入；归一化核心主张仍参与全团队去重，避免换个人设重复同一结论。
-- 原始问题、未批准的公共 Context 与未批准的人设 Context 都只保留作审计，不能直接触发写作。
-- 每个人设先判断自己是否会注意到、是否有知识边界内的独特主张、与已有内容相比是否有新增价值；不能满足则 `HOLD` 或 `IGNORE`。
-- 选题并非按人设顺序分配，`WRITE` 也不是发布指令。
-- `/market` shows both selected topics and rejected topics with reasons.
-- `POST /api/context/daily-runs/{date}/retry-angle-expansion` immediately releases a failed angle stage after API credit, rate-limit, or provider recovery; otherwise three short retries are followed by a 30-minute cooldown retry.
-
-## Daily mother-pool scheduler
-
-The scheduler runs inside the service process and never stores credentials in SQLite or generated artifacts. On Linux/systemd, set `TWITTER241_RAPIDAPI_KEY`, `XOPS_LLM_API_KEY`, `XOPS_GROK_API_KEY` and `XOPS_GEMINI_API_KEY` in `/etc/x-account-operator.env`; formal candidate generation stays retryable rather than falling back when either dedicated editor provider is absent.
+常用环境变量：
 
 ```text
+XOPS_DATA_DIR=/data
+XOPS_TIMEZONE=Asia/Shanghai
+
 XOPS_DAILY_CONTEXT_ENABLED=true
 XOPS_DAILY_CONTEXT_RUN_TIME=08:15
 XOPS_DAILY_CONTEXT_HOURS=30
 XOPS_DAILY_CONTEXT_WORKERS=8
 XOPS_DAILY_CONTEXT_RESUME_HOURS=20
-XOPS_MOTHER_POOL_ACCOUNTS=/path/to/content_source_accounts.json
+XOPS_MOTHER_POOL_ACCOUNTS=/app/configs/content_source_accounts.json
+XOPS_AI_SOURCE_ACCOUNTS=/app/configs/ai_content_source_accounts.json
+XOPS_AI_SOURCE_ENABLED=true
+
 XOPS_DAILY_POST_ENABLED=true
-XOPS_DAILY_POST_PERSONAS=acheng,ridehail-driver-zhao,college-student-linjia,atuo,axu,nanqiao,qiliang,aye,xiaoman,maili,hegong-afterwork,zhaojie-process,linxue-model,xiaocheng-product,ada-builds,susu-multimodal,zhangshifu-ai,lianglaoban-ai,mojie-eval,wenwen-ai-industry
 XOPS_DAILY_POST_TARGET_PER_PERSONA=3
 XOPS_DAILY_SUPPLEMENT_COOLDOWN_DAYS=7
+XOPS_EDITORIAL_RESEARCH_CONCURRENCY=4
+XOPS_EDITORIAL_EVALUATION_CONCURRENCY=5
+XOPS_EDITORIAL_GENERATION_CONCURRENCY=5
+
+TWITTER241_RAPIDAPI_KEY=...
 XOPS_GROK_API_KEY=...
 XOPS_GROK_BASE_URL=https://www.micuapi.ai/v1
 XOPS_GROK_MODEL=grok-4.6
-XOPS_EDITORIAL_RESEARCH_CONCURRENCY=4
-XOPS_EDITORIAL_EVALUATION_CONCURRENCY=5
-XOPS_GEMINI_API_KEY=...
+XOPS_GEMINI_API_KEY_1=...
+XOPS_GEMINI_API_KEY_2=...
+XOPS_GEMINI_API_KEY_3=...
+XOPS_GEMINI_API_KEY_4=...
+XOPS_GEMINI_API_KEY_5=...
 XOPS_GEMINI_BASE_URL=https://www.micuapi.ai/v1
 XOPS_GEMINI_MODEL=gemini-3.1-pro-preview-low
-XOPS_EDITORIAL_GENERATION_CONCURRENCY=5
-XOPS_OPERATOR_TOKEN=...  # optional: protect all /api write requests
+XOPS_OPERATOR_TOKEN=...
 ```
 
-macOS 本地可把多把 Gemini key 放进 Keychain service `codex.xops.gemini.pool`，account 使用
-`slot-1` 到 `slot-5`，并设置 `XOPS_GEMINI_KEYCHAIN_ACCOUNTS=slot-1,slot-2,slot-3,slot-4,slot-5`。
-同一服务进程内，每把 key 同时只处理一个请求；没有 Keychain pool 时继续使用单一 `XOPS_GEMINI_API_KEY`。
-如果运行环境同时注入了单 key，必须显式设置 `XOPS_GEMINI_KEYCHAIN_ACCOUNTS` 才会启用本地 Keychain pool。
+凭据只通过运行环境或 macOS Keychain 注入，不进入 SQLite、生成产物或 Git。
 
-Railway 使用 `XOPS_GEMINI_API_KEY_1` 到 `XOPS_GEMINI_API_KEY_5` 组成同样的池，并设置
-`XOPS_EDITORIAL_GENERATION_CONCURRENCY=5`。只要任一编号槽位存在，就优先使用编号池；全部缺失时才回退
-`XOPS_GEMINI_API_KEY`。`/health` 只返回 `gemini_pool_configured_slots` 数量，不返回任何密钥信息。
-`XOPS_EDITORIAL_EVALUATION_CONCURRENCY=5` 会让人设编辑判断最多同时处理 5 个人设，避免逐个串行等待。
+## 数据与状态
 
-- `XOPS_DAILY_CONTEXT_ENABLED=false` pauses only the automatic run; manual runs in `/market` remain available.
-- `XOPS_DAILY_CONTEXT_RUN_TIME` is interpreted in `XOPS_TIMEZONE` (default: `Asia/Shanghai`).
-- `XOPS_MOTHER_POOL_ACCOUNTS` is the account-list JSON used by the collector. If omitted, the service uses the verified default source configuration.
-- `XOPS_DAILY_POST_PERSONAS` defines the personas that enter the daily queue. `XOPS_DAILY_POST_TARGET_PER_PERSONA` defaults to `3`; hot topics still win first, and source-backed methodology cards plus approved evergreen judgments fill only the remaining slots. `XOPS_DAILY_SUPPLEMENT_COOLDOWN_DAYS` defaults to `7`, so the same persona will not recycle the same successful supplement claim too soon.
-- `POST /api/daily-posts/generate` is the daily trigger for an external scheduler. It starts a single background generation run for today's approved Context and returns immediately; poll `GET /api/daily-posts` for the resulting `needs_review` drafts. It never collects, approves, publishes, or schedules X posts.
-- The built-in daily scheduler automatically approves a completed machine-generated Context for draft generation, then tries the configured personas up to `XOPS_DAILY_POST_TARGET_PER_PERSONA`. A failed Thesis gate is never bypassed to fill quantity. Drafts still stop at `needs_review`; publishing remains manual.
-- 人设按 `content.topic_domain` 取公共题：现有公共题缺省为 `crypto`，不会被 10 个 `ai` 人设硬写；AI 人设仍可先消费自己已批准的长期观点，待独立 AI 热点源接入后再消费 AI 公共题。
-- If `XOPS_OPERATOR_TOKEN` is configured, every non-GET `/api` request must send it as `X-Ops-Token`. The three built-in operator pages prompt once after a 401 and keep it only in that browser tab's session storage. `/health` exposes `operator_auth_enabled`.
-- In `/market`, a reviewer may explicitly confirm only a fact card's representative source reference, with a different first-party verification URL and a short verification note. X/Twitter links, the same source-post URL, and empty evidence are rejected. `two_source_candidate` and `corroborated_candidate` never become verified facts automatically, and a promoted fact is usable only by a selected topic that cites that exact reviewed reference.
+生产数据保存在 Railway `/data` 持久卷的 SQLite 中。主要状态：
 
-结果入口是 `/`，当天真实推文 API 是 `/api/daily-posts`。接口在本轮 Thesis 与生成任务结算后展示已通过的完整推文；实际数量可以少于目标，但不会展示事实池、观点池、选题或生成中的半成品。人设评估和 Thesis 状态只保存在 SQLite 内部，供幂等、恢复和审计使用。数据保存在 Railway `/data` 持久卷。
+- `daily_context_runs`：`queued → running → needs_review → approved`，失败为 `failed`。
+- `persona_editorial_evaluations`：每个人设对每个题的 `WRITE / HOLD / IGNORE`、Thesis 和生成断点。
+- `post_candidates`：正式待审稿为 `needs_review`，已确认发布为 `published`，被新一轮替代的旧稿为 `superseded`。
+- `topic_claim_history`：保存已覆盖的核心主张，用于同人设与跨人设去重。
+
+## 测试
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
+## 目录
+
+```text
+app.py                  FastAPI、SQLite 与内容生产主流程
+market_sources/         Crypto / AI 信源抓取和交叉验证
+configs/                选题、结构、人设与信源硬配置
+docs/                   架构和调度契约
+scripts/                数据导入、预览和一次性维护脚本
+tests/                  单元与流程测试
+assets/                 已授权的人设素材
+```
+
+## 部署
+
+Railway 使用 `start.sh` 启动：
+
+```text
+uvicorn app:app --host 0.0.0.0 --port $PORT
+```
+
+`railway.json` 已配置 `/health` 健康检查和 `/data` 持久卷。部署后至少检查：
+
+```bash
+curl -fsS https://x-account-operator-api-production.up.railway.app/health
+curl -fsS https://x-account-operator-api-production.up.railway.app/api/daily-posts
+```
