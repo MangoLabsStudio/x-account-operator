@@ -48,7 +48,7 @@ class FakeAsyncClient:
 
 
 class FakeGitHubResponse:
-    text = '<a aria-label="4687 users starred this repository">4.7k</a>'
+    text = '<a aria-label="4687 users starred this repository">4.7k</a> 4687 users starred this repository'
 
     def raise_for_status(self):
         return None
@@ -6738,6 +6738,49 @@ class AppTest(unittest.TestCase):
         _payload, contract = self.grounding_fixture(claim_type="CAUSAL")
         self.assertIn("MECHANISM_GAP", contract["preflight_reason_codes"])
 
+    def test_grounding_research_requires_cited_fetchable_source_and_exact_excerpt(self):
+        candidate = {
+            "gap_code": "MECHANISM_GAP",
+            "statement": "官方仓库页面公开显示项目的 Star 计数。",
+            "source_url": "https://github.com/example/project",
+            "source_kind": "github", "published_at": "2026-08-28",
+            "support_role": "mechanism",
+            "evidence_excerpt": "4687 users starred this repository",
+            "mechanism": {"input": "公开仓库", "transformation": "用户点击 Star", "output": "页面累计计数"},
+        }
+        with patch.object(
+            self.app_module.httpx, "AsyncClient", return_value=FakeGitHubClient()
+        ):
+            verified = asyncio.run(self.app_module.verify_grounding_research_candidates(
+                [candidate], [candidate["source_url"]],
+            ))
+        self.assertEqual(len(verified["verified"]), 1)
+        uncited = asyncio.run(self.app_module.verify_grounding_research_candidates(
+            [candidate], [],
+        ))
+        self.assertEqual(uncited["verified"], [])
+        self.assertEqual(uncited["rejected"][0]["reason"], "invalid_or_uncited_source")
+
+    def test_verified_grok_mechanism_research_resolves_preflight_gap(self):
+        payload, contract = self.grounding_fixture(claim_type="CAUSAL")
+        self.assertIn("MECHANISM_GAP", contract["preflight_reason_codes"])
+        research = {"verified_evidence": [{
+            "statement": "官方文档说明输入经过资源计费后形成新的费用输出。",
+            "source_url": "https://example.com/official-mechanism",
+            "source_kind": "official_documentation", "published_at": "2026-08-28",
+            "support_role": "mechanism", "verification_status": "source_fetched_excerpt_matched",
+            "mechanism": {"input": "资源请求", "transformation": "按请求单位计费", "output": "资源费用"},
+        }]}
+        merged = self.app_module.merge_reality_research(payload, research)
+        topic = {"claim_key": "grounding:test", "claim_type": "CAUSAL"}
+        thesis = {
+            "thesis_id": "thesis:test", "thesis_type": "EXPLANATION",
+            "primary_claim": "资源请求通过计费机制改变费用。", "falsifier": "机制未启用",
+        }
+        updated = self.app_module.compile_grounding_contract(topic, thesis, merged)
+        self.assertNotIn("MECHANISM_GAP", updated["preflight_reason_codes"])
+        self.assertEqual(merged["mechanisms"][-1]["supporting_fact_ids"][0][:9], "research:")
+
     def test_grounding_case_6_number_without_reasoning_contribution_does_not_pass(self):
         payload, contract = self.grounding_fixture()
         payload["source_dependent_anchors"][0]["statement"] = "观察值为 42%。"
@@ -6802,6 +6845,11 @@ class AppTest(unittest.TestCase):
             "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
         }), patch.object(self.app_module, "write_persona_editorial_gemini", writer), patch.object(
             self.app_module, "critique_persona_editorial_draft", editor
+        ), patch.object(
+            self.app_module, "research_reality_payload_gaps_grok", AsyncMock(return_value={
+                "status": "no_verified_evidence", "verified_evidence": [],
+                "rejected_evidence": [], "citations": [], "tool_usage": [], "model": "grok-test",
+            })
         ):
             self.run_editorial_pipeline(run_id)
         writer.assert_not_awaited()

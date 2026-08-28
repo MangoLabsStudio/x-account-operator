@@ -1,4 +1,5 @@
 import asyncio
+import html
 import hmac
 import hashlib
 import json
@@ -57,8 +58,8 @@ EDITORIAL_CONTENT_STRUCTURES_PATH = APP_DIR / "configs" / "editorial_content_str
 EVERGREEN_TOPIC_BANK_PATH = APP_DIR / "configs" / "evergreen_editorial_topics.json"
 EDITORIAL_FALLBACK_BANK_PATH = APP_DIR / "configs" / "editorial_fallback_cards.json"
 
-REALITY_PAYLOAD_VERSION = "reality_payload_v1"
-GROUNDING_CONTRACT_VERSION = "grounding_contract_v1"
+REALITY_PAYLOAD_VERSION = "reality_payload_v2"
+GROUNDING_CONTRACT_VERSION = "grounding_contract_v2"
 GROUNDING_PARAGRAPH_JOBS = {
     "CLAIM", "EVIDENCE", "MECHANISM", "CONTEXT", "COUNTER_SIGNAL", "UNCERTAINTY",
     "IMPLICATION", "EXAMPLE", "CONCLUSION",
@@ -70,6 +71,21 @@ GROUNDING_FAILURE_CODES = {
     "MECHANISM_GAP", "ANALOGY_AS_EVIDENCE", "CLAIM_STRENGTH_UPGRADE",
     "UNCERTAINTY_DROPPED", "EXCESSIVE_GENERIC_BACKGROUND", "REALITY_REF_NOT_USED",
     "SOURCE_DRAFT_CONTRADICTION",
+}
+GROUNDING_RESEARCH_GAP_CODES = {
+    "INSUFFICIENT_REALITY_PAYLOAD", "LOW_SOURCE_DEPENDENCE", "MECHANISM_GAP",
+}
+GROUNDING_RESEARCH_SOURCE_KINDS = {
+    "official_documentation", "official_announcement", "regulatory_filing",
+    "github", "project_blog", "reputable_reporting", "x_official", "x_observation",
+}
+GROUNDING_PRIMARY_SOURCE_KINDS = {
+    "official_documentation", "official_announcement", "regulatory_filing",
+    "github", "project_blog",
+}
+GROUNDING_RESEARCH_ROLES = {
+    "primary_observation", "secondary_anchor", "mechanism", "friction",
+    "counter_signal", "consensus",
 }
 
 AI_PERSONA_SLUGS = (
@@ -5567,6 +5583,236 @@ def compile_grounding_contract(topic: dict, thesis: dict, payload: dict) -> dict
     return contract
 
 
+def grounding_research_gap_codes(contract: dict) -> list[str]:
+    return [
+        code for code in contract.get("preflight_reason_codes", [])
+        if code in GROUNDING_RESEARCH_GAP_CODES
+    ]
+
+
+def normalized_research_text(value: str) -> str:
+    value = html.unescape(re.sub(r"<[^>]+>", " ", str(value or "")))
+    return re.sub(r"[^0-9A-Za-z_\u3400-\u9fff]+", "", value).lower()
+
+
+async def verify_grounding_research_candidates(candidates: list[dict], citations: list[str]):
+    cited = {normalized_verification_url(url) for url in citations}
+    cited.discard("")
+    prepared, rejected = [], []
+    for item in candidates[:12]:
+        if not isinstance(item, dict):
+            continue
+        source_url = normalized_verification_url(item.get("source_url", ""))
+        source_kind = str(item.get("source_kind", ""))
+        support_role = str(item.get("support_role", ""))
+        statement = str(item.get("statement", "")).strip()
+        excerpt = str(item.get("evidence_excerpt", "")).strip()[:500]
+        cited_match = source_url in cited or any(
+            urlparse(source_url)._replace(query="", fragment="").geturl().rstrip("/")
+            == urlparse(url)._replace(query="", fragment="").geturl().rstrip("/")
+            for url in cited
+        )
+        if (
+            not source_url or not cited_match or source_kind not in GROUNDING_RESEARCH_SOURCE_KINDS
+            or support_role not in GROUNDING_RESEARCH_ROLES or len(statement) < 8
+            or len(normalized_research_text(excerpt)) < 8
+        ):
+            rejected.append({"source_url": source_url, "reason": "invalid_or_uncited_source"})
+            continue
+        mechanism = item.get("mechanism") if isinstance(item.get("mechanism"), dict) else {}
+        if support_role == "mechanism" and (
+            source_kind not in GROUNDING_PRIMARY_SOURCE_KINDS
+            or not all(str(mechanism.get(key, "")).strip() for key in ("input", "transformation", "output"))
+        ):
+            rejected.append({"source_url": source_url, "reason": "mechanism_not_primary"})
+            continue
+        prepared.append({
+            "gap_code": str(item.get("gap_code", "")), "statement": statement[:1200],
+            "source_url": source_url, "source_kind": source_kind,
+            "published_at": str(item.get("published_at", ""))[:80],
+            "support_role": support_role, "evidence_excerpt": excerpt,
+            "mechanism": {key: str(mechanism.get(key, ""))[:500] for key in ("input", "transformation", "output")},
+        })
+
+    semaphore = asyncio.Semaphore(6)
+
+    async def verify(item):
+        try:
+            async with semaphore:
+                async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                    response = await client.get(
+                        item["source_url"], headers={"User-Agent": "Mozilla/5.0"},
+                    )
+                response.raise_for_status()
+            excerpt = normalized_research_text(item["evidence_excerpt"])
+            page = normalized_research_text(response.text)
+            if excerpt not in page:
+                return None, {"source_url": item["source_url"], "reason": "excerpt_not_found"}
+            return {**item, "verification_status": "source_fetched_excerpt_matched"}, None
+        except httpx.HTTPError:
+            return None, {"source_url": item["source_url"], "reason": "source_fetch_failed"}
+
+    results = await asyncio.gather(*(verify(item) for item in prepared))
+    verified = [item for item, _error in results if item]
+    rejected.extend(error for _item, error in results if error)
+    return {"verified": verified, "rejected": rejected}
+
+
+async def research_reality_payload_gaps_grok(topic: dict, thesis: dict, payload: dict,
+                                              contract: dict, daily_context: dict):
+    gaps = grounding_research_gap_codes(contract)
+    if payload.get("grounding_mode") != "LIVE_RESEARCH" or not gaps:
+        return {"status": "not_required", "verified_evidence": [], "rejected_evidence": []}
+    cache_key = "reality-research:" + hashlib.sha256(json.dumps({
+        "version": REALITY_PAYLOAD_VERSION,
+        "context_date": daily_context.get("context_date"), "topic": topic,
+        "thesis": thesis, "gaps": gaps,
+        "existing_refs": [
+            item.get("reality_ref") for item in payload.get("source_dependent_anchors", [])
+        ],
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    cached = EDITORIAL_GROK_CONTEXT_CACHE.get(cache_key)
+    if cached:
+        return cached
+    provider = editorial_provider_config("GROK")
+    prompt = (
+        "你是 RealityPayload 的定向证据研究员，不写帖子、不润色观点。必须各使用一次 X Search 和 Web Search。"
+        "只为列出的 Grounding 缺口寻找可追溯材料；优先项目官网、官方文档、GitHub、监管文件和官方公告。"
+        "搜索结果摘要和你自己的判断都不算证据。每项必须给出实际打开页面中的短原文 evidence_excerpt，"
+        "source_url 必须是搜索工具真实引用的直达 URL。找不到就返回空 evidence，不得猜测。"
+        "只输出 JSON：{\"evidence\":[{\"gap_code\":\"MECHANISM_GAP\",\"statement\":\"...\","
+        "\"source_url\":\"https://...\",\"source_kind\":\"official_documentation|official_announcement|"
+        "regulatory_filing|github|project_blog|reputable_reporting|x_official|x_observation\","
+        "\"published_at\":\"...\",\"support_role\":\"primary_observation|secondary_anchor|mechanism|"
+        "friction|counter_signal|consensus\",\"evidence_excerpt\":\"页面原文短句\","
+        "\"mechanism\":{\"input\":\"...\",\"transformation\":\"...\",\"output\":\"...\"}}]}。"
+        "MECHANISM_GAP 只能由一手来源且 input/transformation/output 完整的 mechanism 项补足；"
+        "普通 X 讨论和媒体报道只能作为观察、摩擦或反证。不要重复已有来源。\n\n"
+        f"缺口：{json.dumps(gaps, ensure_ascii=False)}\n"
+        f"Topic：{json.dumps(topic, ensure_ascii=False)}\n"
+        f"Persona Thesis：{json.dumps(thesis, ensure_ascii=False)}\n"
+        f"现有 RealityPayload：{json.dumps(payload, ensure_ascii=False)}"
+    )
+    context_date = str(daily_context.get("context_date") or shanghai_today())
+    from_date = (datetime.fromisoformat(context_date).date() - timedelta(days=30)).isoformat() + "T00:00:00Z"
+    async with httpx.AsyncClient(timeout=180) as client:
+        response = await client.post(
+            provider["base_url"] + "/responses",
+            headers={
+                "Authorization": f"Bearer {provider['key']}", "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            },
+            json={
+                "model": provider["model"], "input": prompt,
+                "tools": [{"type": "x_search", "from_date": from_date}, {"type": "web_search"}],
+                "max_output_tokens": 2600,
+            },
+        )
+        response.raise_for_status()
+    text, citations, tool_usage = response_output_text_and_citations(response.json())
+    if not text or {"x_search", "web_search"} - set(tool_usage):
+        raise RuntimeError("Grok Reality Research 未完成 X/Web 双搜索")
+    result = text_json_object(text)
+    evidence = result.get("evidence", [])
+    if not isinstance(evidence, list):
+        raise RuntimeError("Grok Reality Research 缺少 evidence 数组")
+    verification = await verify_grounding_research_candidates(evidence, citations)
+    researched = {
+        "status": "verified" if verification["verified"] else "no_verified_evidence",
+        "gap_codes": gaps, "verified_evidence": verification["verified"],
+        "rejected_evidence": verification["rejected"], "citations": citations,
+        "tool_usage": tool_usage, "model": provider["model"],
+        "researched_at": int(time.time()),
+    }
+    if len(EDITORIAL_GROK_CONTEXT_CACHE) >= EDITORIAL_GROK_CONTEXT_CACHE_MAX:
+        EDITORIAL_GROK_CONTEXT_CACHE.pop(next(iter(EDITORIAL_GROK_CONTEXT_CACHE)))
+    EDITORIAL_GROK_CONTEXT_CACHE[cache_key] = researched
+    return researched
+
+
+def merge_reality_research(payload: dict, research: dict) -> dict:
+    merged = json.loads(json.dumps(payload, ensure_ascii=False))
+    anchors = merged.setdefault("source_dependent_anchors", [])
+    facts = merged.setdefault("concrete_facts", [])
+    observations = merged.setdefault("observed_behaviors", [])
+    mechanisms = merged.setdefault("mechanisms", [])
+    frictions = merged.setdefault("frictions", [])
+    counter_signals = merged.setdefault("counter_signals", [])
+    research_sources = merged.setdefault("research_sources", [])
+    known_urls = {
+        source_id for item in anchors for source_id in item.get("source_ids", [])
+        if str(source_id).startswith("http")
+    }
+    consensus_items = []
+    for item in research.get("verified_evidence", []):
+        source_url = item["source_url"]
+        if source_url in known_urls:
+            continue
+        known_urls.add(source_url)
+        reality_ref = "research:" + hashlib.sha256(
+            f"{source_url}:{item['statement']}".encode("utf-8")
+        ).hexdigest()[:24]
+        is_primary = item["source_kind"] in GROUNDING_PRIMARY_SOURCE_KINDS
+        epistemic = "KNOWN" if is_primary else "KNOWN_OBSERVATION"
+        anchors.append({
+            "reality_ref": reality_ref, "statement": item["statement"],
+            "source_ids": [source_url],
+            "kind": "RESEARCHED_PRIMARY_SOURCE" if is_primary else "RESEARCHED_SOURCE_OBSERVATION",
+            "epistemic_status": epistemic, "observed_at": item.get("published_at", ""),
+        })
+        research_sources.append({
+            "reality_ref": reality_ref, "source_url": source_url,
+            "source_kind": item["source_kind"], "support_role": item["support_role"],
+            "verification_status": item["verification_status"],
+        })
+        if is_primary:
+            facts.append({
+                "fact_id": reality_ref, "statement": item["statement"],
+                "entity": "", "metric": "", "value": "", "unit": "",
+                "time_scope": item.get("published_at", ""), "source_ids": [source_url],
+                "confidence": "verified_primary", "epistemic_status": "KNOWN",
+            })
+        else:
+            observations.append({
+                "reality_ref": reality_ref, "actor": urlparse(source_url).hostname or "",
+                "action": "published", "object": item["statement"],
+                "context": "grok_discovered_source_verified_by_fetch", "fact_ids": [],
+                "source_ids": [source_url], "observed_at": item.get("published_at", ""),
+                "epistemic_status": "KNOWN_OBSERVATION",
+            })
+        role = item["support_role"]
+        if role == "mechanism" and is_primary:
+            mechanisms.append({
+                **item["mechanism"], "supporting_fact_ids": [reality_ref],
+                "confidence": "verified_primary",
+            })
+        elif role == "friction":
+            frictions.append({"type": "RESEARCHED_FRICTION", "statement": item["statement"], "fact_ids": [reality_ref]})
+        elif role == "counter_signal":
+            counter_signals.append({"statement": item["statement"], "fact_ids": [reality_ref]})
+        elif role == "consensus":
+            consensus_items.append((reality_ref, urlparse(source_url).hostname or ""))
+
+    distinct_consensus_hosts = {host for _ref, host in consensus_items if host}
+    if len(consensus_items) >= 2 and len(distinct_consensus_hosts) >= 2:
+        merged.setdefault("consensus_evidence", []).append({
+            "claim": "多个经核验公开来源表达了相同方向的判断",
+            "source_ids": [ref for ref, _host in consensus_items],
+        })
+    primary = anchors[0] if anchors else {}
+    merged["primary_observation"] = {
+        "statement": primary.get("statement", ""),
+        "fact_ids": [primary["reality_ref"]] if primary.get("epistemic_status") == "KNOWN" else [],
+        "source_ids": primary.get("source_ids", []), "observed_at": primary.get("observed_at", ""),
+    }
+    merged["version"] = REALITY_PAYLOAD_VERSION
+    merged.pop("reality_payload_id", None)
+    merged["reality_payload_id"] = "reality:" + hashlib.sha256(json.dumps(
+        merged, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()[:24]
+    return merged
+
+
 def persist_topic_reality_payloads(run_id: int, raw_cards: dict, topics: list[dict]) -> dict:
     payloads = {}
     for topic in topics:
@@ -7018,10 +7264,29 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             grounding_contract = compile_grounding_contract(
                 compact_topic, thesis, reality_payload
             )
+            research = state.get("reality_research")
+            if grounding_research_gap_codes(grounding_contract):
+                if not isinstance(research, dict) or research.get("version") != REALITY_PAYLOAD_VERSION:
+                    if not persist_persona_editorial_generation_state(
+                        evaluation, "grounding_research", state
+                    ):
+                        continue
+                    research = await research_reality_payload_gaps_grok(
+                        compact_topic, thesis, reality_payload, grounding_contract, compact_daily
+                    )
+                    research["version"] = REALITY_PAYLOAD_VERSION
+                reality_payload = merge_reality_research(reality_payload, research)
+                grounding_contract = compile_grounding_contract(
+                    compact_topic, thesis, reality_payload
+                )
             state.update({
                 "reality_payload": reality_payload,
                 "grounding_contract": grounding_contract,
                 "grounding_contract_version": GROUNDING_CONTRACT_VERSION,
+                "reality_research": research or {
+                    "version": REALITY_PAYLOAD_VERSION, "status": "not_required",
+                    "verified_evidence": [], "rejected_evidence": [],
+                },
             })
             if grounding_contract["preflight_reason_codes"]:
                 state["grounding_review"] = validate_editorial_grounding(
@@ -7330,6 +7595,7 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             or state.get("grounding_final_review") or state.get("grounding_review"),
             "semantic_grounding_review": state.get("semantic_grounding_final_review")
             or state.get("semantic_grounding_review", {}),
+            "reality_research": state.get("reality_research", {}),
             "facts_used_ids": generated["facts_used_ids"],
             "used_reality_refs": generated.get("used_reality_refs", []),
             "stance": generated["stance"],
@@ -7350,7 +7616,7 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                 "mode": critic.get("mode", "llm_critic"),
                 "model": critic.get("model", ""),
             },
-            "lineage_kind": "thesis_grounding_contract_v1_candidate",
+            "lineage_kind": "thesis_grounding_contract_v2_candidate",
             "thesis_adherence": adherence,
         }
         now = int(time.time())
@@ -8081,6 +8347,8 @@ def health():
         "editorial_evaluation_concurrency": editorial_evaluation_concurrency(),
         "editorial_content_structure_revision": editorial_content_structure_config().get("revision", 1),
         "thesis_contract_version": THESIS_CONTRACT_VERSION,
+        "reality_payload_version": REALITY_PAYLOAD_VERSION,
+        "grounding_contract_version": GROUNDING_CONTRACT_VERSION,
     }
 
 
