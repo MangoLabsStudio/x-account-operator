@@ -8020,9 +8020,18 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
             missing_public = uncovered_public_angle_keys(conn, run["id"])
         if missing_public:
             continue
-        ensure_daily_persona_draft_floor(run["id"], [dict(persona_row) for persona_row in personas])
-        validate_run_persona_theses(run["id"], cards)
-        resolve_persona_editorial_collisions(run["id"])
+        persona_rows = [dict(persona_row) for persona_row in personas]
+        target = daily_persona_draft_target()
+        for _ in range(max(1, target)):
+            ensure_daily_persona_draft_floor(run["id"], persona_rows)
+            validate_run_persona_theses(run["id"], cards)
+            resolve_persona_editorial_collisions(run["id"])
+            with db() as conn:
+                if all(
+                    daily_persona_draft_count(conn, persona["id"], run["context_date"]) >= target
+                    for persona in persona_rows
+                ):
+                    break
         await generate_pending_persona_editorial_candidates(run["id"], run["context_date"])
         with db() as conn:
             attach_publishable_assets_to_daily_supplements(conn, run["context_date"])
