@@ -3082,6 +3082,8 @@ class AppTest(unittest.TestCase):
         self.assertEqual(result["facts_used_ids"], ["tweet:2092315006826398115"])
         self.assertEqual(result["stance"], "重算成本假设")
         self.assertEqual(result["style_id"], "open_source_discovery")
+        self.assertGreaterEqual(len(result["text"]), 100)
+        self.assertLessEqual(len(result["text"]), 300)
         self.assertEqual(list(result["sections"]), style_recipe["section_order"])
         self.assertEqual(result["text"].split("\n\n"), [
             result["sections"][key] for key in style_recipe["section_order"]
@@ -3093,6 +3095,7 @@ class AppTest(unittest.TestCase):
         self.assertIn("Hook 后用一句话完成对象定位", calls[0]["kwargs"]["json"]["messages"][0]["content"])
         self.assertIn("开头必须选一个最强信号做 Hook", calls[0]["kwargs"]["json"]["messages"][0]["content"])
         self.assertIn("open_source_discovery", calls[0]["kwargs"]["json"]["messages"][0]["content"])
+        self.assertIn("100–300 个字符", calls[0]["kwargs"]["json"]["messages"][0]["content"])
         self.assertIn("一句说清仓库替谁省掉什么工作", calls[0]["kwargs"]["json"]["messages"][0]["content"])
         self.assertIn("不强制所有帖子套同一套三拍结构", calls[0]["kwargs"]["json"]["messages"][0]["content"])
         self.assertIn("产品评论、人物评价和行业分析应收在一个鲜明判断上", calls[0]["kwargs"]["json"]["messages"][0]["content"])
@@ -4097,8 +4100,8 @@ class AppTest(unittest.TestCase):
             },
         ]}, [public, private])
 
-        self.assertEqual(result["public-angle"]["status"], "HOLD")
-        self.assertEqual(result["public-angle"]["reason_code"], "thesis_required_before_write")
+        self.assertEqual(result["public-angle"]["status"], "WRITE")
+        self.assertEqual(result["public-angle"]["reason_code"], "soft_gate_removed")
         self.assertEqual(result["private-angle"]["status"], "HOLD")
 
     def test_every_approved_public_angle_is_forced_into_one_persona_thesis(self):
@@ -4223,7 +4226,8 @@ class AppTest(unittest.TestCase):
             "why_me": "只能泛泛评论。",
         }]}, [topic])
 
-        self.assertEqual(result["macro-angle"]["status"], "HOLD")
+        self.assertEqual(result["macro-angle"]["status"], "WRITE")
+        self.assertEqual(result["macro-angle"]["reason_code"], "soft_gate_removed")
 
     def test_high_fit_hold_promotion_preserves_hard_rejection(self):
         topic = {
@@ -4249,7 +4253,8 @@ class AppTest(unittest.TestCase):
             "why_me": "人设匹配，但事实存在冲突。", "rationale": "已核材料存在冲突。",
         }]}, [topic])
 
-        self.assertEqual(result["implicit-rejection"]["status"], "HOLD")
+        self.assertEqual(result["implicit-rejection"]["status"], "WRITE")
+        self.assertEqual(result["implicit-rejection"]["reason_code"], "soft_gate_removed")
 
     def test_marginal_threshold_only_filters_low_value_after_five_posts(self):
         def decision(value):
@@ -4265,8 +4270,7 @@ class AppTest(unittest.TestCase):
         self.app_module.apply_editorial_marginal_threshold(at_five, 5)
 
         self.assertEqual(before_five["topic"]["status"], "WRITE")
-        self.assertEqual(at_five["weak"]["status"], "HOLD")
-        self.assertEqual(at_five["weak"]["reason_code"], "insufficient_marginal_value")
+        self.assertEqual(at_five["weak"]["status"], "WRITE")
         self.assertEqual(at_five["useful"]["status"], "WRITE")
 
     def test_editorial_claim_history_downgrades_duplicate_write(self):
@@ -6916,7 +6920,7 @@ class AppTest(unittest.TestCase):
     def test_grounding_case_1_live_topic_without_material_fact_fails_closed(self):
         payload, contract = self.grounding_fixture(anchors=0)
         self.assertIn("INSUFFICIENT_REALITY_PAYLOAD", contract["preflight_reason_codes"])
-        self.assertIn("LOW_SOURCE_DEPENDENCE", contract["preflight_reason_codes"])
+        self.assertIn("LOW_SOURCE_DEPENDENCE", contract["advisory_reason_codes"])
 
     def test_grounding_contract_requires_only_best_matching_anchor(self):
         payload, _contract = self.grounding_fixture(anchors=0)
@@ -6943,7 +6947,8 @@ class AppTest(unittest.TestCase):
         review = self.app_module.validate_editorial_grounding(
             draft, payload, contract, self.app_module.editorial_content_structure({"structure_id": "market_cognition"})
         )
-        self.assertIn("LOW_REALITY_CONTRIBUTION", review["reason_codes"])
+        self.assertIn("LOW_REALITY_CONTRIBUTION", review["advisory_reason_codes"])
+        self.assertEqual(review["decision"], "PASS")
 
     def test_grounding_case_3_synthetic_consensus_is_rejected(self):
         payload, contract = self.grounding_fixture()
@@ -6965,11 +6970,12 @@ class AppTest(unittest.TestCase):
         review = self.app_module.validate_editorial_grounding(
             draft, payload, contract, self.app_module.editorial_content_structure({"structure_id": "market_cognition"})
         )
-        self.assertIn("ANALOGY_AS_EVIDENCE", review["reason_codes"])
+        self.assertIn("ANALOGY_AS_EVIDENCE", review["advisory_reason_codes"])
 
     def test_grounding_case_5_causal_claim_without_mechanism_returns_to_research(self):
         _payload, contract = self.grounding_fixture(claim_type="CAUSAL")
-        self.assertIn("MECHANISM_GAP", contract["preflight_reason_codes"])
+        self.assertIn("MECHANISM_GAP", contract["advisory_reason_codes"])
+        self.assertNotIn("MECHANISM_GAP", contract["preflight_reason_codes"])
 
     def test_grounding_research_requires_cited_fetchable_source_and_exact_excerpt(self):
         candidate = {
@@ -6996,7 +7002,7 @@ class AppTest(unittest.TestCase):
 
     def test_verified_grok_mechanism_research_resolves_preflight_gap(self):
         payload, contract = self.grounding_fixture(claim_type="CAUSAL")
-        self.assertIn("MECHANISM_GAP", contract["preflight_reason_codes"])
+        self.assertIn("MECHANISM_GAP", contract["advisory_reason_codes"])
         research = {"verified_evidence": [{
             "statement": "官方文档说明输入经过资源计费后形成新的费用输出。",
             "source_url": "https://example.com/official-mechanism",
@@ -7024,7 +7030,7 @@ class AppTest(unittest.TestCase):
         review = self.app_module.validate_editorial_grounding(
             draft, payload, contract, self.app_module.editorial_content_structure({"structure_id": "market_cognition"})
         )
-        self.assertIn("LOW_REALITY_CONTRIBUTION", review["reason_codes"])
+        self.assertIn("LOW_REALITY_CONTRIBUTION", review["advisory_reason_codes"])
 
     def test_grounding_case_7_may_indicate_cannot_be_upgraded_to_proves(self):
         payload, contract = self.grounding_fixture(epistemic_status="INFERRED")
@@ -7062,7 +7068,7 @@ class AppTest(unittest.TestCase):
         review = self.app_module.validate_editorial_grounding(
             draft, payload, contract, self.app_module.editorial_content_structure({"structure_id": "market_cognition"})
         )
-        self.assertIn("EXCESSIVE_GENERIC_BACKGROUND", review["reason_codes"])
+        self.assertIn("EXCESSIVE_GENERIC_BACKGROUND", review["advisory_reason_codes"])
 
     def test_grounding_case_10_research_failure_never_reaches_writer_or_editor(self):
         context_date = self.app_module.shanghai_today()

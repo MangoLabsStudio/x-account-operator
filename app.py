@@ -59,7 +59,7 @@ EVERGREEN_TOPIC_BANK_PATH = APP_DIR / "configs" / "evergreen_editorial_topics.js
 EDITORIAL_FALLBACK_BANK_PATH = APP_DIR / "configs" / "editorial_fallback_cards.json"
 
 REALITY_PAYLOAD_VERSION = "reality_payload_v2"
-GROUNDING_CONTRACT_VERSION = "grounding_contract_v3"
+GROUNDING_CONTRACT_VERSION = "grounding_contract_v4"
 GROUNDING_PARAGRAPH_JOBS = {
     "CLAIM", "EVIDENCE", "MECHANISM", "CONTEXT", "COUNTER_SIGNAL", "UNCERTAINTY",
     "IMPLICATION", "EXAMPLE", "CONCLUSION",
@@ -73,7 +73,12 @@ GROUNDING_FAILURE_CODES = {
     "SOURCE_DRAFT_CONTRADICTION",
 }
 GROUNDING_RESEARCH_GAP_CODES = {
-    "INSUFFICIENT_REALITY_PAYLOAD", "LOW_SOURCE_DEPENDENCE", "MECHANISM_GAP",
+    "INSUFFICIENT_REALITY_PAYLOAD",
+}
+NON_BLOCKING_EDITORIAL_CODES = {"editorial_hold", "unsupported", "insufficient_marginal_value"}
+NON_BLOCKING_GROUNDING_CODES = {
+    "LOW_SOURCE_DEPENDENCE", "LOW_REALITY_CONTRIBUTION", "MECHANISM_GAP",
+    "ANALOGY_AS_EVIDENCE", "EXCESSIVE_GENERIC_BACKGROUND",
 }
 GROUNDING_RESEARCH_SOURCE_KINDS = {
     "official_documentation", "official_announcement", "regulatory_filing",
@@ -4205,17 +4210,16 @@ def validate_persona_editorial_decisions(result, topics: list[dict], persona_slu
                 })
         if (
             decision["status"] == "HOLD"
-            and str(item.get("reason_code", "")).strip() == "editorial_hold"
+            and decision["reason_code"] in NON_BLOCKING_EDITORIAL_CODES
             and str(allowed[topic_key].get("scope", "public")) != "persona"
-            and decision["why_me"]
-            and min(decision[key] for key in ("notice", "authority", "tension", "marginal_value")) >= 3
-            and editorial_score(decision) >= 14
         ):
-            decision.update({
-                "status": "HOLD",
-                "reason_code": "thesis_required_before_write",
-                "rationale": "公共 Topic 评分再高，也必须先形成独立的人格化 Thesis。",
+            promoted = required_public_angle_decision(allowed[topic_key], persona_slug)
+            promoted.update({
+                "reason_code": "soft_gate_removed",
+                "rationale": "软性编辑判断不再阻断热点母题进入写作。",
             })
+            decisions[topic_key] = promoted
+            decision = promoted
     for topic in topics:
         key = str(topic.get("claim_key", ""))
         if key not in decisions:
@@ -4251,18 +4255,6 @@ def apply_editorial_claim_history(persona_id: int, decisions: dict, claim_histor
 
 
 def apply_editorial_marginal_threshold(decisions: dict, today_count: int):
-    minimum = 3 if today_count >= 5 else 0
-    if not minimum:
-        return decisions
-    for decision in decisions.values():
-        if (
-            decision["status"] == "WRITE"
-            and decision.get("reason_code") != "required_public_angle"
-            and decision["marginal_value"] < minimum
-        ):
-            decision["status"] = "HOLD"
-            decision["reason_code"] = "insufficient_marginal_value"
-            decision["rationale"] = "当天已有候选后，这条主张的边际价值不足。"
     return decisions
 
 
@@ -4276,8 +4268,8 @@ async def evaluate_persona_editorial(persona: dict, persona_context: dict, daily
         "每个输入 topic 必须恰好有一项，topic_claim_key 必须等于输入的 claim_key。"
         "逐题独立判断：notice/authority/tension/marginal_value 均为 0-5 整数；"
         "status 只能 WRITE/HOLD/IGNORE；why_me 说明为什么该人设此刻有资格说；"
-        "HOLD 必须显式输出 reason_code：软性犹豫用 editorial_hold；事实冲突用 fact_conflict；"
-        "人设禁区用 forbidden_claim；历史重复用 historical_duplicate；证据不足用 unsupported。"
+        "HOLD 只允许明确事实冲突 fact_conflict、人设禁区 forbidden_claim 或历史重复 historical_duplicate；"
+        "editorial_hold、unsupported、边际价值不足、机制解释不完整都不能阻止公共热点进入 WRITE。"
         "WRITE 必须返回 thesis 对象，不能只返回一句 core_claim。thesis 必须包含："
         "thesis_type、claim_nature(factual/opinion/mixed)、primary_subject{type,id}、relation、primary_claim、primary_claim_count=1、"
         "scope{statement}、persona_lens_id、supporting_basis[{role,claim,fact_ids}]、"
@@ -5669,7 +5661,12 @@ def compile_grounding_contract(topic: dict, thesis: dict, payload: dict) -> dict
             "falsifier_required": claim_type == "PREDICTIVE",
             "actionable_fields_required": claim_type == "ACTIONABLE",
         },
-        "preflight_reason_codes": list(dict.fromkeys(reasons)),
+        "preflight_reason_codes": list(dict.fromkeys(
+            code for code in reasons if code not in NON_BLOCKING_GROUNDING_CODES
+        )),
+        "advisory_reason_codes": list(dict.fromkeys(
+            code for code in reasons if code in NON_BLOCKING_GROUNDING_CODES
+        )),
     }
     contract["grounding_contract_id"] = "grounding:" + hashlib.sha256(json.dumps(
         contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -6600,6 +6597,7 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
         "\"facts_used_ids\":[\"逐字复制 verified_facts.facts[].id\"],\"stance\":\"...\"}。"
         "sections 的语义槽和必填项是服务器硬约束；reasoning_shape 只能逐字选择 allowed_reasoning_shapes 中的一项。"
         "段落顺序可以在允许形状中变化；每段只写正文，不写 Hook、Context、CTA 等标签，不得把整篇复制进多个字段。\n"
+        "全部 sections 拼接后的正文必须在 100–300 个字符之间，不能用重复句、标签或免责声明凑字数。"
         "每个 sections 项必须返回 text、job、thesis_relation、reality_refs。EVIDENCE 段必须引用 RealityPayload 中的 ID；"
         "MECHANISM 段只能引用 GroundingContract 允许的 mechanism evidence。"
         "唯一可作为确定事实、数字、日期、行为或共识的材料是 RealityPayload 与 verified_facts；Grok 内容只用于理解前情、圈内争议和语言语境。"
@@ -6664,6 +6662,8 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
         response.raise_for_status()
     result = chat_completion_json(response.json())
     text, sections, paragraphs = assemble_editorial_sections(result, style_recipe)
+    if not 100 <= len(text) <= 300:
+        raise RuntimeError(f"Gemini 正文必须为 100–300 字，当前 {len(text)} 字")
     if thesis and normalize_editorial_claim(result.get("stance")) != normalize_editorial_claim(thesis.get("primary_claim")):
         raise RuntimeError("Gemini stance 未忠实返回 Persona Thesis")
     valid_fact_ids = {item["id"] for item in verified_facts.get("facts", [])}
@@ -6724,8 +6724,6 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
 def deterministic_editorial_style_failures(post: str, writer_context: dict, verified_facts: dict | None = None):
     text = str(post or "").strip()
     failures = []
-    if len(text) < 80:
-        failures.append("正文过短，未形成可读的具体判断")
     if any(phrase in text for phrase in EMPTY_WAITING_PHRASES):
         failures.append("用等待或观察句替代当前结论")
     if unauthorized_first_person_experience(text, writer_context):
@@ -6768,6 +6766,7 @@ def validate_editorial_grounding(draft: dict, payload: dict, contract: dict,
             "uncertainty_status": "NOT_CHECKED", "details": [],
         }
     reasons = list(contract.get("preflight_reason_codes", []))
+    advisory = list(contract.get("advisory_reason_codes", []))
     annotations = draft.get("paragraphs", [])
     if not isinstance(annotations, list):
         annotations = []
@@ -6865,6 +6864,10 @@ def validate_editorial_grounding(draft: dict, payload: dict, contract: dict,
         reasons.append("CLAIM_STRENGTH_UPGRADE")
 
     reasons = list(dict.fromkeys(code for code in reasons if code in GROUNDING_FAILURE_CODES))
+    advisory = list(dict.fromkeys([
+        *advisory, *(code for code in reasons if code in NON_BLOCKING_GROUNDING_CODES),
+    ]))
+    reasons = [code for code in reasons if code not in NON_BLOCKING_GROUNDING_CODES]
     research_codes = {
         "INSUFFICIENT_REALITY_PAYLOAD", "LOW_SOURCE_DEPENDENCE", "MECHANISM_GAP",
         "SOURCE_DRAFT_CONTRADICTION",
@@ -6876,6 +6879,7 @@ def validate_editorial_grounding(draft: dict, payload: dict, contract: dict,
         decision = "REPAIR"
     return {
         "decision": decision, "reason_codes": reasons,
+        "advisory_reason_codes": advisory,
         "required_reality_refs": sorted(required), "used_reality_refs": sorted(used),
         "source_dependency_status": "PASS" if not ({"LOW_SOURCE_DEPENDENCE", "LOW_REALITY_CONTRIBUTION"} & set(reasons)) else "FAIL",
         "mechanism_status": mechanism_status,
@@ -6911,7 +6915,8 @@ async def review_editorial_grounding_gemini(topic: dict, thesis: dict, payload: 
         "类比是否被当成证据；因果机制是否完整；claim strength 和 uncertainty 是否保留；"
         "删除现实锚点后正文是否仍基本完整；背景是否压过现实材料；是否出现 synthetic example；"
         "正文是否与 source observation 矛盾。不要评价文风，不要补材料，不要替 Writer 改稿。"
-        "Research 缺失、MECHANISM_GAP 或 source contradiction 必须 RETURN_TO_RESEARCH；"
+        "MECHANISM_GAP、LOW_SOURCE_DEPENDENCE、LOW_REALITY_CONTRIBUTION、ANALOGY_AS_EVIDENCE、"
+        "EXCESSIVE_GENERIC_BACKGROUND 仅作建议，不得因此拒稿；Research 完全缺失或 source contradiction 才退回研究；"
         "可通过删除措辞、压缩背景或恢复不确定性修复的才是 REPAIR。\n\n"
         f"允许的 reason codes：{json.dumps(sorted(GROUNDING_FAILURE_CODES), ensure_ascii=False)}\n"
         f"Topic：{json.dumps(topic, ensure_ascii=False)}\n"
@@ -6945,16 +6950,20 @@ async def review_editorial_grounding_gemini(topic: dict, thesis: dict, payload: 
     ))
     if decision != "PASS" and not codes:
         raise RuntimeError("Grounding Validator 拒绝但未给 reason code")
-    if decision == "PASS" and codes:
+    advisory = [code for code in codes if code in NON_BLOCKING_GROUNDING_CODES]
+    codes = [code for code in codes if code not in NON_BLOCKING_GROUNDING_CODES]
+    if not codes:
+        decision = "PASS"
+    else:
         decision = "RETURN_TO_RESEARCH" if set(codes) & {
-            "INSUFFICIENT_REALITY_PAYLOAD", "LOW_SOURCE_DEPENDENCE", "MECHANISM_GAP",
-            "SOURCE_DRAFT_CONTRADICTION",
+            "INSUFFICIENT_REALITY_PAYLOAD", "SOURCE_DRAFT_CONTRADICTION",
         } else "REPAIR"
     details = result.get("details", [])
     if not isinstance(details, list):
         raise RuntimeError("Grounding Validator details 非法")
     return {
         "decision": decision, "reason_codes": codes,
+        "advisory_reason_codes": advisory,
         "details": [item for item in details[:12] if isinstance(item, dict)],
         "model": provider["model"], "mode": "semantic_grounding_validator",
     }
