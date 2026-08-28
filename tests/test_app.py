@@ -3147,6 +3147,44 @@ class AppTest(unittest.TestCase):
         self.app_module.EDITORIAL_GEMINI_KEY_POOLS.clear()
         self.app_module._cached_gemini_api_keys.cache_clear()
 
+    def test_angle_expansion_isolates_a_failed_batch(self):
+        calls = []
+        payload = {"choices": [{"message": {"content": "{}"}}]}
+        mothers = [
+            {"seed_key": f"seed-{index}", "title": f"母题 {index}", "topic_domain": "ai"}
+            for index in range(3)
+        ]
+        grok = {"contexts": [
+            {"seed_key": f"seed-{index}", "background": "背景"} for index in range(3)
+        ]}
+        self.app_module.EDITORIAL_GEMINI_KEY_POOLS.clear()
+        self.app_module._cached_gemini_api_keys.cache_clear()
+        with patch.dict(os.environ, {
+            "XOPS_GEMINI_KEYCHAIN_ACCOUNTS": "", "XOPS_GEMINI_API_KEY": "dummy",
+        }, clear=True), patch.object(
+            self.app_module.httpx, "AsyncClient", return_value=FakeAsyncClient(payload, calls)
+        ), patch.object(
+            self.app_module, "chat_completion_json", side_effect=[
+                json.JSONDecodeError("bad json", "", 0),
+                json.JSONDecodeError("bad json", "", 0),
+                {"angles": [], "rejected_angles": []},
+            ],
+        ):
+            result = asyncio.run(self.app_module.expand_editorial_angles_gemini(
+                mothers, {}, grok, [],
+            ))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            [item["parent_seed_key"] for item in result["rejected_angles"]],
+            ["seed-0", "seed-1"],
+        )
+        self.assertTrue(all(
+            item["reason_code"] == "context_unavailable"
+            for item in result["rejected_angles"]
+        ))
+        self.app_module.EDITORIAL_GEMINI_KEY_POOLS.clear()
+        self.app_module._cached_gemini_api_keys.cache_clear()
+
     def test_gemini_provider_signature_does_not_expose_key(self):
         dummy_key = "dummy-gemini-secret"
         with patch.dict(os.environ, {

@@ -5983,33 +5983,49 @@ async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_contex
         f"团队已覆盖主张：{json.dumps(editorial_claim_memory(claim_history), ensure_ascii=False)}"
         )
         for attempt in range(2):
-            async with httpx.AsyncClient(timeout=180) as client:
-                async with gemini_request_key(provider) as key:
-                    response = await client.post(
-                        provider["base_url"] + "/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                            "User-Agent": "Mozilla/5.0",
-                        },
-                        json={
-                            "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
-                            "response_format": {"type": "json_object"},
-                            "temperature": 0.55 if attempt == 0 else 0.2, "max_tokens": 8000,
-                        },
-                    )
-                response.raise_for_status()
             try:
+                async with httpx.AsyncClient(timeout=180) as client:
+                    async with gemini_request_key(provider) as key:
+                        response = await client.post(
+                            provider["base_url"] + "/chat/completions",
+                            headers={
+                                "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                                "User-Agent": "Mozilla/5.0",
+                            },
+                            json={
+                                "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
+                                "response_format": {"type": "json_object"},
+                                "temperature": 0.55 if attempt == 0 else 0.2, "max_tokens": 8000,
+                            },
+                        )
+                    response.raise_for_status()
                 return chat_completion_json(response.json())
-            except json.JSONDecodeError:
+            except (httpx.HTTPError, json.JSONDecodeError):
                 if attempt == 1:
                     raise
 
-    results = await asyncio.gather(*(
-        expand_batch(mother_topics[index:index + 2]) for index in range(0, len(mother_topics), 2)
-    ))
+    batches = [mother_topics[index:index + 2] for index in range(0, len(mother_topics), 2)]
+    results = await asyncio.gather(*(expand_batch(batch) for batch in batches), return_exceptions=True)
+    completed = [result for result in results if not isinstance(result, Exception)]
+    if not completed:
+        raise RuntimeError("Gemini 所有选角批次均失败")
+    failed = [
+        {
+            "parent_seed_key": topic["seed_key"],
+            "title": topic["title"],
+            "core_claim": "",
+            "reason_code": "context_unavailable",
+            "reason": "Gemini 选角批次连续失败，本轮不进入写稿。",
+        }
+        for batch, result in zip(batches, results) if isinstance(result, Exception)
+        for topic in batch
+    ]
     return {
-        "angles": [item for result in results for item in result.get("angles", [])],
-        "rejected_angles": [item for result in results for item in result.get("rejected_angles", [])],
+        "angles": [item for result in completed for item in result.get("angles", [])],
+        "rejected_angles": [
+            *[item for result in completed for item in result.get("rejected_angles", [])],
+            *failed,
+        ],
         "_model": provider["model"],
     }
 
