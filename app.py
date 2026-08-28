@@ -4579,6 +4579,7 @@ def daily_persona_draft_count(conn, persona_id: int, context_date: str) -> int:
         """SELECT COUNT(*) FROM persona_editorial_evaluations e
            JOIN daily_context_runs r ON r.id=e.run_id
            WHERE e.persona_id=? AND r.context_date=? AND e.status='WRITE'
+             AND COALESCE(json_extract(e.input_json,'$.daily.approval_revision'),0)=r.approval_revision
              AND NOT EXISTS (
                  SELECT 1 FROM post_candidates c
                  WHERE c.id=e.candidate_id AND c.status IN ('needs_review','queued','published')
@@ -6334,8 +6335,10 @@ async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict
         daily = daily_context_dict(daily_row)
         daily["approval_revision"] = run["approval_revision"]
         evaluation_count = conn.execute(
-            "SELECT COUNT(*) FROM persona_editorial_evaluations WHERE run_id=? AND status='WRITE'",
-            (run_id,),
+            """SELECT COUNT(*) FROM persona_editorial_evaluations
+               WHERE run_id=? AND status='WRITE'
+                 AND COALESCE(json_extract(input_json,'$.daily.approval_revision'),0)=?""",
+            (run_id, run["approval_revision"]),
         ).fetchone()[0]
         existing_stage = current_cards.get("editorial_angle_expansion")
         if evaluation_count and not isinstance(existing_stage, dict):
@@ -6891,7 +6894,7 @@ def reopen_daily_supplement_guard_rejections(run_id: int | None = None):
 def reopen_required_public_angle_rejections(run_id: int | None = None):
     with db() as conn:
         runs = conn.execute(
-            """SELECT id,raw_cards FROM daily_context_runs
+            """SELECT id,raw_cards,approval_revision FROM daily_context_runs
                WHERE status='approved' AND context_date=? AND (? IS NULL OR id=?)""",
             (shanghai_today(), run_id, run_id),
         ).fetchall()
@@ -6904,8 +6907,9 @@ def reopen_required_public_angle_rejections(run_id: int | None = None):
                 """SELECT e.id,e.topic_json,e.generation_state,e.reason_code,p.slug
                    FROM persona_editorial_evaluations e
                    JOIN personas p ON p.id=e.persona_id
-                   WHERE e.run_id=? AND e.status='HOLD'""",
-                (run["id"],),
+                   WHERE e.run_id=? AND e.status='HOLD'
+                     AND COALESCE(json_extract(e.input_json,'$.daily.approval_revision'),0)=?""",
+                (run["id"], run["approval_revision"]),
             ).fetchall()
             for row in rows:
                 if row["reason_code"] in GROUNDING_FAILURE_CODES:
@@ -7817,13 +7821,19 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
                 )
                 existing_hashes = {
                     row["topic_input_hash"] for row in conn.execute(
-                        "SELECT topic_input_hash FROM persona_editorial_evaluations WHERE run_id=? AND persona_id=?",
-                        (run["id"], persona["id"]),
+                        """SELECT topic_input_hash FROM persona_editorial_evaluations
+                           WHERE run_id=? AND persona_id=?
+                             AND COALESCE(json_extract(input_json,'$.daily.approval_revision'),0)=?""",
+                        (run["id"], persona["id"], run["approval_revision"]),
                     ).fetchall()
                 }
                 today_count = conn.execute(
                     """SELECT COUNT(*) FROM persona_editorial_evaluations
                        WHERE persona_id=? AND status='WRITE' AND candidate_id IS NOT NULL
+                       AND COALESCE(json_extract(input_json,'$.daily.approval_revision'),0)=(
+                           SELECT approval_revision FROM daily_context_runs
+                           WHERE id=persona_editorial_evaluations.run_id
+                       )
                        AND EXISTS (SELECT 1 FROM daily_context_runs r WHERE r.id=persona_editorial_evaluations.run_id AND r.context_date=?)""",
                     (persona["id"], run["context_date"]),
                 ).fetchone()[0]

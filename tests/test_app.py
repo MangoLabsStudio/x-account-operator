@@ -3810,6 +3810,68 @@ class AppTest(unittest.TestCase):
             "WRITE", "THESIS_APPROVED", "required_public_angle", None,
         ))
 
+    def test_pipeline_does_not_reopen_required_angle_from_an_old_revision(self):
+        context_date = self.app_module.shanghai_today()
+        topic = {
+            "claim_key": "stale-required-reopen", "title": "旧审批周期观点",
+            "core_claim": "旧审批周期的评估不能在手动重跑后恢复。",
+            "parent_seed_key": "mother:stale-reopen", "scope": "public",
+            "topic_domain": "crypto",
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+        with self.app_module.db() as conn:
+            cards = json.loads(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()[0])
+            cards["editorial_angle_expansion"] = {
+                "status": "ready", "expanded_topics": [topic], "rejected_angles": [],
+            }
+            conn.execute(
+                "UPDATE daily_context_runs SET raw_cards=? WHERE id=?",
+                (json.dumps(cards, ensure_ascii=False), run_id),
+            )
+        evaluation_id = self.insert_pending_editorial_write(run_id, context_date, topic)
+        with self.app_module.db() as conn:
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET status='HOLD',reason_code='manual_regeneration' WHERE id=?""",
+                (evaluation_id,),
+            )
+            conn.execute(
+                "UPDATE daily_context_runs SET approval_revision=approval_revision+1 WHERE id=?",
+                (run_id,),
+            )
+
+        with patch.dict(os.environ, {"XOPS_DAILY_POST_PERSONAS": "acheng"}):
+            self.app_module.reopen_required_public_angle_rejections(run_id)
+
+        with self.app_module.db() as conn:
+            row = conn.execute(
+                "SELECT status,reason_code FROM persona_editorial_evaluations WHERE id=?",
+                (evaluation_id,),
+            ).fetchone()
+        self.assertEqual(tuple(row), ("HOLD", "manual_regeneration"))
+
+    def test_daily_draft_count_ignores_pending_write_from_an_old_revision(self):
+        context_date = self.app_module.shanghai_today()
+        run_id = self.create_editorial_run(context_date)
+        with self.app_module.db() as conn:
+            persona_id = conn.execute(
+                "SELECT id FROM personas WHERE slug='acheng'"
+            ).fetchone()[0]
+        self.insert_pending_editorial_write(
+            run_id, context_date,
+            {"claim_key": "stale-count", "title": "旧稿", "eligible": True},
+        )
+        with self.app_module.db() as conn:
+            conn.execute(
+                "UPDATE daily_context_runs SET approval_revision=approval_revision+1 WHERE id=?",
+                (run_id,),
+            )
+            self.assertEqual(
+                self.app_module.daily_persona_draft_count(conn, persona_id, context_date), 0,
+            )
+
     def test_manual_retry_allows_unpublished_legacy_candidate(self):
         context_date = self.app_module.shanghai_today()
         topic = {"claim_key": "legacy-retry", "title": "旧稿复位", "eligible": True}
