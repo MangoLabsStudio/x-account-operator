@@ -3519,7 +3519,7 @@ def editorial_score(item: dict):
 
 EDITORIAL_CLAIM_KEY = re.compile(r"^[a-z0-9][a-z0-9:_-]{2,119}$")
 EDITORIAL_EVALUATOR_REVISION = 5
-EDITORIAL_SOURCE_FACT_POLICY_VERSION = 1
+EDITORIAL_SOURCE_FACT_POLICY_VERSION = 2
 THESIS_CONTRACT_VERSION = "thesis_contract_v1"
 THESIS_TYPES = {
     "ASSERTION", "INTERPRETATION", "OBSERVATION", "DECISION", "PREDICTION",
@@ -5362,6 +5362,36 @@ def editorial_source_observations(raw_cards: dict, topic: dict) -> list[dict]:
                 visit(item)
 
     visit(raw_cards)
+    missing = [ref for ref in wanted if ref not in found]
+    post_ids = {}
+    for ref in missing:
+        match = re.search(r"(?:^|/status/)(\d+)(?:$|[/?#])", ref)
+        if match:
+            post_ids.setdefault(match.group(1), []).append(ref)
+    if post_ids and DAILY_CONTEXT_SOURCE_DB.exists():
+        placeholders = ",".join("?" for _item in post_ids)
+        with sqlite3.connect(
+            f"file:{DAILY_CONTEXT_SOURCE_DB}?mode=ro", uri=True
+        ) as conn:
+            rows = conn.execute(
+                f"SELECT post_id,handle,text,created_at,url FROM source_posts "
+                f"WHERE post_id IN ({placeholders})",
+                tuple(post_ids),
+            ).fetchall()
+        for post_id, handle, text, created_at, url in rows:
+            for ref in post_ids.get(str(post_id), []):
+                statement = str(text or "").strip()
+                if not statement:
+                    continue
+                found[ref] = {
+                    "source_ref": ref,
+                    "statement": statement[:1200],
+                    "source_ids": list(dict.fromkeys(
+                        item for item in (ref, str(url or "").strip()) if item
+                    )),
+                    "observed_at": str(created_at or ""),
+                    "actor": str(handle or ""),
+                }
     return [found[ref] for ref in sorted(wanted) if ref in found]
 
 

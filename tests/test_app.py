@@ -3020,6 +3020,30 @@ class AppTest(unittest.TestCase):
         self.assertEqual(payload["source_dependent_anchors"][0]["kind"], "SOURCE_REPORTED_FACT")
         self.assertEqual(payload["primary_observation"]["fact_ids"], ["tweet:2092025531684532245"])
 
+    def test_editorial_verified_facts_reads_referenced_post_from_source_database(self):
+        with sqlite3.connect(self.app_module.DAILY_CONTEXT_SOURCE_DB) as conn:
+            conn.execute(
+                """CREATE TABLE source_posts(
+                    post_id TEXT PRIMARY KEY,handle TEXT,text TEXT,created_at TEXT,url TEXT
+                )"""
+            )
+            conn.execute(
+                "INSERT INTO source_posts VALUES(?,?,?,?,?)",
+                (
+                    "2092315006826398115", "source_account",
+                    "原帖写明活动池规模为 5000 万美元。",
+                    "2026-08-28T02:00:00Z",
+                    "https://x.com/source_account/status/2092315006826398115",
+                ),
+            )
+        facts = self.app_module.editorial_verified_facts(
+            {}, {"source_refs": ["2092315006826398115"]}, {}
+        )
+        self.assertEqual(facts["facts"][0]["id"], "tweet:2092315006826398115")
+        self.assertEqual(facts["facts"][0]["text"], "原帖写明活动池规模为 5000 万美元。")
+        self.assertEqual(facts["facts"][0]["actor"], "source_account")
+        self.assertTrue(facts["requires_fact_ids"])
+
     def test_gemini_parser_enforces_facts_used_ids_contract(self):
         calls = []
         payload = {
