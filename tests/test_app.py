@@ -3966,6 +3966,36 @@ class AppTest(unittest.TestCase):
             )
             self.assertFalse(self.app_module.daily_post_output_ready(conn, context_date))
 
+    def test_grounded_candidate_is_visible_while_other_angles_remain_uncovered(self):
+        context_date = self.app_module.shanghai_today()
+        ready_topic = {
+            "claim_key": "ready-grounded", "title": "已完成观点",
+            "core_claim": "已完成观点可以先进入审核。", "scope": "public",
+        }
+        pending_topic = {
+            "claim_key": "pending-grounding", "title": "仍在校验",
+            "core_claim": "未完成观点不能遮住合格稿。", "scope": "public",
+        }
+        run_id = self.create_editorial_run(context_date, topics=[ready_topic, pending_topic])
+        with self.app_module.db() as conn:
+            cards = json.loads(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()[0])
+            cards["editorial_angle_expansion"] = {
+                "status": "ready", "expanded_topics": [ready_topic, pending_topic],
+                "rejected_angles": [],
+            }
+            conn.execute(
+                "UPDATE daily_context_runs SET raw_cards=? WHERE id=?",
+                (json.dumps(cards, ensure_ascii=False), run_id),
+            )
+        self.insert_formal_queue_candidate(
+            run_id, context_date, ready_topic, slug="acheng",
+            title="已完成观点", body="这是一条已经通过完整校验的推文正文。",
+        )
+        posts = self.client.get("/api/daily-posts").json()
+        self.assertEqual([post["title"] for post in posts], ["已完成观点"])
+
     def test_high_fit_hold_promotion_still_requires_real_authority(self):
         topic = {
             "claim_key": "macro-angle", "core_claim": "宏观判断需要匹配的人设。", "scope": "public",

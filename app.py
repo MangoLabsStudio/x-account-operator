@@ -9398,25 +9398,7 @@ def daily_post_output_ready(conn, context_date: str) -> bool:
     ).fetchall()
     if not runs:
         return False
-    if any(
-        (task := DAILY_POST_GENERATION_TASKS.get(row["id"])) is not None and not task.done()
-        for row in runs
-    ):
-        return False
-    if any(uncovered_public_angle_keys(conn, row["id"]) for row in runs):
-        return False
-    active = conn.execute(
-        """SELECT COUNT(*) FROM persona_editorial_evaluations e
-           JOIN daily_context_runs r ON r.id=e.run_id
-           WHERE r.context_date=? AND r.status='approved' AND e.status='WRITE'
-             AND NOT EXISTS (
-                 SELECT 1 FROM post_candidates c
-                 WHERE (c.id=e.candidate_id OR c.source=('persona_editorial_grok_gemini:' || e.id))
-                   AND c.status IN ('needs_review','queued','published')
-             )""",
-        (context_date,),
-    ).fetchone()[0]
-    return not active
+    return bool(queued_post_rows(conn, context_date))
 
 
 @app.post("/api/post-candidates/{candidate_id}/rewrite")
