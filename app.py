@@ -8032,7 +8032,19 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
                     for persona in persona_rows
                 ):
                     break
-        await generate_pending_persona_editorial_candidates(run["id"], run["context_date"])
+        for _ in range(max(1, target)):
+            await generate_pending_persona_editorial_candidates(run["id"], run["context_date"])
+            with db() as conn:
+                if all(
+                    daily_persona_visible_draft_count(
+                        conn, persona["id"], run["context_date"]
+                    ) >= target
+                    for persona in persona_rows
+                ):
+                    break
+            ensure_daily_persona_draft_floor(run["id"], persona_rows)
+            validate_run_persona_theses(run["id"], cards)
+            resolve_persona_editorial_collisions(run["id"])
         with db() as conn:
             attach_publishable_assets_to_daily_supplements(conn, run["context_date"])
             enforce_daily_persona_draft_cap(
