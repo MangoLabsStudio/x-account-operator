@@ -7016,6 +7016,8 @@ def reopen_required_public_angle_rejections(run_id: int | None = None):
                 (run["id"], run["approval_revision"]),
             ).fetchall()
             for row in rows:
+                if row["reason_code"] == "formal_generation_retry_exhausted":
+                    continue
                 topic = json_value(row["topic_json"], {})
                 if assignments.get(str(topic.get("claim_key", ""))) != row["slug"]:
                     continue

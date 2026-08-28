@@ -3837,6 +3837,15 @@ class AppTest(unittest.TestCase):
             "HOLD", "THESIS_APPROVED", "formal_generation_retry_exhausted", 1,
         ))
         self.assertIsNone(row["next_retry_at"])
+        self.app_module.reopen_required_public_angle_rejections(run_id)
+        with self.app_module.db() as conn:
+            reopened = conn.execute(
+                "SELECT status,reason_code,generation_attempts FROM persona_editorial_evaluations WHERE id=?",
+                (evaluation_id,),
+            ).fetchone()
+        self.assertEqual(tuple(reopened), (
+            "HOLD", "formal_generation_retry_exhausted", 1,
+        ))
 
     def test_pipeline_reopens_a_previously_rejected_required_public_angle(self):
         context_date = self.app_module.shanghai_today()
