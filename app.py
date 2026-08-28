@@ -6005,7 +6005,7 @@ async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_contex
                     raise
 
     results = await asyncio.gather(*(
-        expand_batch(mother_topics[index:index + 5]) for index in range(0, len(mother_topics), 5)
+        expand_batch(mother_topics[index:index + 2]) for index in range(0, len(mother_topics), 2)
     ))
     return {
         "angles": [item for result in results for item in result.get("angles", [])],

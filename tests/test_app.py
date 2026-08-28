@@ -3111,7 +3111,7 @@ class AppTest(unittest.TestCase):
                 mothers, {}, grok, [],
             ))
         prompts = [call["kwargs"]["json"]["messages"][0]["content"] for call in calls]
-        self.assertEqual(len(prompts), 3)
+        self.assertEqual(len(prompts), 6)
         self.assertEqual(result["angles"], [])
         for index in range(11):
             self.assertEqual(sum(f'"seed_key": "seed-{index}"' in prompt for prompt in prompts), 1)
