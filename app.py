@@ -4560,11 +4560,11 @@ def uncovered_public_angle_keys(conn, run_id: int) -> list[str]:
         str(json_value(evaluation["topic_json"], {}).get("claim_key", ""))
         for evaluation in conn.execute(
             """SELECT topic_json FROM persona_editorial_evaluations
-               WHERE run_id=? AND (
-                   status='WRITE'
-                   OR (status='HOLD' AND reason_code='formal_generation_retry_exhausted')
-               )""",
-            (run_id,),
+               WHERE run_id=? AND thesis_json<>'{}'
+                 AND COALESCE(json_extract(input_json,'$.daily.approval_revision'),0)=(
+                     SELECT approval_revision FROM daily_context_runs WHERE id=?
+                 )""",
+            (run_id, run_id),
         ).fetchall()
     }
     return sorted(required - covered)

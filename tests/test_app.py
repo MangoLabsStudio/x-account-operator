@@ -4173,7 +4173,8 @@ class AppTest(unittest.TestCase):
         with self.app_module.db() as conn:
             conn.execute(
                 """UPDATE persona_editorial_evaluations
-                   SET status='HOLD',reason_code='formal_generation_retry_exhausted'
+                   SET status='HOLD',reason_code='formal_generation_retry_exhausted',
+                       thesis_json='{"topic_id":"must-reach-thesis"}'
                    WHERE id=?""",
                 (evaluation_id,),
             )
