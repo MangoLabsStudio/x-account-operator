@@ -7003,6 +7003,15 @@ def reopen_required_public_angle_rejections(run_id: int | None = None):
             (shanghai_today(), run_id, run_id),
         ).fetchall()
         for run in runs:
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET status='HOLD',reason_code='formal_generation_retry_exhausted',
+                       next_retry_at=NULL,updated_at=?
+                   WHERE run_id=? AND status='WRITE' AND candidate_id IS NULL
+                     AND generation_attempts>=generation_max_attempts
+                     AND COALESCE(json_extract(input_json,'$.daily.approval_revision'),0)=?""",
+                (int(time.time()), run["id"], run["approval_revision"]),
+            )
             topics = editorial_public_topics(json_value(run["raw_cards"], {}))
             assignments = required_public_topic_assignments(topics)
             if not assignments:

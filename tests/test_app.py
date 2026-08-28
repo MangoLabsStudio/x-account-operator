@@ -3846,6 +3846,21 @@ class AppTest(unittest.TestCase):
         self.assertEqual(tuple(reopened), (
             "HOLD", "formal_generation_retry_exhausted", 1,
         ))
+        with self.app_module.db() as conn:
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET status='WRITE',reason_code='required_public_angle' WHERE id=?""",
+                (evaluation_id,),
+            )
+        self.app_module.reopen_required_public_angle_rejections(run_id)
+        with self.app_module.db() as conn:
+            recovered = conn.execute(
+                "SELECT status,reason_code,generation_attempts FROM persona_editorial_evaluations WHERE id=?",
+                (evaluation_id,),
+            ).fetchone()
+        self.assertEqual(tuple(recovered), (
+            "HOLD", "formal_generation_retry_exhausted", 1,
+        ))
 
     def test_pipeline_reopens_a_previously_rejected_required_public_angle(self):
         context_date = self.app_module.shanghai_today()
