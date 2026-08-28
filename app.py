@@ -40,7 +40,7 @@ EDITORIAL_GEMINI_KEY_POOLS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.
 GEMINI_KEYCHAIN_SERVICE = "codex.xops.gemini.pool"
 GEMINI_KEYCHAIN_ACCOUNTS = ("slot-1", "slot-2", "slot-3", "slot-4", "slot-5")
 GEMINI_POOL_ENV_VARS = tuple(f"XOPS_GEMINI_API_KEY_{index}" for index in range(1, 6))
-EDITORIAL_ANGLE_EXPANSION_REVISION = 5
+EDITORIAL_ANGLE_EXPANSION_REVISION = 6
 EDITORIAL_ANGLE_MAX_ATTEMPTS = 3
 EDITORIAL_HOT_TOPIC_RETENTION_DAYS = 3
 EDITORIAL_ANGLE_FAMILIES = {
@@ -56,6 +56,21 @@ TOPIC_SELECTION_POLICY_PATH = APP_DIR / "configs" / "topic_selection_policy.json
 EDITORIAL_CONTENT_STRUCTURES_PATH = APP_DIR / "configs" / "editorial_content_structures.json"
 EVERGREEN_TOPIC_BANK_PATH = APP_DIR / "configs" / "evergreen_editorial_topics.json"
 EDITORIAL_FALLBACK_BANK_PATH = APP_DIR / "configs" / "editorial_fallback_cards.json"
+
+REALITY_PAYLOAD_VERSION = "reality_payload_v1"
+GROUNDING_CONTRACT_VERSION = "grounding_contract_v1"
+GROUNDING_PARAGRAPH_JOBS = {
+    "CLAIM", "EVIDENCE", "MECHANISM", "CONTEXT", "COUNTER_SIGNAL", "UNCERTAINTY",
+    "IMPLICATION", "EXAMPLE", "CONCLUSION",
+}
+GROUNDING_THESIS_RELATIONS = {"SUPPORT", "QUALIFY", "CONSTRAIN", "EXPLAIN"}
+GROUNDING_FAILURE_CODES = {
+    "INSUFFICIENT_REALITY_PAYLOAD", "LOW_SOURCE_DEPENDENCE", "LOW_REALITY_CONTRIBUTION",
+    "UNSUPPORTED_FACT", "UNSUPPORTED_CONSENSUS_CLAIM", "UNSUPPORTED_BEHAVIOR_CLAIM",
+    "MECHANISM_GAP", "ANALOGY_AS_EVIDENCE", "CLAIM_STRENGTH_UPGRADE",
+    "UNCERTAINTY_DROPPED", "EXCESSIVE_GENERIC_BACKGROUND", "REALITY_REF_NOT_USED",
+    "SOURCE_DRAFT_CONTRADICTION",
+}
 
 AI_PERSONA_SLUGS = (
     "hegong-afterwork",
@@ -1185,15 +1200,33 @@ def editorial_content_structure_catalog():
     return editorial_content_structure_config()["structures"]
 
 
-def assemble_editorial_sections(result: dict, style_recipe: dict) -> tuple[str, dict]:
+def assemble_editorial_sections(result: dict, style_recipe: dict) -> tuple[str, dict, list[dict]]:
     structure = validate_editorial_content_structure(style_recipe)
     sections = result.get("sections")
     if not isinstance(sections, dict):
         raise RuntimeError("Gemini 未按内容结构返回 sections")
-    cleaned = {
-        key: str(sections.get(key, "")).strip()
-        for key in structure["section_order"]
-    }
+    cleaned, annotations = {}, []
+    for key in structure["section_order"]:
+        value = sections.get(key, "")
+        if isinstance(value, dict):
+            text = str(value.get("text", "")).strip()
+            job = str(value.get("job", "CONTEXT")).upper()
+            relation = str(value.get("thesis_relation", "EXPLAIN")).upper()
+            refs = value.get("reality_refs", [])
+            if job not in GROUNDING_PARAGRAPH_JOBS:
+                raise RuntimeError(f"Gemini section job 非法：{key}")
+            if relation not in GROUNDING_THESIS_RELATIONS:
+                raise RuntimeError(f"Gemini thesis_relation 非法：{key}")
+            if not isinstance(refs, list) or not all(isinstance(item, str) for item in refs):
+                raise RuntimeError(f"Gemini reality_refs 非法：{key}")
+        else:
+            text, job, relation, refs = str(value).strip(), "CONTEXT", "EXPLAIN", []
+        cleaned[key] = text
+        if text:
+            annotations.append({
+                "section": key, "text": text, "job": job,
+                "thesis_relation": relation, "reality_refs": list(dict.fromkeys(refs)),
+            })
     missing = [key for key in structure["required_sections"] if not cleaned[key]]
     if missing:
         raise RuntimeError(f"Gemini 缺少必填内容段：{','.join(missing)}")
@@ -1217,7 +1250,7 @@ def assemble_editorial_sections(result: dict, style_recipe: dict) -> tuple[str, 
     if cleaned["cta"] and "cta" not in output_shape:
         output_shape.append("cta")
     text = "\n\n".join(cleaned[key] for key in output_shape if cleaned[key])
-    return text, cleaned
+    return text, cleaned, annotations
 
 
 def seed_topic_claim_history():
@@ -3899,6 +3932,11 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
             continue
         claim_key = str(item.get("claim_key", "")).strip().lower()
         family = str(item.get("angle_family", "")).strip()
+        claim_type = str(item.get("claim_type", "")).upper() or {
+            "opportunity": "ACTIONABLE",
+            "industry_evaluation": "STRUCTURAL",
+            "trading_philosophy": "NORMATIVE",
+        }.get(family, "DESCRIPTIVE")
         required = (
             "title", "core_claim", "specific_tension", "non_obvious_delta",
             "audience_value", "why_worth_saying",
@@ -3910,6 +3948,18 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
             continue
         if family not in EDITORIAL_ANGLE_FAMILIES:
             reject(item, "invalid_angle_family", "角度镜头不在允许范围内。")
+            continue
+        if claim_type not in {
+            "DESCRIPTIVE", "COMPARATIVE", "CAUSAL", "STRUCTURAL",
+            "PREDICTIVE", "NORMATIVE", "ACTIONABLE",
+        }:
+            reject(item, "invalid_claim_type", "角度没有声明有效的现实证据负担类型。")
+            continue
+        if claim_type == "ACTIONABLE" and any(
+            not str(item.get(key, "")).strip()
+            for key in ("action_setup", "action_trigger", "action_invalidation", "action_consequence")
+        ):
+            reject(item, "incomplete_actionable_grounding", "行动角度缺少 setup、trigger、invalidation 或 consequence。")
             continue
         structure_id = str(item.get("structure_id", "")).strip()
         if structure_id and structure_id not in structure_ids:
@@ -3969,6 +4019,11 @@ def bounded_editorial_angles(result: dict, mother_topics: list[dict], claim_hist
             "core_claim": core_claim[:1600],
             "content_type": content_type,
             "angle_family": family,
+            "claim_type": claim_type,
+            "action_setup": str(item.get("action_setup", ""))[:800],
+            "action_trigger": str(item.get("action_trigger", ""))[:800],
+            "action_invalidation": str(item.get("action_invalidation", ""))[:800],
+            "action_consequence": str(item.get("action_consequence", ""))[:800],
             "structure_id": structure_id,
             "specific_tension": str(item["specific_tension"]).strip()[:1000],
             "non_obvious_delta": str(item["non_obvious_delta"]).strip()[:1000],
@@ -5116,7 +5171,7 @@ SAFE_FIRST_PERSON_OPINION_LEADS = (
     "我认为", "我觉得", "我的判断是", "我的判断", "我的理解是", "我的理解",
     "我倾向于", "我倾向", "我更关心", "在我看来",
 )
-EDITORIAL_DETERMINISTIC_GUARD_REVISION = 2
+EDITORIAL_DETERMINISTIC_GUARD_REVISION = 3
 
 UNAUTHORIZED_FIRST_PERSON_EXPERIENCE_RE = re.compile(
     r"(?:我|本人)(?:上周|上个月|昨天|今天|最近|今年|这个月|一直|已经|刚|曾|现在|目前)?"
@@ -5201,6 +5256,12 @@ def editorial_verified_facts(raw_cards: dict, topic: dict, writer_context: dict)
             "source_refs": sorted(card_refs)[:12],
             "status": card["status"],
         }
+        for key in (
+            "entity", "metric", "value", "unit", "time_scope", "observed_at",
+            "actor", "action", "object", "mechanism", "confidence", "epistemic_status",
+        ):
+            if card.get(key) not in (None, "", [], {}):
+                fact[key] = card[key]
         if card.get("review_promoted") and isinstance(card.get("verification_evidence"), dict):
             fact["verification_evidence"] = card["verification_evidence"]
         facts.append(fact)
@@ -5214,6 +5275,319 @@ def editorial_verified_facts(raw_cards: dict, topic: dict, writer_context: dict)
             "status": "approved_life",
         })
     return {"schema": "facts_used_ids", "facts": facts, "requires_fact_ids": bool(facts)}
+
+
+def editorial_topic_source_refs(topic: dict) -> set[str]:
+    refs = set()
+    values = topic.get("source_refs", [])
+    if not isinstance(values, list):
+        values = [values]
+    for value in values:
+        if isinstance(value, dict):
+            for key in ("source_ref", "id", "url"):
+                if value.get(key):
+                    refs.add(str(value[key]).strip())
+        elif str(value or "").strip():
+            refs.add(str(value).strip())
+    return refs
+
+
+def editorial_source_observations(raw_cards: dict, topic: dict) -> list[dict]:
+    """Return exact approved source observations referenced by the topic."""
+    wanted = editorial_topic_source_refs(topic)
+    if not wanted:
+        return []
+    found = {}
+
+    def visit(value):
+        if isinstance(value, dict):
+            source_ref = str(
+                value.get("source_ref") or value.get("representative_source_ref") or ""
+            ).strip()
+            text = str(value.get("text") or value.get("representative_text") or "").strip()
+            url = str(value.get("url") or value.get("representative_url") or "").strip()
+            if source_ref in wanted and text and source_ref not in found:
+                found[source_ref] = {
+                    "source_ref": source_ref,
+                    "statement": text[:1200],
+                    "source_ids": [item for item in (source_ref, url) if item],
+                    "observed_at": str(value.get("created_at") or value.get("latest_at") or ""),
+                    "actor": str(value.get("handle") or value.get("representative_handle") or ""),
+                }
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    visit(nested)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(raw_cards)
+    return [found[ref] for ref in sorted(wanted) if ref in found]
+
+
+def grounding_mode_for_topic(topic: dict) -> str:
+    source_kind = str(topic.get("source_kind", ""))
+    if source_kind == "life":
+        return "HISTORICAL"
+    if source_kind in {
+        "daily_supplement", "editorial_fallback", "evergreen", "thought",
+        "expression_debt", "persona_private",
+    } or str(
+        topic.get("source_mode", "")
+    ) in {"approved_editorial", "paraphrase"}:
+        return "EVERGREEN"
+    live_source_ref = any(
+        ref.isdigit() or ref.startswith("https://x.com/") or ref.startswith("https://www.")
+        for ref in editorial_topic_source_refs(topic)
+    )
+    if (
+        topic.get("status") == "needs_live_research"
+        or live_source_ref
+        or source_kind in {"market", "daily_context", "hot_topic"}
+    ):
+        return "LIVE_RESEARCH"
+    return "EVERGREEN"
+
+
+def compile_reality_payload(raw_cards: dict, topic: dict, verified_facts: dict,
+                            writer_context: dict) -> dict:
+    mode = grounding_mode_for_topic(topic)
+    concrete_facts, anchors = [], []
+    for fact in verified_facts.get("facts", []):
+        if not isinstance(fact, dict) or not fact.get("id") or not fact.get("text"):
+            continue
+        item = {
+            "fact_id": fact["id"], "statement": str(fact["text"])[:1200],
+            "entity": fact.get("entity", ""), "metric": fact.get("metric", ""),
+            "value": fact.get("value", ""), "unit": fact.get("unit", ""),
+            "time_scope": fact.get("time_scope", ""),
+            "source_ids": list(fact.get("source_refs", []))[:12],
+            "confidence": fact.get("confidence", fact.get("status", "verified")),
+            "epistemic_status": "KNOWN",
+        }
+        concrete_facts.append(item)
+        anchors.append({
+            "reality_ref": fact["id"], "statement": item["statement"],
+            "source_ids": item["source_ids"], "kind": "VERIFIED_FACT",
+            "epistemic_status": "KNOWN",
+            "observed_at": str(fact.get("observed_at") or fact.get("time_scope") or ""),
+        })
+
+    observations = []
+    for item in editorial_source_observations(raw_cards, topic):
+        reality_ref = "observation:" + item["source_ref"]
+        observations.append({
+            "reality_ref": reality_ref, "actor": item["actor"], "action": "published",
+            "object": item["statement"], "context": "tracked_public_source",
+            "fact_ids": [], "source_ids": item["source_ids"],
+            "observed_at": item["observed_at"], "epistemic_status": "KNOWN_OBSERVATION",
+        })
+        anchors.append({
+            "reality_ref": reality_ref, "statement": item["statement"],
+            "source_ids": item["source_ids"], "kind": "SOURCE_OBSERVATION",
+            "epistemic_status": "KNOWN_OBSERVATION", "observed_at": item["observed_at"],
+        })
+
+    if mode != "LIVE_RESEARCH" and not anchors:
+        source = writer_context.get("source_item") or topic
+        statements = source.get("opinion_basis") or source.get("fact_basis") or []
+        if isinstance(statements, str):
+            statements = [statements]
+        statement = next((str(item).strip() for item in statements if str(item).strip()), "")
+        statement = statement or str(
+            source.get("specific_tension") or source.get("current_view")
+            or source.get("observation") or source.get("angle")
+            or source.get("core_claim") or source.get("title") or ""
+        ).strip()
+        if statement:
+            source_id = str(
+                source.get("source_url") or source.get("source_id")
+                or writer_context.get("source_id") or topic.get("claim_key")
+            )
+            reality_ref = "approved:" + hashlib.sha256(
+                f"{source_id}:{statement}".encode("utf-8")
+            ).hexdigest()[:20]
+            anchors.append({
+                "reality_ref": reality_ref, "statement": statement[:1200],
+                "source_ids": [source_id] if source_id else [], "kind": "APPROVED_PREMISE",
+                "epistemic_status": "INFERRED", "observed_at": "",
+            })
+
+    mechanisms = []
+    for fact in verified_facts.get("facts", []):
+        mechanism = fact.get("mechanism") if isinstance(fact, dict) else None
+        if not isinstance(mechanism, dict):
+            continue
+        mechanisms.append({
+            "input": str(mechanism.get("input", "")),
+            "transformation": str(mechanism.get("transformation", "")),
+            "output": str(mechanism.get("output", "")),
+            "supporting_fact_ids": [fact["id"]],
+            "confidence": fact.get("confidence", fact.get("status", "verified")),
+        })
+
+    source_item = writer_context.get("source_item") or {}
+    frictions, counter_signals = [], []
+    if mode != "LIVE_RESEARCH":
+        friction = str(source_item.get("specific_tension") or source_item.get("tension") or "").strip()
+        if friction:
+            frictions.append({"type": "APPROVED_TENSION", "statement": friction[:800], "fact_ids": []})
+        counters = source_item.get("counterevidence", [])
+        if isinstance(counters, str):
+            counters = [counters]
+        counter_signals = [
+            {"statement": str(item)[:800], "fact_ids": []}
+            for item in counters if str(item).strip()
+        ]
+
+    uncertainty_values = topic.get("uncertainties", [])
+    if isinstance(uncertainty_values, str):
+        uncertainty_values = [uncertainty_values]
+    uncertainties = [
+        {"reality_ref": f"uncertainty:{index}", "question": str(value)[:500], "status": "UNKNOWN"}
+        for index, value in enumerate(uncertainty_values)
+        if str(value).strip()
+    ]
+    consensus = []
+    distinct_actors = {item["actor"] for item in observations if item["actor"]}
+    if len(observations) >= 2 and len(distinct_actors) >= 2:
+        consensus.append({
+            "claim": "多个已跟踪公开来源围绕该主题发布了内容",
+            "source_ids": [item["reality_ref"] for item in observations],
+        })
+    primary = anchors[0] if anchors else {}
+    semantic = {
+        "version": REALITY_PAYLOAD_VERSION,
+        "topic_id": str(topic.get("claim_key", "")), "grounding_mode": mode,
+        "primary_observation": {
+            "statement": primary.get("statement", ""),
+            "fact_ids": [primary["reality_ref"]] if primary.get("kind") == "VERIFIED_FACT" else [],
+            "source_ids": primary.get("source_ids", []),
+            "observed_at": primary.get("observed_at", ""),
+        },
+        "concrete_facts": concrete_facts,
+        "observed_behaviors": observations,
+        "mechanisms": mechanisms,
+        "frictions": frictions, "counter_signals": counter_signals, "uncertainties": uncertainties,
+        "consensus_evidence": consensus, "source_dependent_anchors": anchors,
+    }
+    semantic["reality_payload_id"] = "reality:" + hashlib.sha256(json.dumps(
+        semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()[:24]
+    return semantic
+
+
+def grounding_claim_type(topic: dict, thesis: dict) -> str:
+    explicit = str(topic.get("claim_type", "")).upper()
+    if explicit in {"DESCRIPTIVE", "COMPARATIVE", "CAUSAL", "STRUCTURAL", "PREDICTIVE", "NORMATIVE", "ACTIONABLE"}:
+        return explicit
+    thesis_type = str(thesis.get("thesis_type", ""))
+    if thesis_type == "COMPARISON":
+        return "COMPARATIVE"
+    if thesis_type == "PREDICTION":
+        return "PREDICTIVE"
+    if thesis_type == "DECISION" or topic.get("angle_family") == "opportunity":
+        return "ACTIONABLE"
+    if thesis_type == "EXPLANATION":
+        return "CAUSAL"
+    if topic.get("angle_family") == "industry_evaluation":
+        return "STRUCTURAL"
+    if topic.get("angle_family") == "trading_philosophy":
+        return "NORMATIVE"
+    return "DESCRIPTIVE"
+
+
+def compile_grounding_contract(topic: dict, thesis: dict, payload: dict) -> dict:
+    mode = payload.get("grounding_mode") or grounding_mode_for_topic(topic)
+    claim_type = grounding_claim_type(topic, thesis)
+    anchors = [item["reality_ref"] for item in payload.get("source_dependent_anchors", [])]
+    required_count = 1
+    if claim_type in {"COMPARATIVE", "STRUCTURAL"}:
+        required_count = 2
+    required = anchors[:required_count]
+    reasons = []
+    if mode == "LIVE_RESEARCH" and not anchors:
+        reasons.extend(["INSUFFICIENT_REALITY_PAYLOAD", "LOW_SOURCE_DEPENDENCE"])
+    elif len(required) < required_count:
+        reasons.append("INSUFFICIENT_REALITY_PAYLOAD")
+    if claim_type in {"CAUSAL", "PREDICTIVE"} and not payload.get("mechanisms"):
+        reasons.append("MECHANISM_GAP")
+    if claim_type == "PREDICTIVE" and not str(thesis.get("falsifier", "")).strip():
+        reasons.append("CLAIM_STRENGTH_UPGRADE")
+    actionable_fields = {
+        "setup": str(topic.get("action_setup", "")).strip(),
+        "trigger": str(topic.get("action_trigger", "")).strip(),
+        "invalidation": str(topic.get("action_invalidation", "")).strip(),
+        "consequence": str(topic.get("action_consequence", "")).strip(),
+    }
+    if claim_type == "ACTIONABLE" and not all(actionable_fields.values()):
+        reasons.append("INSUFFICIENT_REALITY_PAYLOAD")
+    obligations = [{"type": "PRIMARY_OBSERVATION", "required_refs": required[:1]}]
+    if claim_type in {"COMPARATIVE", "STRUCTURAL"}:
+        obligations.append({"type": "MULTIPLE_REALITY_SIGNALS", "required_refs": required})
+    if claim_type in {"CAUSAL", "PREDICTIVE"}:
+        obligations.append({
+            "type": "MECHANISM_BRIDGE",
+            "required_refs": sorted({
+                fact_id for item in payload.get("mechanisms", [])
+                for fact_id in item.get("supporting_fact_ids", [])
+            }),
+        })
+    if claim_type == "ACTIONABLE":
+        obligations.append({
+            "type": "ACTION_SETUP_TRIGGER_INVALIDATION_CONSEQUENCE",
+            "required_refs": required, "fields": actionable_fields,
+        })
+    contract = {
+        "contract_version": GROUNDING_CONTRACT_VERSION,
+        "thesis_id": thesis.get("thesis_id", ""),
+        "reality_payload_id": payload.get("reality_payload_id", ""),
+        "grounding_mode": mode, "claim_type": claim_type,
+        "required_reality_refs": required,
+        "required_obligations": obligations,
+        "allowed_background_refs": [],
+        "uncertainty_refs": [item["reality_ref"] for item in payload.get("uncertainties", [])],
+        "forbidden_claims": ["unsupported_fact", "unsupported_behavior", "synthetic_consensus"],
+        "consensus_claim_policy": {
+            "requires_evidence": True,
+            "evidence": payload.get("consensus_evidence", []),
+        },
+        "analogy_policy": "EXPLANATION_ONLY_NOT_EVIDENCE",
+        "minimum_grounding_requirements": {
+            "material_anchor_count": required_count,
+            "mechanism_required": claim_type in {"CAUSAL", "PREDICTIVE"},
+            "falsifier_required": claim_type == "PREDICTIVE",
+            "actionable_fields_required": claim_type == "ACTIONABLE",
+        },
+        "preflight_reason_codes": list(dict.fromkeys(reasons)),
+    }
+    contract["grounding_contract_id"] = "grounding:" + hashlib.sha256(json.dumps(
+        contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()[:24]
+    return contract
+
+
+def persist_topic_reality_payloads(run_id: int, raw_cards: dict, topics: list[dict]) -> dict:
+    payloads = {}
+    for topic in topics:
+        if not isinstance(topic, dict) or not topic.get("claim_key"):
+            continue
+        writer_context = {
+            "source_kind": str(topic.get("source_kind", "")),
+            "source_id": str(topic.get("source_id", "")),
+            "source_item": topic,
+            "first_person_allowed": bool(topic.get("first_person_allowed")),
+        }
+        facts = editorial_verified_facts(raw_cards, topic, writer_context)
+        payload = compile_reality_payload(raw_cards, topic, facts, writer_context)
+        payloads[str(topic["claim_key"])] = payload
+    updated = {**raw_cards, "reality_payloads": payloads}
+    with db() as conn:
+        conn.execute(
+            "UPDATE daily_context_runs SET raw_cards=?,updated_at=? WHERE id=?",
+            (json.dumps(updated, ensure_ascii=False), int(time.time()), run_id),
+        )
+    return updated
 
 
 async def enrich_verified_facts_with_github_traction(topic: dict, verified_facts: dict,
@@ -5574,9 +5948,13 @@ async def expand_editorial_angles_gemini(mother_topics: list[dict], daily_contex
         "每个母题输出 0 到 5 个真正互不替代的角度，本批总数最多 8；这是上限，不是配额。"
         "可选 angle_family 只有 opportunity、industry_evaluation、project_evaluation、market_cognition、"
         "trading_philosophy、people_or_community、other，不要求覆盖任何一类。"
-        "angles 每项必须包含 parent_seed_key,claim_key,subject,title,core_claim,angle_family,structure_id,"
+        "angles 每项必须包含 parent_seed_key,claim_key,subject,title,core_claim,angle_family,claim_type,structure_id,"
         "specific_tension,non_obvious_delta,audience_value,why_worth_saying,why_now,statement_mode,persona_fit。"
         "claim_key 只能用小写字母、数字、冒号、下划线或连字符。statement_mode 只能 opinion 或 conditional。"
+        "claim_type 只能是 DESCRIPTIVE、COMPARATIVE、CAUSAL、STRUCTURAL、PREDICTIVE、NORMATIVE、ACTIONABLE，"
+        "并且必须按主张实际证据负担选择，不能为了降低门槛统一写 DESCRIPTIVE。"
+        "ACTIONABLE 角度还必须提供 action_setup、action_trigger、action_invalidation、action_consequence；"
+        "任何一项缺失都不得进入写稿。"
         "structure_id 必须从给定内容结构中选择，它只由这条内容的题材和读者任务决定，不能按人设选择。"
         "参与活动与交易 setup 要分开；资讯解释、配套讲解、开源发现、项目评价和行业分析也不能混成同一结构。"
         "core_claim 必须是一句可争论、能直接说出口的明确结论，不能是问题、背景介绍、名词解释或等待后续。"
@@ -5838,11 +6216,21 @@ async def ensure_editorial_angle_expansion(run_id: int, cards: dict, daily: dict
 
 async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_facts: dict,
                                          grok_context: dict, writer_context: dict,
-                                         rewrite_instruction: str = ""):
+                                         rewrite_instruction: str = "",
+                                         reality_payload: dict | None = None,
+                                         grounding_contract: dict | None = None):
     provider = editorial_provider_config("GEMINI")
     content_domain = editorial_domain_label(topic.get("topic_domain", "crypto"))
     style_recipe = topic.get("style_recipe") if isinstance(topic.get("style_recipe"), dict) else {}
-    section_template = {key: "..." for key in style_recipe.get("section_order", [])}
+    reality_payload = reality_payload or {}
+    grounding_contract = grounding_contract or {}
+    section_template = {
+        key: {
+            "text": "...", "job": "CLAIM|EVIDENCE|MECHANISM|CONTEXT|COUNTER_SIGNAL|UNCERTAINTY|IMPLICATION|EXAMPLE|CONCLUSION",
+            "thesis_relation": "SUPPORT|QUALIFY|CONSTRAIN|EXPLAIN", "reality_refs": [],
+        }
+        for key in style_recipe.get("section_order", [])
+    }
     thesis = topic.get("persona_thesis") if isinstance(topic.get("persona_thesis"), dict) else {}
     frozen_thesis_hash = hashlib.sha256(
         json.dumps(thesis, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -5853,7 +6241,12 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
         "\"reasoning_shape\":[\"hook\",\"...\"],\"facts_used_ids\":[\"fact:...\"],\"stance\":\"...\"}。"
         "sections 的语义槽和必填项是服务器硬约束；reasoning_shape 只能逐字选择 allowed_reasoning_shapes 中的一项。"
         "段落顺序可以在允许形状中变化；每段只写正文，不写 Hook、Context、CTA 等标签，不得把整篇复制进多个字段。\n"
-        "唯一可作为确定事实、数字或日期的材料是 verified_facts（已批准事实依据）；Grok 内容只用于理解前情、圈内争议和语言语境。"
+        "每个 sections 项必须返回 text、job、thesis_relation、reality_refs。EVIDENCE 段必须引用 RealityPayload 中的 ID；"
+        "MECHANISM 段只能引用 GroundingContract 允许的 mechanism evidence。"
+        "唯一可作为确定事实、数字、日期、行为或共识的材料是 RealityPayload 与 verified_facts；Grok 内容只用于理解前情、圈内争议和语言语境。"
+        "required_reality_refs 必须全部进入正文并真实参与论证，不能只在背景里点名。Writer 无权补造 RealityPayload。"
+        "不得发明数字、日期、参与者、用户行为、市场共识、来源观察或机制；不得把 UNKNOWN 写成答案、INFERRED 写成 FACT。"
+        "‘大家都觉得/市场普遍认为/越来越多人’等表达只有 consensus_evidence 允许时才能写。类比只能解释，不能承担证据义务。"
         "X 上重复出现的说法仍只是观点。必须给清楚判断和现实后果，不写研报、免责声明、标题、来源列表或观察清单。"
         "若 verified_facts.facts 为空，不得写日期、价格、比例、数量或已被确认的事实；只能写明确标出的观点、解释或判断。"
         "TermMax S1、x402、L2 这类项目或协议标识可以照常写，它们不属于数字断言。"
@@ -5885,6 +6278,8 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
         f"选题：{json.dumps(topic, ensure_ascii=False)}\n"
         f"本条行文结构：{json.dumps(style_recipe, ensure_ascii=False)}\n"
         f"verified_facts：{json.dumps(verified_facts, ensure_ascii=False)}\n"
+        f"RealityPayload：{json.dumps(reality_payload, ensure_ascii=False)}\n"
+        f"GroundingContract：{json.dumps(grounding_contract, ensure_ascii=False)}\n"
         f"Grok 背景：{json.dumps({'text': grok_context.get('text', ''), 'citations': grok_context.get('citations', [])}, ensure_ascii=False)}\n"
         f"第一人称权限：{json.dumps(minimal_editorial_writer_context(writer_context), ensure_ascii=False)}"
     )
@@ -5905,7 +6300,7 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
             )
         response.raise_for_status()
     result = chat_completion_json(response.json())
-    text, sections = assemble_editorial_sections(result, style_recipe)
+    text, sections, paragraphs = assemble_editorial_sections(result, style_recipe)
     if thesis and normalize_editorial_claim(result.get("stance")) != normalize_editorial_claim(thesis.get("primary_claim")):
         raise RuntimeError("Gemini stance 未忠实返回 Persona Thesis")
     valid_fact_ids = {item["id"] for item in verified_facts.get("facts", [])}
@@ -5915,6 +6310,18 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
     facts_used = [item for item in raw_facts_used if item]
     if any(item not in valid_fact_ids for item in facts_used):
         raise RuntimeError("Gemini 引用了未提供的事实编号")
+    valid_reality_refs = {
+        item.get("reality_ref") for item in reality_payload.get("source_dependent_anchors", [])
+        if item.get("reality_ref")
+    } | {
+        item.get("reality_ref") for item in reality_payload.get("uncertainties", [])
+        if item.get("reality_ref")
+    }
+    used_reality_refs = {
+        ref for item in paragraphs for ref in item.get("reality_refs", [])
+    }
+    if any(ref not in valid_reality_refs for ref in used_reality_refs):
+        raise RuntimeError("Gemini 引用了未提供的 Reality Ref")
     thesis_fact_ids = {
         fact_id
         for basis in thesis.get("supporting_basis", []) if isinstance(basis, dict)
@@ -5927,11 +6334,16 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
     return {
         "text": text,
         "sections": sections,
+        "paragraphs": paragraphs,
         "facts_used_ids": facts_used,
+        "used_reality_refs": sorted(used_reality_refs),
         "stance": str(result.get("stance", "")).strip(),
         "reasoning_shape": result.get("reasoning_shape") or style_recipe.get("allowed_reasoning_shapes", [[]])[0],
         "frozen_thesis_hash": frozen_thesis_hash,
         "style_id": str(style_recipe.get("id", "")),
+        "grounding_contract_version": (
+            GROUNDING_CONTRACT_VERSION if grounding_contract else ""
+        ),
         "model": provider["model"],
     }
 
@@ -5962,6 +6374,217 @@ def deterministic_editorial_style_failures(post: str, writer_context: dict, veri
     if any(phrase in text for phrase in boilerplate) or re.search(r"^\s*不是.{1,30}而是", text):
         failures.append("AI 模板或常识性空话")
     return failures
+
+
+CONSENSUS_CLAIM_RE = re.compile(
+    r"大家都(?:觉得|认为)|市场普遍(?:认为|觉得|将)|主流观点(?:是|认为)|"
+    r"越来越多人(?:认为|觉得)|社区普遍(?:认为|觉得)|投资者都在押注|"
+    r"开发者正在转向|用户开始认为"
+)
+BEHAVIOR_CLAIM_RE = re.compile(r"(?:用户|开发者|投资者|交易者|机构)(?:开始|正在|纷纷|大量|越来越)(?:使用|转向|购买|离开|涌入|押注|升级)")
+ANALOGY_RE = re.compile(r"像是|就像|如同|相当于|类似于")
+
+
+def validate_editorial_grounding(draft: dict, payload: dict, contract: dict,
+                                  style_recipe: dict) -> dict:
+    if draft.get("grounding_contract_version") != GROUNDING_CONTRACT_VERSION:
+        return {
+            "decision": "PASS", "reason_codes": [], "required_reality_refs": [],
+            "used_reality_refs": [], "source_dependency_status": "LEGACY_COMPAT",
+            "mechanism_status": "NOT_CHECKED", "consensus_status": "NOT_CHECKED",
+            "uncertainty_status": "NOT_CHECKED", "details": [],
+        }
+    reasons = list(contract.get("preflight_reason_codes", []))
+    annotations = draft.get("paragraphs", [])
+    if not isinstance(annotations, list):
+        annotations = []
+    allowed = {
+        item.get("reality_ref") for item in payload.get("source_dependent_anchors", [])
+        if item.get("reality_ref")
+    } | {
+        item.get("reality_ref") for item in payload.get("uncertainties", [])
+        if item.get("reality_ref")
+    }
+    required = set(contract.get("required_reality_refs", []))
+    used, details = set(), []
+    for paragraph in annotations:
+        if not isinstance(paragraph, dict):
+            continue
+        refs = {str(item) for item in paragraph.get("reality_refs", []) if str(item)}
+        used.update(refs)
+        if refs - allowed:
+            reasons.append("UNSUPPORTED_FACT")
+            details.append({"section": paragraph.get("section", ""), "missing_refs": sorted(refs - allowed)})
+        if paragraph.get("job") == "EVIDENCE" and not refs:
+            reasons.append("UNSUPPORTED_FACT")
+        text = str(paragraph.get("text", ""))
+        if CONSENSUS_CLAIM_RE.search(text):
+            evidence_refs = {
+                ref for item in contract.get("consensus_claim_policy", {}).get("evidence", [])
+                for ref in item.get("source_ids", [])
+            }
+            if not evidence_refs or not (refs & evidence_refs):
+                reasons.append("UNSUPPORTED_CONSENSUS_CLAIM")
+        if BEHAVIOR_CLAIM_RE.search(text) and not refs:
+            reasons.append("UNSUPPORTED_BEHAVIOR_CLAIM")
+        if paragraph.get("job") in {"EVIDENCE", "MECHANISM"} and ANALOGY_RE.search(text):
+            mechanism_refs = {
+                ref for item in payload.get("mechanisms", [])
+                for ref in item.get("supporting_fact_ids", [])
+            }
+            if not (refs & mechanism_refs):
+                reasons.append("ANALOGY_AS_EVIDENCE")
+    missing = required - used
+    if missing:
+        reasons.append("REALITY_REF_NOT_USED")
+        details.append({"missing_required_reality_refs": sorted(missing)})
+
+    mechanism_status = "NOT_REQUIRED"
+    if contract.get("minimum_grounding_requirements", {}).get("mechanism_required"):
+        mechanism_refs = {
+            ref for item in payload.get("mechanisms", [])
+            for ref in item.get("supporting_fact_ids", [])
+        }
+        mechanism_used = any(
+            item.get("job") == "MECHANISM"
+            and set(item.get("reality_refs", [])) & mechanism_refs
+            for item in annotations if isinstance(item, dict)
+        )
+        mechanism_status = "COMPLETE" if mechanism_used else "GAP"
+        if not mechanism_used:
+            reasons.append("MECHANISM_GAP")
+
+    uncertainty_refs = set(contract.get("uncertainty_refs", []))
+    uncertainty_status = "NOT_REQUIRED"
+    if uncertainty_refs:
+        uncertainty_status = "PRESERVED" if uncertainty_refs.issubset(used) else "DROPPED"
+        if uncertainty_status == "DROPPED":
+            reasons.append("UNCERTAINTY_DROPPED")
+
+    if contract.get("grounding_mode") == "LIVE_RESEARCH":
+        reasoning_refs = set()
+        repeated = {}
+        for item in annotations:
+            if not isinstance(item, dict):
+                continue
+            refs = set(item.get("reality_refs", [])) & required
+            if item.get("job") in {"CLAIM", "MECHANISM", "IMPLICATION", "CONCLUSION"}:
+                reasoning_refs.update(refs)
+            for ref in refs:
+                repeated[ref] = repeated.get(ref, 0) + 1
+        if required and not reasoning_refs and not any(count >= 2 for count in repeated.values()):
+            reasons.append("LOW_REALITY_CONTRIBUTION")
+
+    text_length = sum(len(str(item.get("text", ""))) for item in annotations if isinstance(item, dict)) or 1
+    background_length = sum(
+        len(str(item.get("text", ""))) for item in annotations
+        if isinstance(item, dict) and item.get("job") == "CONTEXT" and not item.get("reality_refs")
+    )
+    max_background = float(style_recipe.get("max_generic_background_ratio", 0.4))
+    if contract.get("grounding_mode") == "LIVE_RESEARCH" and background_length / text_length > max_background:
+        reasons.append("EXCESSIVE_GENERIC_BACKGROUND")
+
+    inferred_only = bool(payload.get("source_dependent_anchors")) and all(
+        item.get("epistemic_status") == "INFERRED"
+        for item in payload.get("source_dependent_anchors", [])
+    )
+    if inferred_only and re.search(r"证明了|必然|毫无疑问|确定会", str(draft.get("text", ""))):
+        reasons.append("CLAIM_STRENGTH_UPGRADE")
+
+    reasons = list(dict.fromkeys(code for code in reasons if code in GROUNDING_FAILURE_CODES))
+    research_codes = {
+        "INSUFFICIENT_REALITY_PAYLOAD", "LOW_SOURCE_DEPENDENCE", "MECHANISM_GAP",
+        "SOURCE_DRAFT_CONTRADICTION",
+    }
+    decision = "PASS"
+    if set(reasons) & research_codes:
+        decision = "RETURN_TO_RESEARCH"
+    elif reasons:
+        decision = "REPAIR"
+    return {
+        "decision": decision, "reason_codes": reasons,
+        "required_reality_refs": sorted(required), "used_reality_refs": sorted(used),
+        "source_dependency_status": "PASS" if not ({"LOW_SOURCE_DEPENDENCE", "LOW_REALITY_CONTRIBUTION"} & set(reasons)) else "FAIL",
+        "mechanism_status": mechanism_status,
+        "consensus_status": "FAIL" if "UNSUPPORTED_CONSENSUS_CLAIM" in reasons else "PASS",
+        "uncertainty_status": uncertainty_status, "details": details,
+    }
+
+
+def grounding_repair_instruction(review: dict) -> str:
+    instructions = {
+        "LOW_REALITY_CONTRIBUTION": "让已批准的现实锚点直接参与判断或机制，不要只在背景段提一次。",
+        "UNSUPPORTED_FACT": "删除未绑定 Reality Ref 的事实，只能使用 RealityPayload 中的材料。",
+        "UNSUPPORTED_CONSENSUS_CLAIM": "删除‘大家都认为/市场普遍认为’等共识措辞；除非逐段绑定共识证据。",
+        "UNSUPPORTED_BEHAVIOR_CLAIM": "删除未经来源支持的用户、开发者或投资者行为描述。",
+        "ANALOGY_AS_EVIDENCE": "类比只能帮助解释，不能承担证据或机制证明；改用已批准现实锚点。",
+        "CLAIM_STRENGTH_UPGRADE": "恢复材料原有的不确定强度，不得把可能、迹象或推断写成确定事实。",
+        "UNCERTAINTY_DROPPED": "把 GroundingContract 要求保留的未知项明确写回正文。",
+        "EXCESSIVE_GENERIC_BACKGROUND": "删除基础概念和通用背景，把篇幅留给现实材料与推理。",
+        "REALITY_REF_NOT_USED": "使用全部 required_reality_refs，并让它们参与核心论证。",
+    }
+    return " ".join(instructions[code] for code in review.get("reason_codes", []) if code in instructions)
+
+
+async def review_editorial_grounding_gemini(topic: dict, thesis: dict, payload: dict,
+                                             contract: dict, draft: dict) -> dict:
+    provider = editorial_provider_config("GEMINI")
+    prompt = (
+        "你是独立 Grounding Validator，不是文案编辑。只输出 JSON："
+        "{\"decision\":\"PASS|REPAIR|RETURN_TO_RESEARCH|DROP\","
+        "\"reason_codes\":[\"LOW_REALITY_CONTRIBUTION\"],"
+        "\"details\":[{\"claim\":\"...\",\"missing_reality\":\"...\"}]}。"
+        "逐段检查：Thesis 是否真的依赖 RealityPayload；required refs 是否参与推理；是否新增事实、行为或共识；"
+        "类比是否被当成证据；因果机制是否完整；claim strength 和 uncertainty 是否保留；"
+        "删除现实锚点后正文是否仍基本完整；背景是否压过现实材料；是否出现 synthetic example；"
+        "正文是否与 source observation 矛盾。不要评价文风，不要补材料，不要替 Writer 改稿。"
+        "Research 缺失、MECHANISM_GAP 或 source contradiction 必须 RETURN_TO_RESEARCH；"
+        "可通过删除措辞、压缩背景或恢复不确定性修复的才是 REPAIR。\n\n"
+        f"允许的 reason codes：{json.dumps(sorted(GROUNDING_FAILURE_CODES), ensure_ascii=False)}\n"
+        f"Topic：{json.dumps(topic, ensure_ascii=False)}\n"
+        f"ThesisContract：{json.dumps(thesis, ensure_ascii=False)}\n"
+        f"RealityPayload：{json.dumps(payload, ensure_ascii=False)}\n"
+        f"GroundingContract：{json.dumps(contract, ensure_ascii=False)}\n"
+        f"Draft：{json.dumps(draft, ensure_ascii=False)}"
+    )
+    async with httpx.AsyncClient(timeout=240) as client:
+        async with gemini_request_key(provider) as key:
+            response = await client.post(
+                provider["base_url"] + "/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                },
+                json={
+                    "model": provider["model"], "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"}, "temperature": 0,
+                    "max_tokens": 3000,
+                },
+            )
+        response.raise_for_status()
+    result = chat_completion_json(response.json())
+    decision = str(result.get("decision", "RETURN_TO_RESEARCH")).upper()
+    if decision not in {"PASS", "REPAIR", "RETURN_TO_RESEARCH", "DROP"}:
+        raise RuntimeError("Grounding Validator decision 非法")
+    codes = list(dict.fromkeys(
+        str(code) for code in result.get("reason_codes", [])
+        if str(code) in GROUNDING_FAILURE_CODES
+    ))
+    if decision != "PASS" and not codes:
+        raise RuntimeError("Grounding Validator 拒绝但未给 reason code")
+    if decision == "PASS" and codes:
+        decision = "RETURN_TO_RESEARCH" if set(codes) & {
+            "INSUFFICIENT_REALITY_PAYLOAD", "LOW_SOURCE_DEPENDENCE", "MECHANISM_GAP",
+            "SOURCE_DRAFT_CONTRADICTION",
+        } else "REPAIR"
+    details = result.get("details", [])
+    if not isinstance(details, list):
+        raise RuntimeError("Grounding Validator details 非法")
+    return {
+        "decision": decision, "reason_codes": codes,
+        "details": [item for item in details[:12] if isinstance(item, dict)],
+        "model": provider["model"], "mode": "semantic_grounding_validator",
+    }
 
 
 def reopen_daily_supplement_guard_rejections(run_id: int | None = None):
@@ -6016,13 +6639,15 @@ def reopen_required_public_angle_rejections(run_id: int | None = None):
             if not assignments:
                 continue
             rows = conn.execute(
-                """SELECT e.id,e.topic_json,e.generation_state,p.slug
+                """SELECT e.id,e.topic_json,e.generation_state,e.reason_code,p.slug
                    FROM persona_editorial_evaluations e
                    JOIN personas p ON p.id=e.persona_id
                    WHERE e.run_id=? AND e.status='HOLD'""",
                 (run["id"],),
             ).fetchall()
             for row in rows:
+                if row["reason_code"] in GROUNDING_FAILURE_CODES:
+                    continue
                 topic = json_value(row["topic_json"], {})
                 if assignments.get(str(topic.get("claim_key", ""))) != row["slug"]:
                     continue
@@ -6088,11 +6713,15 @@ def thesis_repair_instruction(adherence: dict, thesis: dict) -> str:
 
 async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_facts: dict,
                                            grok_context: dict, writer_context: dict, draft: dict,
-                                           deterministic_failures: list[str]):
+                                           deterministic_failures: list[str],
+                                           reality_payload: dict | None = None,
+                                           grounding_contract: dict | None = None):
     provider = editorial_provider_config("GEMINI")
     critic_grok_context = {**grok_context, "text": str(grok_context.get("text", ""))[:5000]}
     content_domain = editorial_domain_label(topic.get("topic_domain", "crypto"))
     style_recipe = topic.get("style_recipe") if isinstance(topic.get("style_recipe"), dict) else {}
+    reality_payload = reality_payload or {}
+    grounding_contract = grounding_contract or {}
     prompt = (
         f"你是中文 {content_domain} 内容主编。只输出 JSON：{{\"adherence\":{{\"verdict\":\"PASS或REJECT\","
         "\"reason_codes\":[\"THESIS_DRIFT\"],\"spans\":[{\"text\":\"...\",\"classification\":\"SUPPORTS_THESIS\"}]}},"
@@ -6129,10 +6758,14 @@ async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_
         "仍须拒绝把它伪装成新发生的事实、名人直接引语或万能鸡汤。"
         "source_mode=paraphrase 时，正文出现引号、‘某某说过’或把 source_name 当作未经提供的事实，一律 REJECT。"
         "但条件句里夹带的价格、比例、日期、数量或已发生事件仍须 verified_facts。\n\n"
+        "Grounding Validator 已在你之前运行。你只能改善表达，不能通过补数字、行为、共识、机制或来源事实来修复证据缺口；"
+        "发现缺证据必须 REJECT，不得编造后放行。每个 substantive paragraph 的 Reality Ref 必须与实际语义相符。\n\n"
         f"永久成稿门槛：{json.dumps(topic_selection_policy().get('draft_quality_gates', []), ensure_ascii=False)}\n"
         f"人设：{json.dumps(persona, ensure_ascii=False)}\n题目：{json.dumps(topic, ensure_ascii=False)}\n"
         f"本条行文结构：{json.dumps(style_recipe, ensure_ascii=False)}\n"
         f"verified_facts：{json.dumps(verified_facts, ensure_ascii=False)}\n"
+        f"RealityPayload：{json.dumps(reality_payload, ensure_ascii=False)}\n"
+        f"GroundingContract：{json.dumps(grounding_contract, ensure_ascii=False)}\n"
         f"Grok 背景：{json.dumps(critic_grok_context, ensure_ascii=False)}\n"
         f"第一人称权限：{json.dumps(minimal_editorial_writer_context(writer_context), ensure_ascii=False)}\n"
         f"确定性检查：{json.dumps(deterministic_failures, ensure_ascii=False)}\n"
@@ -6290,7 +6923,8 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             "scope", "source_kind", "source_id", "source_refs", "angle", "asset_ids",
             "first_person_allowed", "parent_seed_key", "parent_claim_keys", "angle_family",
             "specific_tension", "non_obvious_delta", "why_worth_saying", "statement_mode",
-            "topic_domain", "structure_id", "style_recipe",
+            "topic_domain", "structure_id", "style_recipe", "claim_type", "uncertainties",
+            "action_setup", "action_trigger", "action_invalidation", "action_consequence",
             "hot_pool_origin_date", "hot_pool_age_days",
         )
         compact_topic = {}
@@ -6326,6 +6960,7 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
         state = json_value(evaluation.get("generation_state"), {})
         if not isinstance(state, dict):
             state = {}
+        previous_grounding_version = state.get("grounding_contract_version")
         frozen_thesis_hash = hashlib.sha256(
             json.dumps(thesis, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -6361,6 +6996,33 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             else:
                 verified_facts = cached_facts
 
+            reality_payload = compile_reality_payload(
+                raw_cards, compact_topic, verified_facts, writer_context
+            )
+            grounding_contract = compile_grounding_contract(
+                compact_topic, thesis, reality_payload
+            )
+            state.update({
+                "reality_payload": reality_payload,
+                "grounding_contract": grounding_contract,
+                "grounding_contract_version": GROUNDING_CONTRACT_VERSION,
+            })
+            if grounding_contract["preflight_reason_codes"]:
+                state["grounding_review"] = validate_editorial_grounding(
+                    {"grounding_contract_version": GROUNDING_CONTRACT_VERSION, "paragraphs": []},
+                    reality_payload, grounding_contract, compact_topic["style_recipe"],
+                )
+                persist_persona_editorial_generation_state(
+                    evaluation, "grounding_return_to_research", state
+                )
+                with db() as conn:
+                    supersede_persona_editorial_evaluation(
+                        conn, evaluation["id"], grounding_contract["preflight_reason_codes"][0],
+                        "GroundingContract 未满足写稿前证据义务："
+                        + ",".join(grounding_contract["preflight_reason_codes"]),
+                    )
+                continue
+
             structure_revision = compact_topic["style_recipe"]["revision"]
             cached_structure_revision = int(
                 state.get("structure_revision")
@@ -6381,13 +7043,21 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                 ):
                     continue
 
+            if state.get("draft") and previous_grounding_version != GROUNDING_CONTRACT_VERSION:
+                for key in (
+                    "draft", "draft_failures", "grounding_review", "grounding_rewrite",
+                    "critic", "rewrite", "rewrite_failures", "final_critic",
+                ):
+                    state.pop(key, None)
+
             generated = state.get("draft")
             failures = state.get("draft_failures")
             if not isinstance(generated, dict) or not isinstance(failures, list):
                 if not persist_persona_editorial_generation_state(evaluation, "draft_generating", state):
                     continue
                 generated = await write_persona_editorial_gemini(
-                    persona, compact_topic, verified_facts, grok_context, writer_context
+                    persona, compact_topic, verified_facts, grok_context, writer_context,
+                    reality_payload=reality_payload, grounding_contract=grounding_contract,
                 )
                 failures = deterministic_editorial_style_failures(
                     generated["text"], writer_context, verified_facts
@@ -6418,12 +7088,115 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                     continue
             attempts = int(state.get("writer_attempts") or 1)
 
+            grounding_review = validate_editorial_grounding(
+                generated, reality_payload, grounding_contract, compact_topic["style_recipe"]
+            )
+            state["grounding_review"] = grounding_review
+            if grounding_review["decision"] == "RETURN_TO_RESEARCH":
+                persist_persona_editorial_generation_state(
+                    evaluation, "grounding_return_to_research", state
+                )
+                with db() as conn:
+                    supersede_persona_editorial_evaluation(
+                        conn, evaluation["id"], grounding_review["reason_codes"][0],
+                        "Grounding Validator 退回研究："
+                        + ",".join(grounding_review["reason_codes"]),
+                    )
+                continue
+            if grounding_review["decision"] == "REPAIR":
+                rewritten = await write_persona_editorial_gemini(
+                    persona, compact_topic, verified_facts, grok_context, writer_context,
+                    grounding_repair_instruction(grounding_review),
+                    reality_payload=reality_payload, grounding_contract=grounding_contract,
+                )
+                rewritten_failures = deterministic_editorial_style_failures(
+                    rewritten["text"], writer_context, verified_facts
+                )
+                rewritten_grounding = validate_editorial_grounding(
+                    rewritten, reality_payload, grounding_contract, compact_topic["style_recipe"]
+                )
+                attempts += 1
+                state.update({
+                    "grounding_rewrite": rewritten,
+                    "grounding_rewrite_failures": rewritten_failures,
+                    "grounding_final_review": rewritten_grounding,
+                    "writer_attempts": attempts,
+                })
+                if rewritten_grounding["decision"] != "PASS":
+                    persist_persona_editorial_generation_state(
+                        evaluation, "grounding_failed", state
+                    )
+                    with db() as conn:
+                        supersede_persona_editorial_evaluation(
+                            conn, evaluation["id"], rewritten_grounding["reason_codes"][0],
+                            "Grounding 定向修复后仍失败："
+                            + ",".join(rewritten_grounding["reason_codes"]),
+                        )
+                    continue
+                generated, failures = rewritten, rewritten_failures
+                if not persist_persona_editorial_generation_state(
+                    evaluation, "grounding_ready", state
+                ):
+                    continue
+
+            if generated.get("grounding_contract_version") == GROUNDING_CONTRACT_VERSION:
+                semantic_grounding = await review_editorial_grounding_gemini(
+                    compact_topic, thesis, reality_payload, grounding_contract, generated
+                )
+                state["semantic_grounding_review"] = semantic_grounding
+                if semantic_grounding["decision"] == "REPAIR":
+                    semantic_rewrite = await write_persona_editorial_gemini(
+                        persona, compact_topic, verified_facts, grok_context, writer_context,
+                        grounding_repair_instruction(semantic_grounding)
+                        + " 只使用现有 RealityPayload，不得搜索或补造事实。",
+                        reality_payload=reality_payload, grounding_contract=grounding_contract,
+                    )
+                    semantic_failures = deterministic_editorial_style_failures(
+                        semantic_rewrite["text"], writer_context, verified_facts
+                    )
+                    deterministic_grounding = validate_editorial_grounding(
+                        semantic_rewrite, reality_payload, grounding_contract,
+                        compact_topic["style_recipe"],
+                    )
+                    attempts += 1
+                    if deterministic_grounding["decision"] == "PASS":
+                        semantic_grounding = await review_editorial_grounding_gemini(
+                            compact_topic, thesis, reality_payload, grounding_contract,
+                            semantic_rewrite,
+                        )
+                    state.update({
+                        "semantic_grounding_rewrite": semantic_rewrite,
+                        "semantic_grounding_deterministic_review": deterministic_grounding,
+                        "semantic_grounding_final_review": semantic_grounding,
+                        "writer_attempts": attempts,
+                    })
+                    if (
+                        deterministic_grounding["decision"] == "PASS"
+                        and semantic_grounding["decision"] == "PASS"
+                    ):
+                        generated, failures = semantic_rewrite, semantic_failures
+                if semantic_grounding["decision"] != "PASS":
+                    persist_persona_editorial_generation_state(
+                        evaluation, "semantic_grounding_failed", state
+                    )
+                    with db() as conn:
+                        supersede_persona_editorial_evaluation(
+                            conn, evaluation["id"], semantic_grounding["reason_codes"][0],
+                            "独立 Grounding Validator 未通过："
+                            + ",".join(semantic_grounding["reason_codes"]),
+                        )
+                    continue
+                if not persist_persona_editorial_generation_state(
+                    evaluation, "semantic_grounding_ready", state
+                ):
+                    continue
+
             critic = state.get("critic")
             needs_critic = editorial_always_critique() or bool(failures)
             if needs_critic and not isinstance(critic, dict):
                 critic = await critique_persona_editorial_draft(
                     persona, compact_topic, verified_facts, grok_context,
-                    writer_context, generated, failures,
+                    writer_context, generated, failures, reality_payload, grounding_contract,
                 )
                 state["critic"] = critic
                 if not persist_persona_editorial_generation_state(evaluation, "critique_ready", state):
@@ -6451,6 +7224,7 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                     rewritten = await write_persona_editorial_gemini(
                         persona, compact_topic, verified_facts, grok_context, writer_context,
                         repair_instruction,
+                        reality_payload=reality_payload, grounding_contract=grounding_contract,
                     )
                     rewritten_failures = deterministic_editorial_style_failures(
                         rewritten["text"], writer_context, verified_facts
@@ -6465,12 +7239,32 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                     if not persist_persona_editorial_generation_state(evaluation, "rewrite_ready", state):
                         continue
                 generated, failures = rewritten, rewritten_failures
+                rewritten_grounding = validate_editorial_grounding(
+                    generated, reality_payload, grounding_contract, compact_topic["style_recipe"]
+                )
+                state["post_editor_grounding_review"] = rewritten_grounding
+                if rewritten_grounding["decision"] != "PASS":
+                    critic = {
+                        "verdict": "REJECT",
+                        "reasons": rewritten_grounding["reason_codes"],
+                        "adherence": adherence,
+                    }
+                    persist_persona_editorial_generation_state(
+                        evaluation, "post_editor_grounding_failed", state
+                    )
+                    with db() as conn:
+                        supersede_persona_editorial_evaluation(
+                            conn, evaluation["id"], rewritten_grounding["reason_codes"][0],
+                            "Editor 定向重写后破坏 Grounding："
+                            + ",".join(rewritten_grounding["reason_codes"]),
+                        )
+                    continue
                 if editorial_always_critique():
                     critic = state.get("final_critic")
                     if not isinstance(critic, dict):
                         critic = await critique_persona_editorial_draft(
                             persona, compact_topic, verified_facts, grok_context,
-                            writer_context, generated, failures,
+                            writer_context, generated, failures, reality_payload, grounding_contract,
                         )
                         state["final_critic"] = critic
                         if not persist_persona_editorial_generation_state(
@@ -6514,7 +7308,14 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                 )
             },
             "verified_facts": verified_facts,
+            "reality_payload": reality_payload,
+            "grounding_contract": grounding_contract,
+            "grounding_review": state.get("post_editor_grounding_review")
+            or state.get("grounding_final_review") or state.get("grounding_review"),
+            "semantic_grounding_review": state.get("semantic_grounding_final_review")
+            or state.get("semantic_grounding_review", {}),
             "facts_used_ids": generated["facts_used_ids"],
+            "used_reality_refs": generated.get("used_reality_refs", []),
             "stance": generated["stance"],
             "grok": {
                 "model": grok_context["model"], "citations": grok_context["citations"],
@@ -6533,7 +7334,7 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                 "mode": critic.get("mode", "llm_critic"),
                 "model": critic.get("model", ""),
             },
-            "lineage_kind": "thesis_contract_v1_candidate",
+            "lineage_kind": "thesis_grounding_contract_v1_candidate",
             "thesis_adherence": adherence,
         }
         now = int(time.time())
@@ -6716,6 +7517,7 @@ async def run_persona_editorial_pipeline(run_id: int | None = None):
                 "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run["id"],)
             ).fetchone()[0], {})
         public_topics = expanded_topics if expanded_topics is not None else []
+        cards = persist_topic_reality_payloads(run["id"], cards, public_topics)
         evaluation_semaphore = asyncio.Semaphore(editorial_evaluation_concurrency())
 
         async def evaluate_one_persona(persona_row):

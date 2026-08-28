@@ -110,7 +110,7 @@ class AppTest(unittest.TestCase):
                 "tool_usage": ["x_search", "web_search"], "model": "grok-test",
             }
 
-        async def legacy_gemini(_persona, topic, facts, _grok, _writer_context, _rewrite=""):
+        async def legacy_gemini(_persona, topic, facts, _grok, _writer_context, _rewrite="", **_kwargs):
             generated = await self.app_module.generate_persona_post(
                 0,
                 self.app_module.PostGenerationIn(
@@ -122,7 +122,7 @@ class AppTest(unittest.TestCase):
                 text += "补充文字只为覆盖原有状态流转测试所需长度，不增加任何外部事实，也不影响该测试关注的生成、冲突和候选入库边界。此处保持语义中性，确保旧断言仍只验证对应流程。"
             return {"text": text, "facts_used_ids": [], "stance": "测试判断", "model": "gemini-test"}
 
-        async def legacy_critic(*_args):
+        async def legacy_critic(*_args, **_kwargs):
             return {"verdict": "PASS", "reasons": [], "rewrite_instruction": ""}
 
         async def legacy_angle_expansion(_run_id, cards, _daily):
@@ -350,6 +350,10 @@ class AppTest(unittest.TestCase):
             "why_now": "母池今天集中讨论资金结构。",
             "statement_mode": "opinion",
             "persona_fit": ["axu"],
+            "action_setup": "已有可核验的参与条件。",
+            "action_trigger": "条件满足后才执行。",
+            "action_invalidation": "条件失效则停止。",
+            "action_consequence": "执行后承担对应成本和结果。",
         }
 
     def insert_pending_editorial_write(self, run_id, context_date, topic, *, slug="acheng",
@@ -1139,13 +1143,14 @@ class AppTest(unittest.TestCase):
         })
         trade_sections = {key: f"{key} 内容" for key in trade["section_order"]}
         trade_sections["cta"] = "如果确认条件成立，可以考虑按计划执行。"
-        text, saved = self.app_module.assemble_editorial_sections(
+        text, saved, annotations = self.app_module.assemble_editorial_sections(
             {"sections": trade_sections}, trade,
         )
         self.assertEqual(text.split("\n\n"), [
             trade_sections[key] for key in trade["section_order"]
         ])
         self.assertEqual(saved, trade_sections)
+        self.assertEqual([item["section"] for item in annotations], trade["section_order"])
 
         missing_cta = {**trade_sections, "cta": ""}
         with self.assertRaisesRegex(RuntimeError, "必填内容段"):
@@ -1238,7 +1243,7 @@ class AppTest(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM post_candidates").fetchone()[0], 0)
 
     def test_angle_expansion_persists_before_persona_evaluation(self):
-        parent = self.mother_topic()
+        parent = {**self.mother_topic(), "source_refs": ["x:btc:1", "x:btc:2"]}
         run_id = self.create_editorial_run("2026-08-21", topics=[parent])
         researched = {
             "text": "BTC 资金来源与山寨币外溢仍有争议。",
@@ -1301,7 +1306,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(cards["selected_topics"][0]["claim_key"], "btc-mother")
         for topic in stage["expanded_topics"]:
             self.assertEqual(topic["source_topic_keys"], ["discussion:btc"])
-            self.assertEqual(topic["source_refs"], ["x:btc:1"])
+            self.assertEqual(topic["source_refs"], ["x:btc:1", "x:btc:2"])
         with self.app_module.db() as conn:
             evaluation = conn.execute(
                 """SELECT status,candidate_id FROM persona_editorial_evaluations
@@ -2598,7 +2603,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(audit["stance"], "先重算判断基准")
         self.assertEqual(audit["gemini"], {
             "model": "gemini-3.1-pro-preview", "attempts": 1,
-            "structure_id": "news_explainer", "structure_revision": 3,
+            "structure_id": "news_explainer", "structure_revision": 4,
         })
         self.assertEqual(audit["critic"]["verdict"], "PASS")
         self.assertEqual(audit["critic"]["mode"], "llm_critic")
@@ -2695,6 +2700,10 @@ class AppTest(unittest.TestCase):
             "claim_key": "crypto-opportunity-structure", "title": "小资金流动性活动",
             "topic_domain": "crypto", "angle_family": "opportunity",
             "core_claim": "参与条件合适时可以把收益和成本一起粗算后参与。",
+            "action_setup": "活动规则与成本已经明确。",
+            "action_trigger": "粗算后的正向空间覆盖资金占用。",
+            "action_invalidation": "规则、成本或退出条件变化。",
+            "action_consequence": "条件成立时小资金可以参与。",
         }
         run_id = self.create_editorial_run(context_date, topics=[topic])
         self.insert_pending_editorial_write(run_id, context_date, topic, slug="atuo")
@@ -6572,6 +6581,165 @@ class AppTest(unittest.TestCase):
         )
         self.assertIn(contract["primary_claim"], instruction)
         self.assertNotIn("重新选择", instruction)
+
+    def grounding_fixture(self, *, claim_type="DESCRIPTIVE", anchors=1, mechanisms=False,
+                          epistemic_status="KNOWN"):
+        payload = {
+            "version": self.app_module.REALITY_PAYLOAD_VERSION,
+            "reality_payload_id": "reality:test",
+            "topic_id": "grounding:test",
+            "grounding_mode": "LIVE_RESEARCH",
+            "primary_observation": {"statement": "现实观察", "fact_ids": ["fact:1"], "source_ids": ["source:1"], "observed_at": "2026-08-28"},
+            "concrete_facts": [], "observed_behaviors": [],
+            "mechanisms": ([{
+                "input": "A", "transformation": "B", "output": "C",
+                "supporting_fact_ids": ["fact:1"], "confidence": "verified",
+            }] if mechanisms else []),
+            "frictions": [], "counter_signals": [], "uncertainties": [],
+            "consensus_evidence": [],
+            "source_dependent_anchors": [
+                {
+                    "reality_ref": f"fact:{index + 1}", "statement": f"现实观察 {index + 1}",
+                    "source_ids": [f"source:{index + 1}"], "kind": "VERIFIED_FACT",
+                    "epistemic_status": epistemic_status,
+                }
+                for index in range(anchors)
+            ],
+        }
+        topic = {
+            "claim_key": "grounding:test", "title": "现实约束测试",
+            "claim_type": claim_type, "angle_family": "market_cognition",
+        }
+        thesis = {
+            "thesis_id": "thesis:test", "thesis_type": "ASSERTION",
+            "primary_claim": "现实观察改变了当前判断。", "falsifier": "观察消失",
+        }
+        return payload, self.app_module.compile_grounding_contract(topic, thesis, payload)
+
+    def grounding_draft(self, paragraphs):
+        return {
+            "text": "\n\n".join(item["text"] for item in paragraphs),
+            "paragraphs": paragraphs,
+            "grounding_contract_version": self.app_module.GROUNDING_CONTRACT_VERSION,
+        }
+
+    def test_grounding_case_1_live_topic_without_material_fact_fails_closed(self):
+        payload, contract = self.grounding_fixture(anchors=0)
+        self.assertIn("INSUFFICIENT_REALITY_PAYLOAD", contract["preflight_reason_codes"])
+        self.assertIn("LOW_SOURCE_DEPENDENCE", contract["preflight_reason_codes"])
+
+    def test_grounding_case_2_one_fact_cannot_support_abstract_expansion(self):
+        payload, contract = self.grounding_fixture()
+        draft = self.grounding_draft([
+            {"section": "signal_context", "text": "现实观察 1。", "job": "EVIDENCE", "thesis_relation": "SUPPORT", "reality_refs": ["fact:1"]},
+            {"section": "close", "text": "所以整个行业都会被永久改变。", "job": "CONCLUSION", "thesis_relation": "SUPPORT", "reality_refs": []},
+        ])
+        review = self.app_module.validate_editorial_grounding(
+            draft, payload, contract, self.app_module.editorial_content_structure({"structure_id": "market_cognition"})
+        )
+        self.assertIn("LOW_REALITY_CONTRIBUTION", review["reason_codes"])
+
+    def test_grounding_case_3_synthetic_consensus_is_rejected(self):
+        payload, contract = self.grounding_fixture()
+        draft = self.grounding_draft([{
+            "section": "hook", "text": "市场普遍认为这个判断已经成立。", "job": "CLAIM",
+            "thesis_relation": "SUPPORT", "reality_refs": ["fact:1"],
+        }])
+        review = self.app_module.validate_editorial_grounding(
+            draft, payload, contract, self.app_module.editorial_content_structure({"structure_id": "market_cognition"})
+        )
+        self.assertIn("UNSUPPORTED_CONSENSUS_CLAIM", review["reason_codes"])
+
+    def test_grounding_case_4_analogy_cannot_complete_causal_proof(self):
+        payload, contract = self.grounding_fixture(claim_type="CAUSAL", mechanisms=True)
+        draft = self.grounding_draft([{
+            "section": "gap", "text": "它就像股票回购，所以结果一定相同。", "job": "MECHANISM",
+            "thesis_relation": "EXPLAIN", "reality_refs": [],
+        }])
+        review = self.app_module.validate_editorial_grounding(
+            draft, payload, contract, self.app_module.editorial_content_structure({"structure_id": "market_cognition"})
+        )
+        self.assertIn("ANALOGY_AS_EVIDENCE", review["reason_codes"])
+
+    def test_grounding_case_5_causal_claim_without_mechanism_returns_to_research(self):
+        _payload, contract = self.grounding_fixture(claim_type="CAUSAL")
+        self.assertIn("MECHANISM_GAP", contract["preflight_reason_codes"])
+
+    def test_grounding_case_6_number_without_reasoning_contribution_does_not_pass(self):
+        payload, contract = self.grounding_fixture()
+        payload["source_dependent_anchors"][0]["statement"] = "观察值为 42%。"
+        draft = self.grounding_draft([
+            {"section": "signal_context", "text": "观察值为 42%。", "job": "EVIDENCE", "thesis_relation": "SUPPORT", "reality_refs": ["fact:1"]},
+            {"section": "close", "text": "耐心最重要。", "job": "CONCLUSION", "thesis_relation": "SUPPORT", "reality_refs": []},
+        ])
+        review = self.app_module.validate_editorial_grounding(
+            draft, payload, contract, self.app_module.editorial_content_structure({"structure_id": "market_cognition"})
+        )
+        self.assertIn("LOW_REALITY_CONTRIBUTION", review["reason_codes"])
+
+    def test_grounding_case_7_may_indicate_cannot_be_upgraded_to_proves(self):
+        payload, contract = self.grounding_fixture(epistemic_status="INFERRED")
+        draft = self.grounding_draft([{
+            "section": "close", "text": "这个信号证明了结论必然成立。", "job": "CONCLUSION",
+            "thesis_relation": "SUPPORT", "reality_refs": ["fact:1"],
+        }])
+        review = self.app_module.validate_editorial_grounding(
+            draft, payload, contract, self.app_module.editorial_content_structure({"structure_id": "market_cognition"})
+        )
+        self.assertIn("CLAIM_STRENGTH_UPGRADE", review["reason_codes"])
+
+    def test_grounding_case_8_unknown_must_remain_unknown(self):
+        payload, contract = self.grounding_fixture()
+        payload["uncertainties"] = [{"reality_ref": "uncertainty:0", "question": "机制是否持续？", "status": "UNKNOWN"}]
+        contract = self.app_module.compile_grounding_contract(
+            {"claim_key": "grounding:test", "claim_type": "DESCRIPTIVE"},
+            {"thesis_id": "thesis:test", "thesis_type": "ASSERTION", "primary_claim": "判断"}, payload,
+        )
+        draft = self.grounding_draft([{
+            "section": "close", "text": "现实观察支持当前判断。", "job": "CONCLUSION",
+            "thesis_relation": "SUPPORT", "reality_refs": ["fact:1"],
+        }])
+        review = self.app_module.validate_editorial_grounding(
+            draft, payload, contract, self.app_module.editorial_content_structure({"structure_id": "market_cognition"})
+        )
+        self.assertIn("UNCERTAINTY_DROPPED", review["reason_codes"])
+
+    def test_grounding_case_9_generic_background_budget_is_enforced_by_structure(self):
+        payload, contract = self.grounding_fixture()
+        draft = self.grounding_draft([
+            {"section": "signal_context", "text": "这是很长的通用背景。" * 30, "job": "CONTEXT", "thesis_relation": "EXPLAIN", "reality_refs": []},
+            {"section": "close", "text": "现实观察支持判断。", "job": "CONCLUSION", "thesis_relation": "SUPPORT", "reality_refs": ["fact:1"]},
+        ])
+        review = self.app_module.validate_editorial_grounding(
+            draft, payload, contract, self.app_module.editorial_content_structure({"structure_id": "market_cognition"})
+        )
+        self.assertIn("EXCESSIVE_GENERIC_BACKGROUND", review["reason_codes"])
+
+    def test_grounding_case_10_research_failure_never_reaches_writer_or_editor(self):
+        context_date = self.app_module.shanghai_today()
+        topic = {
+            "claim_key": "live-without-source", "title": "缺少现实依据的实时题",
+            "core_claim": "不能靠语言补齐研究。", "eligible": True,
+            "source_kind": "market", "source_refs": [],
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+        self.insert_pending_editorial_write(run_id, context_date, topic)
+        writer, editor = AsyncMock(), AsyncMock()
+        with patch.dict(os.environ, {
+            "XOPS_DAILY_POST_ENABLED": "true", "XOPS_DAILY_POST_PERSONAS": "acheng",
+        }), patch.object(self.app_module, "write_persona_editorial_gemini", writer), patch.object(
+            self.app_module, "critique_persona_editorial_draft", editor
+        ):
+            self.run_editorial_pipeline(run_id)
+        writer.assert_not_awaited()
+        editor.assert_not_awaited()
+        with self.app_module.db() as conn:
+            row = conn.execute(
+                "SELECT status,reason_code FROM persona_editorial_evaluations WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        self.assertEqual(row["status"], "HOLD")
+        self.assertEqual(row["reason_code"], "INSUFFICIENT_REALITY_PAYLOAD")
 
 if __name__ == "__main__":
     unittest.main()
