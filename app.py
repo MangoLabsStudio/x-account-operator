@@ -6976,12 +6976,17 @@ def reopen_required_public_angle_rejections(run_id: int | None = None):
                 (run["id"], run["approval_revision"]),
             ).fetchall()
             for row in rows:
-                if row["reason_code"] in GROUNDING_FAILURE_CODES:
-                    continue
                 topic = json_value(row["topic_json"], {})
                 if assignments.get(str(topic.get("claim_key", ""))) != row["slug"]:
                     continue
                 state = json_value(row["generation_state"], {})
+                if (
+                    row["reason_code"] in GROUNDING_FAILURE_CODES
+                    and isinstance(state, dict)
+                    and state.get("source_fact_policy_version")
+                    == EDITORIAL_SOURCE_FACT_POLICY_VERSION
+                ):
+                    continue
                 if isinstance(state, dict):
                     for key in (
                         "draft", "draft_failures", "critic", "thesis_adherence", "rewrite",

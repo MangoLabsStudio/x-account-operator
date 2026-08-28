@@ -3875,6 +3875,57 @@ class AppTest(unittest.TestCase):
             "WRITE", "THESIS_APPROVED", "required_public_angle", None,
         ))
 
+    def test_source_fact_policy_upgrade_reopens_old_grounding_failure_once(self):
+        context_date = self.app_module.shanghai_today()
+        topic = {
+            "claim_key": "source-fact-reopen", "title": "原帖事实策略升级",
+            "core_claim": "旧事实策略导致的 Grounding 失败需要重新写。",
+            "parent_seed_key": "mother:source-fact", "scope": "public",
+            "topic_domain": "crypto",
+        }
+        run_id = self.create_editorial_run(context_date, topics=[topic])
+        with self.app_module.db() as conn:
+            cards = json.loads(conn.execute(
+                "SELECT raw_cards FROM daily_context_runs WHERE id=?", (run_id,)
+            ).fetchone()[0])
+            cards["editorial_angle_expansion"] = {
+                "status": "ready", "expanded_topics": [topic], "rejected_angles": [],
+            }
+            conn.execute(
+                "UPDATE daily_context_runs SET raw_cards=? WHERE id=?",
+                (json.dumps(cards, ensure_ascii=False), run_id),
+            )
+        evaluation_id = self.insert_pending_editorial_write(run_id, context_date, topic)
+        with self.app_module.db() as conn:
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET status='HOLD',reason_code='UNSUPPORTED_FACT',generation_state=?
+                   WHERE id=?""",
+                (json.dumps({"source_fact_policy_version": 1}), evaluation_id),
+            )
+        self.app_module.reopen_required_public_angle_rejections(run_id)
+        with self.app_module.db() as conn:
+            reopened = conn.execute(
+                "SELECT status,reason_code FROM persona_editorial_evaluations WHERE id=?",
+                (evaluation_id,),
+            ).fetchone()
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET status='HOLD',reason_code='UNSUPPORTED_FACT',generation_state=?
+                   WHERE id=?""",
+                (json.dumps({
+                    "source_fact_policy_version": self.app_module.EDITORIAL_SOURCE_FACT_POLICY_VERSION,
+                }), evaluation_id),
+            )
+        self.assertEqual(tuple(reopened), ("WRITE", "required_public_angle"))
+        self.app_module.reopen_required_public_angle_rejections(run_id)
+        with self.app_module.db() as conn:
+            current = conn.execute(
+                "SELECT status,reason_code FROM persona_editorial_evaluations WHERE id=?",
+                (evaluation_id,),
+            ).fetchone()
+        self.assertEqual(tuple(current), ("HOLD", "UNSUPPORTED_FACT"))
+
     def test_pipeline_does_not_reopen_required_angle_from_an_old_revision(self):
         context_date = self.app_module.shanghai_today()
         topic = {
