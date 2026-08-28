@@ -6564,7 +6564,8 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
     prompt = (
         f"你是中文 {content_domain} KOL 编辑。把以下正式选题写成一条能进入人工审核的帖子，只输出 JSON："
         f"{{\"sections\":{json.dumps(section_template, ensure_ascii=False)},"
-        "\"reasoning_shape\":[\"hook\",\"...\"],\"facts_used_ids\":[\"fact:...\"],\"stance\":\"...\"}。"
+        "\"reasoning_shape\":[\"hook\",\"...\"],"
+        "\"facts_used_ids\":[\"逐字复制 verified_facts.facts[].id\"],\"stance\":\"...\"}。"
         "sections 的语义槽和必填项是服务器硬约束；reasoning_shape 只能逐字选择 allowed_reasoning_shapes 中的一项。"
         "段落顺序可以在允许形状中变化；每段只写正文，不写 Hook、Context、CTA 等标签，不得把整篇复制进多个字段。\n"
         "每个 sections 项必须返回 text、job、thesis_relation、reality_refs。EVIDENCE 段必须引用 RealityPayload 中的 ID；"
@@ -6636,7 +6637,17 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
     raw_facts_used = result.get("facts_used_ids", [])
     if not isinstance(raw_facts_used, list) or not all(isinstance(item, str) for item in raw_facts_used):
         raise RuntimeError("Gemini facts_used_ids 不符合 JSON 数组约束")
-    facts_used = [item for item in raw_facts_used if item]
+    facts_used = []
+    for item in raw_facts_used:
+        if not item:
+            continue
+        normalized = item
+        if normalized not in valid_fact_ids:
+            tweet_id = re.search(r"(\d{10,})$", normalized)
+            reported_id = f"tweet:{tweet_id.group(1)}" if tweet_id else ""
+            if reported_id in valid_fact_ids:
+                normalized = reported_id
+        facts_used.append(normalized)
     if any(item not in valid_fact_ids for item in facts_used):
         raise RuntimeError("Gemini 引用了未提供的事实编号")
     valid_reality_refs = {

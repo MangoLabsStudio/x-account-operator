@@ -3057,12 +3057,15 @@ class AppTest(unittest.TestCase):
                     "close": "真正有价值的是先重算原来的成本假设，再决定是否采用。",
                     "cta": "适合这类团队时，可以先看仓库说明再试。",
                 },
-                "facts_used_ids": ["fact:card-1"], "stance": "重算成本假设",
+                "facts_used_ids": ["fact:2092315006826398115"], "stance": "重算成本假设",
             }, ensure_ascii=False)}}],
         }
         verified_facts = {
             "schema": "facts_used_ids", "requires_fact_ids": True,
-            "facts": [{"id": "fact:card-1", "text": "经过验证的公告。", "source_refs": ["card-1"], "status": "verified"}],
+            "facts": [{
+                "id": "tweet:2092315006826398115", "text": "原帖明确写出的公告。",
+                "source_refs": ["2092315006826398115"], "status": "source_reported",
+            }],
         }
         with patch.dict(os.environ, {"XOPS_GEMINI_API_KEY": "test-key"}), patch.object(
             self.app_module.httpx, "AsyncClient", return_value=FakeAsyncClient(payload, calls)
@@ -3076,7 +3079,7 @@ class AppTest(unittest.TestCase):
                 }, verified_facts,
                 {"text": "背景", "citations": []}, {"source_kind": "market", "source_id": "", "source_item": None, "first_person_allowed": False},
             ))
-        self.assertEqual(result["facts_used_ids"], ["fact:card-1"])
+        self.assertEqual(result["facts_used_ids"], ["tweet:2092315006826398115"])
         self.assertEqual(result["stance"], "重算成本假设")
         self.assertEqual(result["style_id"], "open_source_discovery")
         self.assertEqual(list(result["sections"]), style_recipe["section_order"])
