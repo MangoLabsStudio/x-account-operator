@@ -6882,6 +6882,22 @@ class AppTest(unittest.TestCase):
         self.assertIn("INSUFFICIENT_REALITY_PAYLOAD", contract["preflight_reason_codes"])
         self.assertIn("LOW_SOURCE_DEPENDENCE", contract["preflight_reason_codes"])
 
+    def test_grounding_contract_requires_only_best_matching_anchor(self):
+        payload, _contract = self.grounding_fixture(anchors=0)
+        payload["source_dependent_anchors"] = [
+            {"reality_ref": "fact:claude", "statement": "Claude 增加了浏览器能力。"},
+            {"reality_ref": "fact:chip", "statement": "OpenAI Jalapeño 芯片与 Nvidia GB300 被公开比较。"},
+            {"reality_ref": "fact:vercel", "statement": "Vercel 扩大 AI 云业务。"},
+        ]
+        contract = self.app_module.compile_grounding_contract(
+            {"claim_key": "ai:chip", "title": "OpenAI Jalapeño 芯片挑战 Nvidia"},
+            {"thesis_id": "thesis:chip", "primary_claim": "Jalapeño 正在拆分 Nvidia 主导的推理芯片市场。"},
+            payload,
+        )
+        self.assertEqual(contract["required_reality_refs"], ["fact:chip"])
+        self.assertEqual(set(contract["optional_reality_refs"]), {"fact:claude", "fact:vercel"})
+        self.assertEqual(contract["minimum_grounding_requirements"]["material_anchor_count"], 1)
+
     def test_grounding_case_2_one_fact_cannot_support_abstract_expansion(self):
         payload, contract = self.grounding_fixture()
         draft = self.grounding_draft([

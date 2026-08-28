@@ -59,7 +59,7 @@ EVERGREEN_TOPIC_BANK_PATH = APP_DIR / "configs" / "evergreen_editorial_topics.js
 EDITORIAL_FALLBACK_BANK_PATH = APP_DIR / "configs" / "editorial_fallback_cards.json"
 
 REALITY_PAYLOAD_VERSION = "reality_payload_v2"
-GROUNDING_CONTRACT_VERSION = "grounding_contract_v2"
+GROUNDING_CONTRACT_VERSION = "grounding_contract_v3"
 GROUNDING_PARAGRAPH_JOBS = {
     "CLAIM", "EVIDENCE", "MECHANISM", "CONTEXT", "COUNTER_SIGNAL", "UNCERTAINTY",
     "IMPLICATION", "EXAMPLE", "CONCLUSION",
@@ -5578,16 +5578,41 @@ def grounding_claim_type(topic: dict, thesis: dict) -> str:
 def compile_grounding_contract(topic: dict, thesis: dict, payload: dict) -> dict:
     mode = payload.get("grounding_mode") or grounding_mode_for_topic(topic)
     claim_type = grounding_claim_type(topic, thesis)
-    anchors = [item["reality_ref"] for item in payload.get("source_dependent_anchors", [])]
-    required_count = 1
-    if claim_type in {"COMPARATIVE", "STRUCTURAL"}:
-        required_count = 2
-    required = anchors[:required_count]
+    anchor_items = payload.get("source_dependent_anchors", [])
+    thesis_text = " ".join(str(value or "") for value in (
+        topic.get("title"), topic.get("core_claim"), topic.get("subject"),
+        thesis.get("primary_claim"), thesis.get("source_delta"),
+    ))
+
+    def relevance_terms(value: str) -> set[str]:
+        value = str(value or "").lower()
+        words = {
+            word for word in re.findall(r"[a-z0-9][a-z0-9_.+-]{2,}", value)
+            if word not in {"the", "and", "for", "with", "that", "this", "from"}
+        }
+        chinese = re.sub(r"[^\u3400-\u9fff]", "", value)
+        words.update(chinese[index:index + 2] for index in range(len(chinese) - 1))
+        return words
+
+    thesis_terms = relevance_terms(thesis_text)
+    ranked = sorted(
+        (
+            (
+                len(thesis_terms & relevance_terms(item.get("statement", ""))),
+                index,
+                item.get("reality_ref", ""),
+            )
+            for index, item in enumerate(anchor_items)
+            if isinstance(item, dict) and item.get("reality_ref")
+        ),
+        key=lambda item: (-item[0], item[1]),
+    )
+    anchors = [item[2] for item in ranked]
+    required = anchors[:1]
+    optional = anchors[1:]
     reasons = []
     if mode == "LIVE_RESEARCH" and not anchors:
         reasons.extend(["INSUFFICIENT_REALITY_PAYLOAD", "LOW_SOURCE_DEPENDENCE"])
-    elif len(required) < required_count:
-        reasons.append("INSUFFICIENT_REALITY_PAYLOAD")
     if claim_type in {"CAUSAL", "PREDICTIVE"} and not payload.get("mechanisms"):
         reasons.append("MECHANISM_GAP")
     if claim_type == "PREDICTIVE" and not str(thesis.get("falsifier", "")).strip():
@@ -5601,7 +5626,7 @@ def compile_grounding_contract(topic: dict, thesis: dict, payload: dict) -> dict
     if claim_type == "ACTIONABLE" and not all(actionable_fields.values()):
         reasons.append("INSUFFICIENT_REALITY_PAYLOAD")
     obligations = [{"type": "PRIMARY_OBSERVATION", "required_refs": required[:1]}]
-    if claim_type in {"COMPARATIVE", "STRUCTURAL"}:
+    if claim_type in {"COMPARATIVE", "STRUCTURAL"} and len(required) > 1:
         obligations.append({"type": "MULTIPLE_REALITY_SIGNALS", "required_refs": required})
     if claim_type in {"CAUSAL", "PREDICTIVE"}:
         obligations.append({
@@ -5622,6 +5647,7 @@ def compile_grounding_contract(topic: dict, thesis: dict, payload: dict) -> dict
         "reality_payload_id": payload.get("reality_payload_id", ""),
         "grounding_mode": mode, "claim_type": claim_type,
         "required_reality_refs": required,
+        "optional_reality_refs": optional,
         "required_obligations": obligations,
         "allowed_background_refs": [],
         "uncertainty_refs": [item["reality_ref"] for item in payload.get("uncertainties", [])],
@@ -5632,7 +5658,7 @@ def compile_grounding_contract(topic: dict, thesis: dict, payload: dict) -> dict
         },
         "analogy_policy": "EXPLANATION_ONLY_NOT_EVIDENCE",
         "minimum_grounding_requirements": {
-            "material_anchor_count": required_count,
+            "material_anchor_count": 1,
             "mechanism_required": claim_type in {"CAUSAL", "PREDICTIVE"},
             "falsifier_required": claim_type == "PREDICTIVE",
             "actionable_fields_required": claim_type == "ACTIONABLE",
@@ -6573,7 +6599,8 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
         "唯一可作为确定事实、数字、日期、行为或共识的材料是 RealityPayload 与 verified_facts；Grok 内容只用于理解前情、圈内争议和语言语境。"
         "verified_facts 中 status=source_reported 的项目表示母池原帖明确写出的内容，可以直接复述；"
         "不得把原帖没有写出的数字、因果、身份或市场共识追加进去。"
-        "required_reality_refs 必须全部进入正文并真实参与论证，不能只在背景里点名。Writer 无权补造 RealityPayload。"
+        "required_reality_refs 必须进入正文并真实参与论证，不能只在背景里点名；optional_reality_refs 只是冗余材料，"
+        "只在与当前 thesis 直接相关时使用，不要求覆盖，也不能为了凑材料写进正文。Writer 无权补造 RealityPayload。"
         "不得发明数字、日期、参与者、用户行为、市场共识、来源观察或机制；不得把 UNKNOWN 写成答案、INFERRED 写成 FACT。"
         "‘大家都觉得/市场普遍认为/越来越多人’等表达只有 consensus_evidence 允许时才能写。类比只能解释，不能承担证据义务。"
         "母池原帖明确写出的陈述可按 source_reported 事实使用；多条原帖重复同一说法不能自动写成市场共识。"
