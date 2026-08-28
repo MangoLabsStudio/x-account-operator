@@ -2981,6 +2981,45 @@ class AppTest(unittest.TestCase):
             "source_refs": ["fact-card-42", "official:announcement-42"], "status": "verified",
         }])
 
+    def test_editorial_verified_facts_accepts_exact_referenced_source_post(self):
+        raw_cards = {
+            "discussion_topics": [{
+                "sample_posts": [
+                    {
+                        "source_ref": "2092025531684532245",
+                        "text": "项目宣布 TVL 已达到 2 亿美元。",
+                        "url": "https://x.com/project/status/2092025531684532245",
+                        "handle": "project",
+                        "created_at": "2026-08-28T01:00:00Z",
+                    },
+                    {
+                        "source_ref": "not-selected",
+                        "text": "这条没有被选题引用。",
+                    },
+                ],
+            }],
+        }
+        topic = {"source_refs": ["2092025531684532245"]}
+        facts = self.app_module.editorial_verified_facts(raw_cards, topic, {})
+        self.assertEqual(facts["facts"], [{
+            "id": "tweet:2092025531684532245",
+            "text": "项目宣布 TVL 已达到 2 亿美元。",
+            "source_refs": [
+                "2092025531684532245",
+                "https://x.com/project/status/2092025531684532245",
+            ],
+            "status": "source_reported",
+            "actor": "project",
+            "action": "published",
+            "object": "项目宣布 TVL 已达到 2 亿美元。",
+            "observed_at": "2026-08-28T01:00:00Z",
+            "epistemic_status": "SOURCE_REPORTED",
+        }])
+        payload = self.app_module.compile_reality_payload(raw_cards, topic, facts, {})
+        self.assertEqual(payload["concrete_facts"][0]["epistemic_status"], "SOURCE_REPORTED")
+        self.assertEqual(payload["source_dependent_anchors"][0]["kind"], "SOURCE_REPORTED_FACT")
+        self.assertEqual(payload["primary_observation"]["fact_ids"], ["tweet:2092025531684532245"])
+
     def test_gemini_parser_enforces_facts_used_ids_contract(self):
         calls = []
         payload = {
@@ -3022,6 +3061,7 @@ class AppTest(unittest.TestCase):
             if result["sections"][key]
         ])
         self.assertIn("facts_used_ids", calls[0]["kwargs"]["json"]["messages"][0]["content"])
+        self.assertIn("status=source_reported", calls[0]["kwargs"]["json"]["messages"][0]["content"])
         self.assertIn("中文 AI KOL 编辑", calls[0]["kwargs"]["json"]["messages"][0]["content"])
         self.assertIn("Hook 后用一句话完成对象定位", calls[0]["kwargs"]["json"]["messages"][0]["content"])
         self.assertIn("开头必须选一个最强信号做 Hook", calls[0]["kwargs"]["json"]["messages"][0]["content"])

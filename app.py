@@ -3519,6 +3519,7 @@ def editorial_score(item: dict):
 
 EDITORIAL_CLAIM_KEY = re.compile(r"^[a-z0-9][a-z0-9:_-]{2,119}$")
 EDITORIAL_EVALUATOR_REVISION = 5
+EDITORIAL_SOURCE_FACT_POLICY_VERSION = 1
 THESIS_CONTRACT_VERSION = "thesis_contract_v1"
 THESIS_TYPES = {
     "ASSERTION", "INTERPRETATION", "OBSERVATION", "DECISION", "PREDICTION",
@@ -5226,7 +5227,7 @@ FACT_CARD_STATUSES = {
 
 
 def editorial_verified_facts(raw_cards: dict, topic: dict, writer_context: dict):
-    """Build fact permissions from exact approved card references, never from model prose."""
+    """Build fact permissions from approved cards and exact referenced source posts."""
     topic_domain = str(topic.get("topic_domain") or "crypto").lower()
     references = set()
     for field in ("source_topic_keys", "source_refs"):
@@ -5283,6 +5284,27 @@ def editorial_verified_facts(raw_cards: dict, topic: dict, writer_context: dict)
         if card.get("review_promoted") and isinstance(card.get("verification_evidence"), dict):
             fact["verification_evidence"] = card["verification_evidence"]
         facts.append(fact)
+    existing_ids = {item["id"] for item in facts}
+    covered_refs = {
+        str(ref) for fact in facts for ref in fact.get("source_refs", [])
+    }
+    for item in editorial_source_observations(raw_cards, topic):
+        fact_id = f"tweet:{item['source_ref']}"
+        if fact_id in existing_ids or item["source_ref"] in covered_refs:
+            continue
+        facts.append({
+            "id": fact_id,
+            "text": item["statement"][:900],
+            "source_refs": item["source_ids"][:12],
+            "status": "source_reported",
+            "actor": item["actor"],
+            "action": "published",
+            "object": item["statement"][:900],
+            "observed_at": item["observed_at"],
+            "epistemic_status": "SOURCE_REPORTED",
+        })
+        existing_ids.add(fact_id)
+        covered_refs.add(item["source_ref"])
     source_item = writer_context.get("source_item") or {}
     if writer_context.get("source_kind") == "life" and source_item.get("fact"):
         source_id = str(writer_context.get("source_id") or "life")
@@ -5374,6 +5396,7 @@ def compile_reality_payload(raw_cards: dict, topic: dict, verified_facts: dict,
     for fact in verified_facts.get("facts", []):
         if not isinstance(fact, dict) or not fact.get("id") or not fact.get("text"):
             continue
+        epistemic_status = str(fact.get("epistemic_status") or "KNOWN")
         item = {
             "fact_id": fact["id"], "statement": str(fact["text"])[:1200],
             "entity": fact.get("entity", ""), "metric": fact.get("metric", ""),
@@ -5381,13 +5404,17 @@ def compile_reality_payload(raw_cards: dict, topic: dict, verified_facts: dict,
             "time_scope": fact.get("time_scope", ""),
             "source_ids": list(fact.get("source_refs", []))[:12],
             "confidence": fact.get("confidence", fact.get("status", "verified")),
-            "epistemic_status": "KNOWN",
+            "epistemic_status": epistemic_status,
         }
         concrete_facts.append(item)
         anchors.append({
             "reality_ref": fact["id"], "statement": item["statement"],
-            "source_ids": item["source_ids"], "kind": "VERIFIED_FACT",
-            "epistemic_status": "KNOWN",
+            "source_ids": item["source_ids"],
+            "kind": (
+                "SOURCE_REPORTED_FACT"
+                if fact.get("status") == "source_reported" else "VERIFIED_FACT"
+            ),
+            "epistemic_status": epistemic_status,
             "observed_at": str(fact.get("observed_at") or fact.get("time_scope") or ""),
         })
 
@@ -5479,7 +5506,10 @@ def compile_reality_payload(raw_cards: dict, topic: dict, verified_facts: dict,
         "topic_id": str(topic.get("claim_key", "")), "grounding_mode": mode,
         "primary_observation": {
             "statement": primary.get("statement", ""),
-            "fact_ids": [primary["reality_ref"]] if primary.get("kind") == "VERIFIED_FACT" else [],
+            "fact_ids": (
+                [primary["reality_ref"]]
+                if primary.get("kind") in {"VERIFIED_FACT", "SOURCE_REPORTED_FACT"} else []
+            ),
             "source_ids": primary.get("source_ids", []),
             "observed_at": primary.get("observed_at", ""),
         },
@@ -6510,10 +6540,13 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
         "每个 sections 项必须返回 text、job、thesis_relation、reality_refs。EVIDENCE 段必须引用 RealityPayload 中的 ID；"
         "MECHANISM 段只能引用 GroundingContract 允许的 mechanism evidence。"
         "唯一可作为确定事实、数字、日期、行为或共识的材料是 RealityPayload 与 verified_facts；Grok 内容只用于理解前情、圈内争议和语言语境。"
+        "verified_facts 中 status=source_reported 的项目表示母池原帖明确写出的内容，可以直接复述；"
+        "不得把原帖没有写出的数字、因果、身份或市场共识追加进去。"
         "required_reality_refs 必须全部进入正文并真实参与论证，不能只在背景里点名。Writer 无权补造 RealityPayload。"
         "不得发明数字、日期、参与者、用户行为、市场共识、来源观察或机制；不得把 UNKNOWN 写成答案、INFERRED 写成 FACT。"
         "‘大家都觉得/市场普遍认为/越来越多人’等表达只有 consensus_evidence 允许时才能写。类比只能解释，不能承担证据义务。"
-        "X 上重复出现的说法仍只是观点。必须给清楚判断和现实后果，不写研报、免责声明、标题、来源列表或观察清单。"
+        "母池原帖明确写出的陈述可按 source_reported 事实使用；多条原帖重复同一说法不能自动写成市场共识。"
+        "必须给清楚判断和现实后果，不写研报、免责声明、标题、来源列表或观察清单。"
         "若 verified_facts.facts 为空，不得写日期、价格、比例、数量或已被确认的事实；只能写明确标出的观点、解释或判断。"
         "TermMax S1、x402、L2 这类项目或协议标识可以照常写，它们不属于数字断言。"
         "题目里的具体对象必须直接点名；没有已核事实时，把机制或催化写成明确的条件句。"
@@ -6998,6 +7031,7 @@ async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_
         "RESTATEMENT、TANGENT 或 UNSUPPORTED_NEW_CLAIM。出现新中心主张标 SECONDARY_THESIS_INTRODUCED；"
         "改写或弱化主张标 THESIS_DRIFT；离题过多标 OFF_THESIS。然后再做现有主编审核。逐句核对待审稿：每条日期、数字、"
         "价格、已经发生的事件、官方关系和因果断言，只要不能由 verified_facts 直接支持，就原句摘入 unsupported_claims。"
+        "verified_facts 中 status=source_reported 的母池原帖可直接支持它明确写出的内容，但不能支持原帖未写出的延伸推断。"
         "unsupported_claims 非空必须 REJECT。严格：没有具体的新冲突、只是在讲常识、AI 模板腔、"
         "把 Grok 背景或未提供材料写成事实、虚构人设经历、没有明确判断，均 REJECT。PASS 必须是有信息量、"
         "有明确主题、像这个人设会说的话的帖子。persona_thesis 是唯一通过条件：正文必须忠实推进 thesis，"
@@ -7241,18 +7275,36 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
         try:
             grok_context = state.get("grok")
             cached_facts = state.get("verified_facts")
-            if not isinstance(grok_context, dict) or not isinstance(cached_facts, dict):
-                grok_context = cached_editorial_topic_context(raw_cards, compact_topic)
-                if not grok_context:
+            source_fact_policy_stale = (
+                state.get("source_fact_policy_version") != EDITORIAL_SOURCE_FACT_POLICY_VERSION
+            )
+            if (
+                not isinstance(grok_context, dict)
+                or not isinstance(cached_facts, dict)
+                or source_fact_policy_stale
+            ):
+                if not isinstance(grok_context, dict):
+                    grok_context = cached_editorial_topic_context(raw_cards, compact_topic)
+                if not isinstance(grok_context, dict):
                     grok_context = await enrich_persona_editorial_context(
                         compact_topic, verified_facts, compact_daily
                     )
                 verified_facts = await enrich_verified_facts_with_github_traction(
                     compact_topic, verified_facts, grok_context
                 )
+                if source_fact_policy_stale:
+                    for key in (
+                        "draft", "draft_failures", "grounding_review", "grounding_rewrite",
+                        "grounding_rewrite_failures", "grounding_final_review", "critic",
+                        "rewrite", "rewrite_failures", "final_critic", "semantic_grounding_review",
+                        "semantic_grounding_rewrite", "semantic_grounding_deterministic_review",
+                        "semantic_grounding_final_review", "post_editor_grounding_review",
+                    ):
+                        state.pop(key, None)
                 state.update({
                     "grok": grok_context,
                     "verified_facts": verified_facts,
+                    "source_fact_policy_version": EDITORIAL_SOURCE_FACT_POLICY_VERSION,
                     "topic": compact_topic,
                     "persona": persona,
                     "writer_context": writer_context,
