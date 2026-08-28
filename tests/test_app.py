@@ -3809,7 +3809,7 @@ class AppTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual(tuple(row), ("WRITE", "formal_generation_manual_retry", 0, None))
 
-    def test_required_public_angle_never_loses_its_thesis_on_generation_failure(self):
+    def test_required_public_angle_exhausts_and_allows_redundant_topic_fill(self):
         context_date = self.app_module.shanghai_today()
         topic = {
             "claim_key": "required-retry", "title": "已批准公共观点",
@@ -3834,10 +3834,9 @@ class AppTest(unittest.TestCase):
             ).fetchone()
 
         self.assertEqual(tuple(row)[:4], (
-            "WRITE", "THESIS_APPROVED", "required_public_angle", 1,
+            "HOLD", "THESIS_APPROVED", "formal_generation_retry_exhausted", 1,
         ))
-        self.assertIsNotNone(row["next_retry_at"])
-        self.assertIn("writer failed", json.loads(row["generation_state"])["retry_instruction"])
+        self.assertIsNone(row["next_retry_at"])
 
     def test_pipeline_reopens_a_previously_rejected_required_public_angle(self):
         context_date = self.app_module.shanghai_today()

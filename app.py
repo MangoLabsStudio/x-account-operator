@@ -4831,11 +4831,13 @@ def supersede_persona_editorial_evaluation(conn, evaluation_id: int, reason_code
 def retry_required_public_generation(conn, evaluation_id: int, rationale: str,
                                      reset_draft: bool = False) -> bool:
     row = conn.execute(
-        """SELECT generation_attempts,topic_json,generation_state
+        """SELECT generation_attempts,generation_max_attempts,topic_json,generation_state
            FROM persona_editorial_evaluations WHERE id=?""",
         (evaluation_id,),
     ).fetchone()
     if not row or not json_value(row["topic_json"], {}).get("parent_seed_key"):
+        return False
+    if int(row["generation_attempts"] or 0) + 1 >= max(1, int(row["generation_max_attempts"] or 1)):
         return False
     state = json_value(row["generation_state"], {})
     if reset_draft and isinstance(state, dict):
