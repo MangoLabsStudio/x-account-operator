@@ -4559,7 +4559,11 @@ def uncovered_public_angle_keys(conn, run_id: int) -> list[str]:
     covered = {
         str(json_value(evaluation["topic_json"], {}).get("claim_key", ""))
         for evaluation in conn.execute(
-            "SELECT topic_json FROM persona_editorial_evaluations WHERE run_id=? AND status='WRITE'",
+            """SELECT topic_json FROM persona_editorial_evaluations
+               WHERE run_id=? AND (
+                   status='WRITE'
+                   OR (status='HOLD' AND reason_code='formal_generation_retry_exhausted')
+               )""",
             (run_id,),
         ).fetchall()
     }

@@ -4169,6 +4169,18 @@ class AppTest(unittest.TestCase):
                 ["must-reach-thesis"],
             )
             self.assertFalse(self.app_module.daily_post_output_ready(conn, context_date))
+        evaluation_id = self.insert_pending_editorial_write(run_id, context_date, topic)
+        with self.app_module.db() as conn:
+            conn.execute(
+                """UPDATE persona_editorial_evaluations
+                   SET status='HOLD',reason_code='formal_generation_retry_exhausted'
+                   WHERE id=?""",
+                (evaluation_id,),
+            )
+            self.assertEqual(
+                self.app_module.uncovered_public_angle_keys(conn, run_id),
+                [],
+            )
 
     def test_grounded_candidate_is_visible_while_other_angles_remain_uncovered(self):
         context_date = self.app_module.shanghai_today()
