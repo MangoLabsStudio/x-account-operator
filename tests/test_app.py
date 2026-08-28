@@ -3761,7 +3761,7 @@ class AppTest(unittest.TestCase):
                 conn, evaluation_id, RuntimeError("writer failed")
             )
             row = conn.execute(
-                """SELECT status,thesis_state,reason_code,generation_attempts,next_retry_at
+                """SELECT status,thesis_state,reason_code,generation_attempts,next_retry_at,generation_state
                    FROM persona_editorial_evaluations WHERE id=?""",
                 (evaluation_id,),
             ).fetchone()
@@ -3770,6 +3770,7 @@ class AppTest(unittest.TestCase):
             "WRITE", "THESIS_APPROVED", "required_public_angle", 1,
         ))
         self.assertIsNotNone(row["next_retry_at"])
+        self.assertIn("writer failed", json.loads(row["generation_state"])["retry_instruction"])
 
     def test_pipeline_reopens_a_previously_rejected_required_public_angle(self):
         context_date = self.app_module.shanghai_today()

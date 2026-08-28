@@ -4843,6 +4843,7 @@ def retry_required_public_generation(conn, evaluation_id: int, rationale: str,
             "rewrite_failures", "final_critic", "writer_attempts", "thesis_repair_attempts",
         ):
             state.pop(key, None)
+        state["retry_instruction"] = rationale[:600]
     attempts = int(row["generation_attempts"] or 0) + 1
     now = int(time.time())
     conn.execute(
@@ -7342,6 +7343,7 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                     continue
                 generated = await write_persona_editorial_gemini(
                     persona, compact_topic, verified_facts, grok_context, writer_context,
+                    str(state.get("retry_instruction", "")),
                     reality_payload=reality_payload, grounding_contract=grounding_contract,
                 )
                 failures = deterministic_editorial_style_failures(
@@ -7353,6 +7355,7 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                     "writer_attempts": 1,
                     "deterministic_guard_revision": EDITORIAL_DETERMINISTIC_GUARD_REVISION,
                 })
+                state.pop("retry_instruction", None)
                 if not persist_persona_editorial_generation_state(evaluation, "draft_ready", state):
                     continue
             elif (
