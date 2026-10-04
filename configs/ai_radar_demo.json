@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "schedule_minutes": 120,
+  "hours": 30,
+  "workers": 6,
+  "rewrite": {
+    "enabled": true,
+    "model": "deepseek-chat",
+    "temperature": 0.1
+  },
+  "db_path": "data/ai_radar_demo/ai_radar_demo.sqlite3",
+  "output_dir": "data/ai_radar_demo/output",
+  "first_party_affiliations": {
+    "finkd": ["Muse Code"],
+    "obviyus": ["OpenClaw"],
+    "hidecloud": ["Manus"],
+    "arcads_ai": ["Arcads"],
+    "bamitsmanas": ["Kairos", "OpenAI", "Codex", "ChatGPT"],
+    "chatgpt": ["ChatGPT", "OpenAI"],
+    "runwayml": ["Solaris", "Runway"],
+    "deemostech": ["HYPER3D", "CAST"],
+    "anthropicai": ["Anthropic", "Claude", "Reward Seeker"],
+    "qwen": ["*"],
+    "alibaba_qwen": ["*"],
+    "celeris": ["*"],
+    "celeris_ai": ["*"],
+    "vercel": ["*"],
+    "deepseek": ["*"],
+    "deepseek_ai": ["*"]
+  },
+  "source_accounts": [
+    {"handle": "Khazix0918", "user_id": null},
+    {"handle": "MaxForAI", "user_id": null}, {"handle": "Gorden_Sun", "user_id": null},
+    {"handle": "aigclink", "user_id": null}, {"handle": "xiaohu", "user_id": null},
+    {"handle": "shao__meng", "user_id": null}, {"handle": "op7418", "user_id": null},
+    {"handle": "jiqizhixin", "user_id": null}, {"handle": "testingcatalog", "user_id": null},
+    {"handle": "AInews_wire", "user_id": null}, {"handle": "_akhaliq", "user_id": null},
+    {"handle": "rohanpaul_ai", "user_id": null}, {"handle": "Lentils80", "user_id": null},
+    {"handle": "codeglitch", "user_id": null}, {"handle": "dair_ai", "user_id": null},
+    {"handle": "HuggingPapers", "user_id": null}, {"handle": "MattVidPro", "user_id": null},
+    {"handle": "aisearchio", "user_id": null}, {"handle": "LeRobotHF", "user_id": null},
+    {"handle": "XRoboHub", "user_id": null}, {"handle": "BiologyAIDaily", "user_id": null},
+    {"handle": "SemiAnalysis_", "user_id": null}, {"handle": "Techmeme", "user_id": null},
+    {"handle": "InsideAIPolicy", "user_id": null}, {"handle": "thePandaily", "user_id": "870221240929140736"}
+  ],
+  "focuses": [
+    {"id": "frontier_models", "title": "前沿模型与产品"}, {"id": "ai_coding", "title": "AI 编程"},
+    {"id": "agents_automation", "title": "Agent 与自动化"}, {"id": "creative_multimodal", "title": "AI 图像、视频与音频"},
+    {"id": "research_open_source", "title": "研究与开源"}, {"id": "robotics_embodied", "title": "机器人与具身智能"},
+    {"id": "chips_compute", "title": "芯片与算力"}, {"id": "business_enterprise", "title": "AI 商业与企业应用"},
+    {"id": "policy_safety_legal", "title": "政策、安全与法律"}, {"id": "ai_for_science", "title": "AI for Science"}
+  ],
+  "output_accounts": [
+    {"slug": "model-frontier", "name": "Milo", "profile_handle": "miloonmodels", "profile_handle_is_internal_only": true, "bio": "New model? I’ll try it. I keep notes on price, limits, access, and the bits that fail.", "focus": "frontier_models", "voice": "只写模型发布、API、价格和开放范围；短、快、保留原始不确定性。"},
+    {"slug": "coding-stack", "name": "Dev", "profile_handle": "devcodes", "profile_handle_is_internal_only": true, "bio": "I build with AI coding tools in real repos. The demo is the easy part.", "focus": "ai_coding", "voice": "聚焦 IDE、CLI、代码模型和真实开发工作流，不把演示写成生产结论。"},
+    {"slug": "agent-workflows", "name": "Nate", "profile_handle": "nateloops", "profile_handle_is_internal_only": true, "bio": "Mostly watching agents do work—or fail to. MCP, computer use, handoffs, and all the messy edges.", "focus": "agents_automation", "voice": "聚焦 Agent、MCP、Computer Use 和流程自动化，优先写具体动作与边界。"},
+    {"slug": "multimodal-lab", "name": "Maya", "profile_handle": "mayamakesai", "profile_handle_is_internal_only": true, "bio": "I make things with image, video, audio, and 3D models. If I can’t steer or edit it, I’m not done.", "focus": "creative_multimodal", "voice": "聚焦图像、视频、音频和 3D，写清生成能力、控制方式与交付限制。"},
+    {"slug": "open-research", "name": "Theo", "profile_handle": "theoreadspapers", "profile_handle_is_internal_only": true, "bio": "I read papers and chase the code behind them. Open source does not automatically mean reproduced.", "focus": "research_open_source", "voice": "聚焦论文、权重、数据集和代码，保留论文口径，不把实验结果写成普遍事实。"},
+    {"slug": "embodied-robotics", "name": "Rory", "profile_handle": "roryrobots", "profile_handle_is_internal_only": true, "bio": "Robots have to work outside the highlight reel. I follow VLA, ROS, field demos, and deployment.", "focus": "robotics_embodied", "voice": "聚焦机器人、VLA、ROS 和真实演示，区分现场展示与量产能力。"},
+    {"slug": "compute-stack", "name": "Sam", "profile_handle": "samonsilicon", "profile_handle_is_internal_only": true, "bio": "GPUs, silicon, datacenters, and inference bills. I like numbers with a source attached.", "focus": "chips_compute", "voice": "聚焦 GPU、芯片、数据中心与推理成本，只使用来源中明确给出的数字。"},
+    {"slug": "ai-business", "name": "Ben", "profile_handle": "benusesai", "profile_handle_is_internal_only": true, "bio": "I follow the companies putting AI to work: who buys it, who keeps using it, and where the money moves.", "focus": "business_enterprise", "voice": "聚焦融资、并购、企业采用和组织变化，不把公司说法写成已验证结果。"},
+    {"slug": "ai-governance", "name": "Lex", "profile_handle": "lexonai", "profile_handle_is_internal_only": true, "bio": "AI policy, safety, copyright, and courtrooms. I keep the jurisdiction and case status in the post.", "focus": "policy_safety_legal", "voice": "聚焦监管、法院、安全和版权，严格保留法域、时间与程序状态。"},
+    {"slug": "ai-science", "name": "Iris", "profile_handle": "irislabnotes", "profile_handle_is_internal_only": true, "bio": "AI in biology, medicine, chemistry, and materials. I’m interested in what the experiment actually showed.", "focus": "ai_for_science", "voice": "聚焦生物、医疗、化学、材料与物理，区分论文结果、临床证据和产业宣传。"}
+  ]
+}

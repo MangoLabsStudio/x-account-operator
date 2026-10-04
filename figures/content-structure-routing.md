@@ -1,0 +1,53 @@
+# 题材到内容结构的路由
+
+结构由题材决定，不由人设决定；实线为默认结构，虚线为该题材允许的可选结构。
+
+```mermaid
+flowchart LR
+    subgraph A["选题角度 family"]
+        A1["opportunity<br/>参与与交易机会"]
+        A2["industry_evaluation<br/>行业评价"]
+        A3["project_evaluation<br/>项目 / 产品评价"]
+        A4["market_cognition<br/>市场认知"]
+        A5["trading_philosophy<br/>交易哲学 / 财富观"]
+        A6["people_or_community<br/>人物 / 社区 / 乐子"]
+        A7["other<br/>其他解释型内容"]
+    end
+
+    subgraph S["硬配置的 10 套内容结构"]
+        S1["参与机会<br/>CTA：必须条件式行动"]
+        S2["交易机会<br/>CTA：必须条件式交易"]
+        S3["行业结构分析<br/>CTA：可选自然提问"]
+        S4["资讯解释<br/>CTA：禁止"]
+        S5["项目与产品评价<br/>CTA：可选试用"]
+        S6["配套讲解<br/>CTA：可选动作"]
+        S7["开源项目发现<br/>CTA：可选条件式试用"]
+        S8["市场认知<br/>CTA：禁止"]
+        S9["交易哲学与财富观<br/>CTA：可选自然提问"]
+        S10["人物、社区与乐子<br/>CTA：可选自然提问"]
+    end
+
+    A1 --> S1
+    A1 -.可选.-> S2
+    A2 --> S3
+    A2 -.可选.-> S4
+    A3 --> S5
+    A3 -.可选.-> S4
+    A3 -.可选.-> S6
+    A3 -.可选.-> S7
+    A4 --> S8
+    A4 -.可选.-> S6
+    A5 --> S9
+    A6 --> S10
+    A7 --> S4
+    A7 -.可选.-> S6
+
+    classDef angle fill:#eef6ff,stroke:#4776a8,color:#17293c;
+    classDef nocta fill:#f7ecee,stroke:#9a4b56,color:#481f28;
+    classDef optional fill:#fff4df,stroke:#a66b18,color:#4d3108;
+    classDef required fill:#eaf8ef,stroke:#3b7d52,color:#173b23;
+    class A1,A2,A3,A4,A5,A6,A7 angle;
+    class S4,S8 nocta;
+    class S3,S5,S6,S7,S9,S10 optional;
+    class S1,S2 required;
+```

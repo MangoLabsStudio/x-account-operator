@@ -25,6 +25,11 @@ ACCOUNT = {"user_id": "42", "handle": "configured_handle", "source_lists": ["mot
 CREATED_AT = "Sun Aug 24 01:30:00 +0000 2026"
 
 
+def test_twitter241_key_prefers_runtime_environment(monkeypatch):
+    monkeypatch.setenv("TWITTER241_RAPIDAPI_KEY", "runtime-key")
+    assert collector.twitter241_api_key() == "runtime-key"
+
+
 def tweet(post_id, author_id="42", *, note_text=None, full_text="legacy full text", text="legacy text"):
     item = {
         "__typename": "Tweet",

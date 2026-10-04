@@ -7101,5 +7101,168 @@ class AppTest(unittest.TestCase):
         self.assertEqual(row["status"], "HOLD")
         self.assertEqual(row["reason_code"], "INSUFFICIENT_REALITY_PAYLOAD")
 
+    def test_retail_attention_api_exposes_sources_items_and_manual_queue(self):
+        module = self.app_module.retail_attention_module()
+        module.store_items(self.app_module.DB_PATH, [
+            module.item(
+                "coingecko", "btc", item_type="attention_signal",
+                title="Bitcoin trending", raw={"id": "btc"}, attention_score=20,
+            )
+        ])
+        sources = self.client.get("/api/retail-attention/sources")
+        self.assertEqual(sources.status_code, 200)
+        self.assertIn("coingecko", {row["source"] for row in sources.json()})
+        items = self.client.get("/api/retail-attention/items?source=coingecko")
+        self.assertEqual(items.status_code, 200)
+        self.assertEqual(items.json()["items"][0]["external_id"], "btc")
+        hot = self.client.get("/api/retail-attention/hot-signals")
+        self.assertEqual(hot.status_code, 200)
+        self.assertEqual(hot.json()["pool"], "hot_signal")
+        viral = self.client.get("/api/retail-attention/viral-priors")
+        self.assertEqual(viral.status_code, 200)
+        observations = self.client.get("/api/retail-attention/observations")
+        self.assertEqual(observations.status_code, 200)
+        with patch.object(self.app_module, "queue_retail_attention", return_value=True):
+            queued = self.client.post(
+                "/api/retail-attention/run", json={"sources": ["coingecko"]}
+            )
+        self.assertEqual(queued.status_code, 200)
+        self.assertTrue(queued.json()["queued"])
+
+    def test_douyin_finished_posts_import_is_idempotent(self):
+        payload = {
+            "batch_date": "2026-08-29",
+            "posts": [{
+                "position": 1,
+                "tag": "财经",
+                "body": "第一版正文。",
+                "source_aweme_id": "7678258566533584228",
+                "source_url": "https://www.douyin.com/video/7678258566533584228",
+            }],
+        }
+        first = self.client.post("/api/douyin-posts/import", json=payload)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["total"], 1)
+        payload["posts"][0]["body"] = "更新后的正文。"
+        second = self.client.post("/api/douyin-posts/import", json=payload)
+        self.assertEqual(second.status_code, 200)
+        rows = self.client.get("/api/douyin-posts?batch_date=2026-08-29").json()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["body"], "更新后的正文。")
+        self.assertIn("抖音成稿池", self.client.get("/douyin").text)
+
+    def test_douyin_finished_posts_assigns_three_to_each_persona(self):
+        tags = ["财经", "AI", "生活感悟", "创业", "个人成长"]
+        posts = []
+        for index in range(60):
+            aweme_id = str(7000000000000000000 + index)
+            posts.append({
+                "position": index + 1,
+                "tag": tags[index % len(tags)],
+                "body": f"第 {index + 1} 条内容，包含市场、产品和普通人的生活观察。",
+                "source_aweme_id": aweme_id,
+                "source_url": f"https://www.douyin.com/video/{aweme_id}",
+            })
+        response = self.client.post(
+            "/api/douyin-posts/import",
+            json={"batch_date": "2026-08-29", "posts": posts},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.json()["assignments"].values()), {3})
+        rows = self.client.get("/api/douyin-posts?batch_date=2026-08-29").json()
+        counts = {}
+        for row in rows:
+            counts[row["persona_slug"]] = counts.get(row["persona_slug"], 0) + 1
+        self.assertEqual(len(counts), 20)
+        self.assertEqual(set(counts.values()), {3})
+
+    def test_douyin_finished_posts_assigns_partial_batch(self):
+        now = int(time.time())
+        with self.app_module.db() as conn:
+            for index in range(7):
+                aweme_id = str(7050000000000000000 + index)
+                conn.execute(
+                    """INSERT INTO douyin_finished_posts(
+                        batch_date,position,tag,body,source_aweme_id,source_url,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?)""",
+                    (
+                        "2026-08-29", index + 1, "AI", f"第 {index + 1} 条 AI 内容。",
+                        aweme_id, f"https://www.douyin.com/video/{aweme_id}", now, now,
+                    ),
+                )
+            assignments = self.app_module.assign_douyin_finished_posts(conn, "2026-08-29")
+            rows = conn.execute(
+                "SELECT persona_id FROM douyin_finished_posts WHERE batch_date=?",
+                ("2026-08-29",),
+            ).fetchall()
+        self.assertEqual(sum(assignments.values()), 7)
+        self.assertLessEqual(max(assignments.values()), 3)
+        self.assertTrue(all(row["persona_id"] for row in rows))
+
+    def test_today_schedule_combines_douyin_and_ai_radar(self):
+        context_date = self.app_module.shanghai_today()
+        now = int(time.time())
+        with self.app_module.db() as conn:
+            persona = conn.execute("SELECT id FROM personas ORDER BY id LIMIT 1").fetchone()
+            conn.execute(
+                """INSERT INTO douyin_finished_posts(
+                    batch_date,position,tag,body,source_aweme_id,source_url,
+                    persona_id,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    context_date, 1, "AI", "抖音正文。", "7060000000000000001",
+                    "https://www.douyin.com/video/7060000000000000001",
+                    persona["id"], now, now,
+                ),
+            )
+        created_at = datetime.now(self.app_module.TZ).isoformat()
+        self.app_module.AI_RADAR_DRAFT_CACHE.update({"expires_at": 0.0, "items": []})
+        with patch.object(
+            self.app_module.httpx,
+            "get",
+            return_value=FakeResponse({"drafts": [{
+                "created_at": created_at,
+                "output_account_name": "Milo",
+                "focus": "frontier_models",
+                "draft_zh": "AI Radar 正文。",
+                "original_post_url": "https://x.com/example/status/1",
+                "persona": {"id": "model-frontier", "name": "Milo", "focus_title": "前沿模型"},
+            }]}),
+        ):
+            rows = self.client.get("/api/today-schedule").json()
+        self.assertEqual({row["source_kind"] for row in rows}, {"douyin", "ai_radar"})
+        self.assertTrue(all(not row["actionable"] for row in rows))
+
+    def test_douyin_full_batch_replaces_stale_sources(self):
+        def posts(offset):
+            rows = []
+            for index in range(60):
+                aweme_id = str(7100000000000000000 + offset + index)
+                rows.append({
+                    "position": index + 1,
+                    "tag": "财经",
+                    "body": f"第 {index + 1} 条。",
+                    "source_aweme_id": aweme_id,
+                    "source_url": f"https://www.douyin.com/video/{aweme_id}",
+                })
+            return rows
+
+        first = posts(0)
+        second = posts(100)
+        self.assertEqual(self.client.post(
+            "/api/douyin-posts/import",
+            json={"batch_date": "2026-08-30", "posts": first},
+        ).status_code, 200)
+        response = self.client.post(
+            "/api/douyin-posts/import",
+            json={"batch_date": "2026-08-30", "posts": second},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total"], 60)
+        rows = self.client.get("/api/douyin-posts?batch_date=2026-08-30").json()
+        self.assertEqual({row["source_aweme_id"] for row in rows}, {
+            row["source_aweme_id"] for row in second
+        })
+
 if __name__ == "__main__":
     unittest.main()

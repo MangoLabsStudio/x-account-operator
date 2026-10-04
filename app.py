@@ -31,6 +31,8 @@ DAILY_CONTEXT_ARTIFACTS = DATA_DIR / "daily_context_runs"
 DAILY_CONTEXT_SOURCE_DB = DATA_DIR / "market_source_posts.sqlite3"
 DAILY_CONTEXT_TASKS: set[asyncio.Task] = set()
 DAILY_POST_GENERATION_TASKS: dict[int, asyncio.Task] = {}
+RETAIL_ATTENTION_TASKS: set[asyncio.Task] = set()
+DOUYIN_DAILY_TASKS: set[asyncio.Task] = set()
 EDITORIAL_GROK_CONTEXT_CACHE: dict[str, dict] = {}
 EDITORIAL_GROK_CONTEXT_CACHE_MAX = 64
 GITHUB_TRACTION_CACHE: dict[str, dict] = {}
@@ -38,6 +40,7 @@ GITHUB_TRACTION_CACHE_MAX = 64
 EDITORIAL_PROVIDER_HEALTH: dict[str, dict] = {}
 EDITORIAL_PROVIDER_MODEL_OVERRIDES: dict[str, dict] = {}
 EDITORIAL_GEMINI_KEY_POOLS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Queue] = {}
+AI_RADAR_DRAFT_CACHE = {"expires_at": 0.0, "items": []}
 GEMINI_KEYCHAIN_SERVICE = "codex.xops.gemini.pool"
 GEMINI_KEYCHAIN_ACCOUNTS = ("slot-1", "slot-2", "slot-3", "slot-4", "slot-5")
 GEMINI_POOL_ENV_VARS = tuple(f"XOPS_GEMINI_API_KEY_{index}" for index in range(1, 6))
@@ -922,6 +925,23 @@ def init_db():
             ON post_candidates(persona_id, context_date DESC);
             CREATE INDEX IF NOT EXISTS idx_post_candidates_fifo
             ON post_candidates(persona_id, status, created_at, id);
+            CREATE TABLE IF NOT EXISTS douyin_finished_posts (
+                id INTEGER PRIMARY KEY,
+                batch_date TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                tag TEXT NOT NULL,
+                body TEXT NOT NULL,
+                source_aweme_id TEXT NOT NULL UNIQUE,
+                source_url TEXT NOT NULL,
+                persona_id INTEGER REFERENCES personas(id),
+                match_score INTEGER NOT NULL DEFAULT 0,
+                match_reason TEXT NOT NULL DEFAULT '',
+                assigned_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_douyin_finished_posts_batch
+            ON douyin_finished_posts(batch_date DESC, position);
             CREATE TABLE IF NOT EXISTS topic_claim_history (
                 id INTEGER PRIMARY KEY,
                 claim_key TEXT NOT NULL UNIQUE,
@@ -985,6 +1005,17 @@ def init_db():
         }
         if "asset_id" not in candidate_columns:
             conn.execute("ALTER TABLE post_candidates ADD COLUMN asset_id TEXT NOT NULL DEFAULT ''")
+        douyin_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(douyin_finished_posts)").fetchall()
+        }
+        for name, definition in (
+            ("persona_id", "INTEGER REFERENCES personas(id)"),
+            ("match_score", "INTEGER NOT NULL DEFAULT 0"),
+            ("match_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("assigned_at", "INTEGER"),
+        ):
+            if name not in douyin_columns:
+                conn.execute(f"ALTER TABLE douyin_finished_posts ADD COLUMN {name} {definition}")
         evaluation_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(persona_editorial_evaluations)").fetchall()
         }
@@ -1125,7 +1156,7 @@ def reusable_editorial_topics(conn, context_date: str, cards: dict, limit: int =
            ORDER BY context_date DESC""",
         (window_start, context_date),
     ).fetchall()
-    for row in rows:
+    for index, row in enumerate(rows):
         old_cards = json_value(row["raw_cards"], {})
         stage = old_cards.get("editorial_angle_expansion", {})
         for topic in stage.get("expanded_topics", []) if isinstance(stage, dict) else []:
@@ -1640,6 +1671,24 @@ class DailySynthesisIn(BaseModel):
     raw_feed: str = Field(min_length=1, max_length=100000)
 
 
+class RetailAttentionRunIn(BaseModel):
+    sources: list[str] = Field(default_factory=list)
+    force: bool = False
+
+
+class DouyinFinishedPostIn(BaseModel):
+    position: int = Field(ge=1, le=100)
+    tag: str = Field(min_length=1, max_length=80)
+    body: str = Field(min_length=1, max_length=20000)
+    source_aweme_id: str = Field(min_length=1, max_length=40)
+    source_url: str = Field(min_length=1, max_length=500)
+
+
+class DouyinFinishedPostBatchIn(BaseModel):
+    batch_date: str = Field(min_length=10, max_length=10)
+    posts: list[DouyinFinishedPostIn]
+
+
 OPPORTUNITY_QUESTION_RULES = {
     "liquidity_activity": ("小资金 LP 现在有没有活动可以冲？", ["新增注意力有没有同步变成更深的盘口、持续成交和可承接的资金。"]),
     "yield": ("闲置资金现在适合参与理财吗？", ["把收益来源、补贴占比和资金成本拆开，不把高年化直接当成长期机会。"]),
@@ -2122,6 +2171,15 @@ def market_sources_module():
         return market_sources
     except ModuleNotFoundError:
         raise RuntimeError("市场母池采集模块未安装")
+
+
+def retail_attention_module():
+    try:
+        from market_sources import retail_attention
+
+        return retail_attention
+    except ModuleNotFoundError:
+        raise RuntimeError("散户注意力采集模块未安装")
 
 
 def daily_context_paths(context_date: str):
@@ -5188,7 +5246,56 @@ SAFE_FIRST_PERSON_OPINION_LEADS = (
     "我认为", "我觉得", "我的判断是", "我的判断", "我的理解是", "我的理解",
     "我倾向于", "我倾向", "我更关心", "在我看来",
 )
-EDITORIAL_DETERMINISTIC_GUARD_REVISION = 3
+EDITORIAL_DETERMINISTIC_GUARD_REVISION = 4
+
+EDITORIAL_EMOTION_MARKERS = {
+    "兴奋": ("冲", "暴涨", "爆", "牛市", "机会", "起飞", "bull", "moon", "50x"),
+    "焦虑": ("焦虑", "恐慌", "慌", "错过", "来不及", "overwhelmed", "anxiety", "panic"),
+    "不爽": ("离谱", "荒谬", "烂", "骗", "割", "砸盘", "崩", "dump", "crash", "shit"),
+    "荒诞感": ("绷不住", "笑死", "人才", "多物种", "搞笑", "meme", "lol"),
+    "好奇": ("为什么", "怎么会", "有意思", "没想到", "why", "interesting"),
+}
+
+
+def editorial_emotion_brief(topic: dict, payload: dict) -> dict:
+    statements = [
+        str(item.get("statement", "")).strip()
+        for item in payload.get("source_dependent_anchors", [])
+        if isinstance(item, dict) and str(item.get("statement", "")).strip()
+    ]
+    statements.extend(str(topic.get(key, "")).strip() for key in (
+        "specific_tension", "core_claim", "angle", "title",
+    ) if str(topic.get(key, "")).strip())
+    joined = "\n".join(statements).lower()
+    ranked = sorted(
+        (
+            (sum(joined.count(marker.lower()) for marker in markers), emotion)
+            for emotion, markers in EDITORIAL_EMOTION_MARKERS.items()
+        ),
+        reverse=True,
+    )
+    emotions = [emotion for score, emotion in ranked if score][:2]
+    punctuation_energy = min(2, joined.count("!") + joined.count("！"))
+    marker_energy = ranked[0][0] if ranked else 0
+    hot = bool(topic.get("hot_pool_origin_date")) or str(topic.get("source_kind", "")) in {
+        "market", "daily_context", "hot_topic",
+    }
+    target = min(5, max(3, 3 + int(hot) + int(marker_energy >= 3 or punctuation_energy >= 2)))
+    energetic = sorted(
+        statements,
+        key=lambda text: -sum(
+            text.lower().count(marker.lower())
+            for markers in EDITORIAL_EMOTION_MARKERS.values() for marker in markers
+        ),
+    )[:3]
+    return {
+        "dominant_emotions": emotions or ["好奇"],
+        "target_intensity": target,
+        "source_high_energy_lines": energetic,
+        "required_effect": "读者必须感到作者对这件事有真实反应，而不是在整理材料。",
+        "allowed_devices": ["短句", "反问", "轻微夸张", "嘲讽", "节奏断裂", "带情绪的判断词"],
+        "boundary": "可以放大情绪和修辞，不能放大事实确定性或编造亲历。",
+    }
 
 UNAUTHORIZED_FIRST_PERSON_EXPERIENCE_RE = re.compile(
     r"(?:我|本人)(?:上周|上个月|昨天|今天|最近|今年|这个月|一直|已经|刚|曾|现在|目前)?"
@@ -6598,6 +6705,9 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
         "sections 的语义槽和必填项是服务器硬约束；reasoning_shape 只能逐字选择 allowed_reasoning_shapes 中的一项。"
         "段落顺序可以在允许形状中变化；每段只写正文，不写 Hook、Context、CTA 等标签，不得把整篇复制进多个字段。\n"
         "全部 sections 拼接后的正文必须在 100–300 个字符之间，不能用重复句、标签或免责声明凑字数。"
+        "emotion_brief 是表达硬契约：开头两句内必须出现一种可感知的真实反应，全文保持同一种主导情绪。"
+        "情绪不是多加感叹号，而是作者明显地兴奋、焦虑、不爽、觉得荒诞或产生强烈好奇；允许短句、反问、轻微夸张和嘲讽。"
+        "母池原句有情绪时不得洗成资讯摘要、说明书或四平八稳的研报口吻。可以放大修辞，不能放大事实确定性。"
         "每个 sections 项必须返回 text、job、thesis_relation、reality_refs。EVIDENCE 段必须引用 RealityPayload 中的 ID；"
         "MECHANISM 段只能引用 GroundingContract 允许的 mechanism evidence。"
         "唯一可作为确定事实、数字、日期、行为或共识的材料是 RealityPayload 与 verified_facts；Grok 内容只用于理解前情、圈内争议和语言语境。"
@@ -6638,6 +6748,7 @@ async def write_persona_editorial_gemini(persona: dict, topic: dict, verified_fa
         f"人设：{json.dumps(persona, ensure_ascii=False)}\n"
         f"选题：{json.dumps(topic, ensure_ascii=False)}\n"
         f"本条行文结构：{json.dumps(style_recipe, ensure_ascii=False)}\n"
+        f"本条情绪契约：{json.dumps(topic.get('emotion_brief') or {}, ensure_ascii=False)}\n"
         f"verified_facts：{json.dumps(verified_facts, ensure_ascii=False)}\n"
         f"RealityPayload：{json.dumps(reality_payload, ensure_ascii=False)}\n"
         f"GroundingContract：{json.dumps(grounding_contract, ensure_ascii=False)}\n"
@@ -7158,6 +7269,10 @@ async def critique_persona_editorial_draft(persona: dict, topic: dict, verified_
         "仍须拒绝把它伪装成新发生的事实、名人直接引语或万能鸡汤。"
         "source_mode=paraphrase 时，正文出现引号、‘某某说过’或把 source_name 当作未经提供的事实，一律 REJECT。"
         "但条件句里夹带的价格、比例、日期、数量或已发生事件仍须 verified_facts。\n\n"
+        "emotion_brief 是硬门槛。target_intensity>=3 时，如果正文只是冷静转述、没有清楚情绪、没有带情绪的判断，"
+        "或把母池高能表达磨成说明文，必须以 EMOTION_COLLAPSE REJECT。中心主张虽然保留、语气却被软化成折中表述，"
+        "以 STANCE_DILUTION REJECT。不要因为表达兴奋、焦虑、不爽、荒诞、嘲讽或轻微修辞夸张而拒稿；"
+        "只有修辞被写成新的事实断言时才按事实问题处理。\n\n"
         "Grounding Validator 已在你之前运行。你只能改善表达，不能通过补数字、行为、共识、机制或来源事实来修复证据缺口；"
         "发现缺证据必须 REJECT，不得编造后放行。每个 substantive paragraph 的 Reality Ref 必须与实际语义相符。\n\n"
         f"永久成稿门槛：{json.dumps(topic_selection_policy().get('draft_quality_gates', []), ensure_ascii=False)}\n"
@@ -7417,6 +7532,9 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
             reality_payload = compile_reality_payload(
                 raw_cards, compact_topic, verified_facts, writer_context
             )
+            compact_topic["emotion_brief"] = editorial_emotion_brief(
+                compact_topic, reality_payload
+            )
             grounding_contract = compile_grounding_contract(
                 compact_topic, thesis, reality_payload
             )
@@ -7437,6 +7555,7 @@ async def generate_pending_persona_editorial_candidates(run_id: int, context_dat
                 )
             state.update({
                 "reality_payload": reality_payload,
+                "emotion_brief": compact_topic["emotion_brief"],
                 "grounding_contract": grounding_contract,
                 "grounding_contract_version": GROUNDING_CONTRACT_VERSION,
                 "reality_research": research or {
@@ -8464,6 +8583,111 @@ async def persona_editorial_scheduler():
         await asyncio.sleep(30)
 
 
+def queue_retail_attention(sources: list[str], trigger: str = "schedule") -> bool:
+    if any(not task.done() for task in RETAIL_ATTENTION_TASKS):
+        return False
+    module = retail_attention_module()
+    task = asyncio.create_task(module.collect(DB_PATH, sources, trigger))
+    RETAIL_ATTENTION_TASKS.add(task)
+    task.add_done_callback(RETAIL_ATTENTION_TASKS.discard)
+    return True
+
+
+async def run_due_retail_attention():
+    module = retail_attention_module()
+    if not module.enabled():
+        return False
+    sources = module.due_sources(DB_PATH)
+    return bool(sources) and queue_retail_attention(sources)
+
+
+async def retail_attention_scheduler():
+    while True:
+        try:
+            await run_due_retail_attention()
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
+def douyin_daily_module():
+    from market_sources import douyin_daily_cloud
+    return douyin_daily_cloud
+
+
+async def execute_douyin_daily(batch_date: str):
+    module = douyin_daily_module()
+    try:
+        with db() as conn:
+            used = {str(row[0]) for row in conn.execute("SELECT source_aweme_id FROM douyin_finished_posts")}
+            await module.run(conn, batch_date, DATA_DIR, used)
+            assignments = assign_douyin_finished_posts(conn, batch_date)
+            module.validate_assignments(assignments)
+    except Exception as error:
+        with db() as conn:
+            module.init_db(conn)
+            now = int(time.time())
+            run = conn.execute("SELECT attempts FROM douyin_daily_runs WHERE batch_date=?", (batch_date,)).fetchone()
+            attempts = int(run["attempts"] or 1) if run else 1
+            conn.execute(
+                "UPDATE douyin_daily_runs SET status='failed',error=?,completed_at=?,next_retry_at=? WHERE batch_date=?",
+                (f"{type(error).__name__}: {error}"[:1000], now, now + module.retry_delay(attempts), batch_date),
+            )
+        raise
+
+
+def queue_douyin_daily(batch_date: str) -> bool:
+    if any(not task.done() for task in DOUYIN_DAILY_TASKS):
+        return False
+    with db() as conn:
+        douyin_daily_module().init_db(conn)
+        status = conn.execute("SELECT * FROM douyin_daily_runs WHERE batch_date=?", (batch_date,)).fetchone()
+        if status and status["status"] == "completed":
+            counts = conn.execute(
+                """SELECT COUNT(*) total,COUNT(DISTINCT source_aweme_id) unique_sources,
+                          COUNT(DISTINCT persona_id) personas
+                   FROM douyin_finished_posts WHERE batch_date=?""",
+                (batch_date,),
+            ).fetchone()
+            balanced = conn.execute(
+                """SELECT COUNT(*) FROM (
+                     SELECT persona_id FROM douyin_finished_posts WHERE batch_date=?
+                     GROUP BY persona_id HAVING persona_id IS NOT NULL AND COUNT(*)=3
+                   )""",
+                (batch_date,),
+            ).fetchone()[0]
+            if status["finished"] >= 80 and counts["total"] == 60 and counts["unique_sources"] == 60 and counts["personas"] == 20 and balanced == 20:
+                return False
+            conn.execute(
+                "UPDATE douyin_daily_runs SET status='failed',error='完成记录未通过 80/60/20x3 验收',next_retry_at=0 WHERE batch_date=?",
+                (batch_date,),
+            )
+            status = conn.execute("SELECT * FROM douyin_daily_runs WHERE batch_date=?", (batch_date,)).fetchone()
+        if status and status["status"] == "running":
+            conn.execute("UPDATE douyin_daily_runs SET status='failed',error='服务重启前任务中断，自动补跑',completed_at=?,next_retry_at=0 WHERE batch_date=?", (int(time.time()), batch_date))
+            status = conn.execute("SELECT * FROM douyin_daily_runs WHERE batch_date=?", (batch_date,)).fetchone()
+        if status and status["status"] == "failed" and not douyin_daily_module().retry_ready(status, int(time.time())):
+            return False
+    task = asyncio.create_task(execute_douyin_daily(batch_date))
+    DOUYIN_DAILY_TASKS.add(task)
+    task.add_done_callback(DOUYIN_DAILY_TASKS.discard)
+    return True
+
+
+async def douyin_daily_scheduler():
+    while True:
+        try:
+            module = douyin_daily_module()
+            if module.enabled():
+                now = datetime.now(TZ)
+                hour, minute = module.schedule()
+                if (now.hour, now.minute) >= (hour, minute):
+                    queue_douyin_daily(now.date().isoformat())
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
 def recover_interrupted_daily_context_run():
     now = int(time.time())
     with db() as conn:
@@ -8485,14 +8709,23 @@ def recover_interrupted_daily_context_run():
 async def lifespan(_app):
     init_db()
     recover_interrupted_daily_context_run()
+    retail_attention_module().recover_interrupted(DB_PATH)
     context_task = asyncio.create_task(daily_context_scheduler())
     editorial_task = asyncio.create_task(persona_editorial_scheduler())
+    retail_task = asyncio.create_task(retail_attention_scheduler())
+    douyin_task = asyncio.create_task(douyin_daily_scheduler())
     yield
     context_task.cancel()
     editorial_task.cancel()
+    retail_task.cancel()
+    douyin_task.cancel()
     for task in list(DAILY_CONTEXT_TASKS):
         task.cancel()
     for task in list(DAILY_POST_GENERATION_TASKS.values()):
+        task.cancel()
+    for task in list(RETAIL_ATTENTION_TASKS):
+        task.cancel()
+    for task in list(DOUYIN_DAILY_TASKS):
         task.cancel()
 
 
@@ -8520,6 +8753,8 @@ async def require_operator_token(request: Request, call_next):
 @app.get("/health")
 def health():
     hour, minute = daily_context_schedule()
+    retail = retail_attention_module()
+    retail_sources = retail.source_status(DB_PATH)
     return {
         "ok": True,
         "daily_context_enabled": daily_context_scheduler_enabled(),
@@ -8534,6 +8769,11 @@ def health():
         "thesis_contract_version": THESIS_CONTRACT_VERSION,
         "reality_payload_version": REALITY_PAYLOAD_VERSION,
         "grounding_contract_version": GROUNDING_CONTRACT_VERSION,
+        "retail_attention_enabled": retail.enabled(),
+        "retail_attention_running": any(not task.done() for task in RETAIL_ATTENTION_TASKS),
+        "retail_attention_sources": {
+            row["source"]: row["status"] for row in retail_sources
+        },
     }
 
 
@@ -8561,9 +8801,335 @@ def thesis_metrics():
     }
 
 
+@app.get("/api/retail-attention/sources")
+def retail_attention_sources():
+    result = retail_attention_module().source_status(DB_PATH)
+    with db() as conn:
+        latest_x = conn.execute(
+            """SELECT id,status,completed_at,error FROM daily_context_runs
+               ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+    if latest_x:
+        for row in result:
+            if row["source"] == "x":
+                row.update({
+                    "upstream_status": latest_x["status"],
+                    "upstream_run_id": latest_x["id"],
+                    "upstream_last_success_at": latest_x["completed_at"],
+                    "upstream_error": latest_x["error"],
+                })
+                break
+    return result
+
+
+@app.get("/api/retail-attention/runs")
+def retail_attention_runs(source: str = "", limit: int = 50):
+    return retail_attention_module().list_runs(
+        DB_PATH, source=source.strip(), limit=max(1, min(limit, 200))
+    )
+
+
+@app.get("/api/retail-attention/items")
+def retail_attention_items(
+    source: str = "", item_type: str = "", hours: int = 168,
+    limit: int = 100, offset: int = 0,
+):
+    return retail_attention_module().list_items(
+        DB_PATH,
+        source=source.strip(), item_type=item_type.strip(),
+        hours=max(1, min(hours, 24 * 90)),
+        limit=max(1, min(limit, 500)), offset=max(0, offset),
+    )
+
+
+@app.get("/api/retail-attention/hot-signals")
+def retail_attention_hot_signals(hours: int = 72, limit: int = 100):
+    return retail_attention_module().list_pool(
+        DB_PATH, "hot_signal",
+        hours=max(1, min(hours, 24 * 30)), limit=max(1, min(limit, 500)),
+    )
+
+
+@app.get("/api/retail-attention/viral-priors")
+def retail_attention_viral_priors(hours: int = 168, limit: int = 100):
+    return retail_attention_module().list_pool(
+        DB_PATH, "viral_prior",
+        hours=max(1, min(hours, 24 * 30)), limit=max(1, min(limit, 500)),
+    )
+
+
+@app.get("/api/retail-attention/observations")
+def retail_attention_observations(
+    source: str = "", external_id: str = "", limit: int = 100,
+):
+    return retail_attention_module().list_observations(
+        DB_PATH, source=source.strip(), external_id=external_id.strip(),
+        limit=max(1, min(limit, 500)),
+    )
+
+
+@app.post("/api/retail-attention/run")
+async def start_retail_attention_run(request: RetailAttentionRunIn):
+    module = retail_attention_module()
+    try:
+        if request.sources:
+            sources = request.sources
+        elif request.force:
+            sources = list(module.configured_sources())
+        else:
+            sources = module.due_sources(DB_PATH)
+        unknown = [source for source in sources if source not in module.SOURCE_INTERVALS]
+        if unknown:
+            raise ValueError(f"未知散户注意力来源: {', '.join(unknown)}")
+    except (RuntimeError, ValueError) as error:
+        raise HTTPException(422, str(error)) from error
+    if not sources:
+        return {"queued": False, "reason": "all_sources_fresh", "sources": []}
+    if not queue_retail_attention(sources, "manual"):
+        raise HTTPException(409, "散户注意力抓取任务正在运行")
+    return {"queued": True, "sources": sources}
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return HTMLResponse(INDEX_HTML.replace("__BASE_URL__", os.environ["XOPS_BASE_URL"].rstrip("/")))
+
+
+DOUYIN_PERSONA_TERMS = {
+    "acheng": "打工人 副业 搞钱 赚钱 职场 工资 收入 上班 外卖 普通人 成本",
+    "ridehail-driver-zhao": "生活感悟 人生感悟 人生智慧 人性 人间清醒 社会观察 婚姻 情感 家庭 邻居 村子",
+    "college-student-linjia": "个人成长 自我提升 成长思维 女性成长 女性觉醒 自律 读书 学习 大学 青春 心理学",
+    "atuo": "商业思维 创业 增长 交易 项目 激励 社区 Token 商业 复盘",
+    "axu": "财经 宏观经济 经济 金融 美股 市场结构 数据 成交量 财政 指数 科技股",
+    "nanqiao": "AI Crypto 人工智能 产品 实测 用户 增长 商业化 Web3",
+    "qiliang": "股票 基金 黄金 投资 股市 炒股 山寨币 轮动 行情 买 卖",
+    "aye": "Meme 注意力 热点 流量 传播 情绪 社会观察 人性",
+    "xiaoman": "生态 社区 家庭教育 亲子教育 长期 跟踪 关系",
+    "maili": "投资理财 股票 基金 黄金 理财 投资 股市 炒股 仓位 止损 情绪 交易手账",
+    "hegong-afterwork": "AI 人工智能 工程 服务器 API 生产 流程 稳定 故障 芯片 算力",
+    "zhaojie-process": "职场 商业 团队 管理 流程 交接 审核 客户 公司 工作",
+    "linxue-model": "AI 大模型 模型 体验 学习 搜索 写作 语音 记忆 读书 认知 心理学",
+    "xiaocheng-product": "AI AI应用 产品 用户 增长 定价 分发 商业化 科技",
+    "ada-builds": "AI AI创业 创业 副业 工具 产品 开发 发布 用户 付费 维护",
+    "susu-multimodal": "AI AIGC 多模态 图像 视频 音频 创作 设计 审美 版权",
+    "zhangshifu-ai": "AI 人工智能 入门 学习 教育 提示词 读书 自律 认知 普通人",
+    "lianglaoban-ai": "AI 商业 财经 经济 成本 收入 毛利 回本 采购 订阅 现金流",
+    "mojie-eval": "AI 大模型 评测 可靠性 证据 数据 样本 复现 幻觉 认知提升 心理学",
+    "wenwen-ai-industry": "AI 人工智能 科技趋势 芯片 英伟达 算力 服务器 公司 产业 政策 宏观经济",
+}
+
+
+def douyin_persona_score(post, persona):
+    terms = DOUYIN_PERSONA_TERMS.get(persona["slug"], "").split()
+    tag = post["tag"].strip()
+    text = f"{tag} {post['body']}"
+    matched = [term for term in terms if term.lower() in text.lower()]
+    score = 5 + min(len(matched), 8) * 7
+    if tag in terms:
+        score += 28
+    ai_signal = any(term.lower() in text.lower() for term in (
+        "AI", "人工智能", "大模型", "AIGC", "机器人", "芯片", "英伟达", "算力",
+    ))
+    ai_persona = persona["slug"] in {
+        "nanqiao", "hegong-afterwork", "linxue-model", "xiaocheng-product",
+        "ada-builds", "susu-multimodal", "zhangshifu-ai", "lianglaoban-ai",
+        "mojie-eval", "wenwen-ai-industry",
+    }
+    if ai_signal == ai_persona:
+        score += 12
+    elif ai_signal:
+        score -= 12
+    return score, matched[:4]
+
+
+def maximize_assignment(weights):
+    size = len(weights)
+    max_weight = max(max(row) for row in weights)
+    costs = [[max_weight - value for value in row] for row in weights]
+    u = [0] * (size + 1)
+    v = [0] * (size + 1)
+    p = [0] * (size + 1)
+    way = [0] * (size + 1)
+    for i in range(1, size + 1):
+        p[0] = i
+        j0 = 0
+        minv = [10**9] * (size + 1)
+        used = [False] * (size + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = 10**9
+            j1 = 0
+            for j in range(1, size + 1):
+                if used[j]:
+                    continue
+                current = costs[i0 - 1][j - 1] - u[i0] - v[j]
+                if current < minv[j]:
+                    minv[j] = current
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(size + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    assignment = [-1] * size
+    for j in range(1, size + 1):
+        assignment[p[j] - 1] = j - 1
+    return assignment
+
+
+def assign_douyin_finished_posts(conn, batch_date: str):
+    posts = conn.execute(
+        "SELECT * FROM douyin_finished_posts WHERE batch_date=? ORDER BY position,id",
+        (batch_date,),
+    ).fetchall()
+    personas = conn.execute("SELECT id,slug,name,role FROM personas ORDER BY id").fetchall()
+    if len(posts) > 60 or len(personas) != 20:
+        raise HTTPException(422, "balanced assignment supports up to 60 posts and requires 20 personas")
+    slots = [persona for persona in personas for _ in range(3)]
+    scored = [[douyin_persona_score(post, persona)[0] for persona in slots] for post in posts]
+    scored.extend([[0] * len(slots) for _ in range(len(slots) - len(scored))])
+    assignment = maximize_assignment(scored)
+    now = int(time.time())
+    counts = {persona["slug"]: 0 for persona in personas}
+    for post, slot_index in zip(posts, assignment[:len(posts)]):
+        persona = slots[slot_index]
+        score, matched = douyin_persona_score(post, persona)
+        reason = f"全局平衡匹配：{persona['role']}"
+        if matched:
+            reason += "；命中 " + "、".join(matched)
+        conn.execute(
+            """UPDATE douyin_finished_posts
+               SET persona_id=?,match_score=?,match_reason=?,assigned_at=?,updated_at=?
+               WHERE id=?""",
+            (persona["id"], score, reason, now, now, post["id"]),
+        )
+        counts[persona["slug"]] += 1
+    return counts
+
+
+@app.get("/api/douyin-posts")
+def list_douyin_finished_posts(batch_date: str | None = None, limit: int = 100):
+    limit = max(1, min(limit, 500))
+    with db() as conn:
+        if batch_date:
+            rows = conn.execute(
+                """SELECT d.*,p.slug persona_slug,p.name persona_name,p.role persona_role
+                   FROM douyin_finished_posts d LEFT JOIN personas p ON p.id=d.persona_id
+                   WHERE d.batch_date=? ORDER BY p.id,d.position LIMIT ?""",
+                (batch_date, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT d.*,p.slug persona_slug,p.name persona_name,p.role persona_role
+                   FROM douyin_finished_posts d LEFT JOIN personas p ON p.id=d.persona_id
+                   ORDER BY d.batch_date DESC,p.id,d.position LIMIT ?""",
+                (limit,),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/douyin-posts/import")
+def import_douyin_finished_posts(request: DouyinFinishedPostBatchIn):
+    try:
+        datetime.strptime(request.batch_date, "%Y-%m-%d")
+    except ValueError as error:
+        raise HTTPException(422, "batch_date must be YYYY-MM-DD") from error
+    if not request.posts or len(request.posts) > 100:
+        raise HTTPException(422, "posts must contain 1 to 100 items")
+    if len({post.source_aweme_id for post in request.posts}) != len(request.posts):
+        raise HTTPException(422, "source_aweme_id must be unique within a batch")
+    for post in request.posts:
+        if not post.source_aweme_id.isdigit() or post.source_aweme_id not in post.source_url:
+            raise HTTPException(422, "source_aweme_id must match the Douyin source URL")
+    now = int(time.time())
+    with db() as conn:
+        before = conn.total_changes
+        if len(request.posts) == 60:
+            source_ids = [post.source_aweme_id for post in request.posts]
+            placeholders = ",".join("?" for _ in source_ids)
+            conn.execute(
+                f"DELETE FROM douyin_finished_posts WHERE batch_date=? AND source_aweme_id NOT IN ({placeholders})",
+                [request.batch_date, *source_ids],
+            )
+        for post in request.posts:
+            conn.execute(
+                """INSERT INTO douyin_finished_posts(
+                    batch_date,position,tag,body,source_aweme_id,source_url,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(source_aweme_id) DO UPDATE SET
+                    batch_date=excluded.batch_date,position=excluded.position,
+                    tag=excluded.tag,body=excluded.body,source_url=excluded.source_url,
+                    updated_at=excluded.updated_at""",
+                (
+                    request.batch_date, post.position, post.tag.strip(), post.body.strip(),
+                    post.source_aweme_id, post.source_url, now, now,
+                ),
+            )
+        changed = conn.total_changes - before
+        total = conn.execute(
+            "SELECT COUNT(*) FROM douyin_finished_posts WHERE batch_date=?",
+            (request.batch_date,),
+        ).fetchone()[0]
+        assignments = assign_douyin_finished_posts(conn, request.batch_date) if total == 60 else {}
+    return {
+        "batch_date": request.batch_date, "received": len(request.posts),
+        "changed": changed, "total": total, "assignments": assignments,
+    }
+
+
+@app.post("/api/douyin-posts/assign")
+def assign_douyin_finished_post_batch(batch_date: str):
+    with db() as conn:
+        assignments = assign_douyin_finished_posts(conn, batch_date)
+    return {"batch_date": batch_date, "assignments": assignments}
+
+
+@app.get("/douyin", response_class=HTMLResponse)
+def douyin_finished_post_center():
+    rows = list_douyin_finished_posts(limit=500)
+    groups = []
+    current_key = None
+    for index, row in enumerate(rows):
+        key = (row["batch_date"], row.get("persona_slug") or "unassigned")
+        if key != current_key:
+            groups.append(
+                f"<section><h2>{html.escape(row.get('persona_name') or '未分配')}"
+                f" <span>{html.escape(row.get('persona_role') or '')}</span></h2>"
+            )
+            current_key = key
+        groups.append(
+            f"<article><h3>{row['position']:02d}｜#{html.escape(row['tag'])}</h3>"
+            + "".join(f"<p>{html.escape(part)}</p>" for part in row["body"].split("\n\n"))
+            + f"<div class='reason'>{html.escape(row.get('match_reason') or '')}</div>"
+            + f"<a href='{html.escape(row['source_url'])}' target='_blank' rel='noopener'>原视频</a>"
+            + f"<small>{html.escape(row['batch_date'])}</small></article>"
+        )
+        next_row = rows[index + 1] if index + 1 < len(rows) else None
+        if not next_row or (next_row["batch_date"], next_row.get("persona_slug") or "unassigned") != key:
+            groups.append("</section>")
+    cards = "".join(groups)
+    return HTMLResponse(
+        "<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>抖音成稿池</title><style>body{font:15px/1.75 system-ui;max-width:900px;margin:36px auto;padding:0 18px;background:#f7f8fa;color:#18181b}"
+        "header{display:flex;justify-content:space-between;align-items:center}section{margin:28px 0}section>h2{font-size:21px}section>h2 span{font-size:14px;color:#71717a;font-weight:400;margin-left:8px}"
+        "article{background:#fff;border:1px solid #e2e4e8;border-radius:12px;padding:20px;margin:12px 0}h1{font-size:26px}h3{font-size:17px}p{white-space:pre-wrap}"
+        ".reason{font-size:12px;color:#71717a;margin:14px 0 8px}a{color:#2563eb;text-decoration:none}small{float:right;color:#71717a}</style>"
+        f"<header><h1>抖音成稿池</h1><a href='{os.environ['XOPS_BASE_URL'].rstrip('/')}'>返回发帖队列</a></header>{cards}"
+    )
 
 
 @app.get("/personas", response_class=HTMLResponse)
@@ -10088,16 +10654,103 @@ def get_daily_posts():
     return result
 
 
+def ai_radar_schedule_rows(context_date: str):
+    if AI_RADAR_DRAFT_CACHE["expires_at"] < time.time():
+        try:
+            response = httpx.get(
+                os.getenv(
+                    "XOPS_AI_RADAR_URL",
+                    "https://ai-radar-demo-production.up.railway.app",
+                ).rstrip("/") + "/api/drafts",
+                timeout=15,
+            )
+            response.raise_for_status()
+            AI_RADAR_DRAFT_CACHE.update({
+                "expires_at": time.time() + 300,
+                "items": response.json().get("drafts", []),
+            })
+        except (httpx.HTTPError, TypeError, ValueError):
+            pass
+    result = []
+    for draft in AI_RADAR_DRAFT_CACHE["items"]:
+        try:
+            created = datetime.fromisoformat(str(draft["created_at"]).replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if created.astimezone(TZ).date().isoformat() != context_date:
+            continue
+        persona = draft.get("persona") or {}
+        body = str(draft.get("draft_zh") or "").strip()
+        if not body:
+            continue
+        result.append({
+            "id": "ai-radar-" + hashlib.sha256(
+                str(draft.get("original_post_url", "")).encode("utf-8")
+            ).hexdigest()[:16],
+            "context_date": context_date,
+            "persona_slug": str(persona.get("id") or draft.get("focus") or "ai-radar"),
+            "persona_name": str(draft.get("output_account_name") or persona.get("name") or "AI Radar"),
+            "title": "AI Radar · " + str(persona.get("focus_title") or draft.get("focus") or "AI 资讯"),
+            "body": body,
+            "image_url": None,
+            "image_note": "AI Radar 待审稿",
+            "source_url": str(draft.get("original_post_url") or ""),
+            "source_kind": "ai_radar",
+            "actionable": False,
+        })
+    return result
+
+
+@app.get("/api/today-schedule")
+def get_today_schedule():
+    context_date = shanghai_today()
+    items = [{**post, "source_kind": "native", "source_url": "", "actionable": True}
+             for post in get_daily_posts()]
+    with db() as conn:
+        douyin = conn.execute(
+            """SELECT d.*,p.slug persona_slug,p.name persona_name
+               FROM douyin_finished_posts d JOIN personas p ON p.id=d.persona_id
+               WHERE d.batch_date=? ORDER BY p.id,d.position""",
+            (context_date,),
+        ).fetchall()
+    items.extend({
+        "id": f"douyin-{row['id']}",
+        "context_date": context_date,
+        "persona_slug": row["persona_slug"],
+        "persona_name": row["persona_name"],
+        "title": f"抖音 · #{row['tag']}",
+        "body": row["body"],
+        "image_url": None,
+        "image_note": "抖音成稿",
+        "source_url": row["source_url"],
+        "source_kind": "douyin",
+        "actionable": False,
+    } for row in douyin)
+    items.extend(ai_radar_schedule_rows(context_date))
+    counts = {}
+    positions = {}
+    for item in items:
+        key = item["persona_slug"]
+        counts[key] = counts.get(key, 0) + 1
+    for item in items:
+        key = item["persona_slug"]
+        positions[key] = positions.get(key, 0) + 1
+        item["position"] = positions[key]
+        item["remaining"] = counts[key]
+        item["is_head"] = positions[key] == 1
+    return items
+
+
 INDEX_HTML = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>每日 Post 草稿队列</title>
 <style>body{font:15px/1.7 system-ui;max-width:1080px;margin:36px auto;padding:0 18px;color:#18181b;background:#f7f8fa}header{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:22px}h1{margin:0;font-size:26px}header p{margin:3px 0 0;color:#71717a}nav{display:flex;gap:16px}a{color:#2563eb;text-decoration:none}.queue{display:grid;gap:24px}.account{background:#fff;border:1px solid #e2e4e8;border-radius:14px;padding:20px}.account-head{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:14px}.account-head h2{margin:0;font-size:20px}.count{color:#71717a}.tweets{display:grid;gap:12px}.card{display:grid;grid-template-columns:120px 1fr;border:1px solid #e2e4e8;border-radius:10px;overflow:hidden}.image{width:100%;height:100%;min-height:160px;object-fit:cover;background:#eceef1}.content{padding:16px;white-space:pre-wrap}.meta{color:#71717a;font-size:13px;margin-bottom:6px}.title{font-weight:750;margin-bottom:8px}.note{color:#8a641b;font-size:12px;margin-top:12px}.feedback{display:flex;gap:8px;margin-top:12px}.feedback select,.feedback input{min-width:0;border:1px solid #d4d7dd;border-radius:8px;padding:7px 9px;background:#fff}.feedback input{flex:1}.rewrite,.done{border:0;border-radius:9px;padding:9px 14px;background:#18181b;color:#fff;cursor:pointer}.rewrite:disabled,.done:disabled{opacity:.55;cursor:wait}.done{margin-top:12px}.waiting{display:inline-block;margin-top:12px;color:#71717a;font-size:13px}.queued{padding:28px;color:#71717a}.empty-image{display:grid;place-items:center;background:#eceef1;color:#8b9098}@media(max-width:680px){header{display:block}nav{margin-top:12px}.account-head{display:block}.card{grid-template-columns:1fr}.image{height:220px}.feedback{display:grid}}</style>
-<header><div><h1>今日发帖安排</h1><p>每个账户一组：今天发几条、按什么顺序，直接排出来。</p></div><nav><a href="__BASE_URL__/personas">人设</a><a href="__BASE_URL__/market">每日研究</a></nav></header>
+<header><div><h1>今日发帖安排</h1><p>每个账户一组：今天发几条、按什么顺序，直接排出来。</p></div><nav><a href="__BASE_URL__/douyin">抖音成稿池</a><a href="__BASE_URL__/personas">人设</a><a href="__BASE_URL__/market">每日研究</a></nav></header>
 <main id="result" class="queue"><div class="queued">正在读取队列…</div></main>
 <script>
 const base='__BASE_URL__',result=document.querySelector('#result');
 async function writeApi(path,options={}){const headers={...(options.headers||{})},request=()=>fetch(base+path,{...options,headers});if(sessionStorage.getItem('xops_operator_token'))headers['X-Ops-Token']=sessionStorage.getItem('xops_operator_token');let response=await request();if(response.status===401){const token=prompt('请输入 Operator Token');if(token){sessionStorage.setItem('xops_operator_token',token);headers['X-Ops-Token']=token;response=await request()}}return response}
 async function load(){
   try{
-    const response=await fetch(base+'/api/daily-posts'),items=await response.json();
+    const response=await fetch(base+'/api/today-schedule'),items=await response.json();
     result.innerHTML='';
     if(!items.length){result.textContent='队列已清空。';return}
     const groups={};items.forEach(x=>(groups[x.persona_slug]??=[]).push(x));
@@ -10116,6 +10769,8 @@ async function load(){
       const title=document.createElement('div');title.className='title';title.textContent=x.title;content.append(title);
       const body=document.createElement('div');body.textContent=x.body;content.append(body);
       const note=document.createElement('div');note.className='note';note.textContent=x.image_note;content.append(note);
+      if(x.source_url){const source=document.createElement('a');source.href=x.source_url;source.target='_blank';source.rel='noopener';source.textContent=x.source_kind==='douyin'?'查看原视频':'查看原帖';content.append(source)}
+      if(!x.actionable){card.append(content);tweets.append(card);return}
       const feedback=document.createElement('div');feedback.className='feedback';
       const choice=document.createElement('select');[
         ['too_ai','太 AI'],['context_missing','Context 不够'],['hook_weak','Hook 不够强'],

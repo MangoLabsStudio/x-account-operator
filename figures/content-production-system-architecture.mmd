@@ -1,0 +1,43 @@
+flowchart TB
+    subgraph I["输入与长期记忆"]
+        direction LR
+        X1["Crypto X 母池"]
+        X2["AI X 信源池"]
+        O["官网・公告・链上・行情"]
+        E["常青题 / 方法论卡"]
+        P["20 个人设 / 已授权素材"]
+        H["历史主张库"]
+    end
+
+    C["1. Daily Context Engine<br/>增量抓取 → 交叉验证 → 事实卡 / 观点卡 / 热点池 → 当日选题"]
+    T["2. Topic & Angle Engine<br/>母题合并 → Grok 实时语境 → Gemini 独立角度 → 常识 / 重复 / 无价值过滤 → 结构路由"]
+    R["3. Persona Editorial Engine<br/>20 人并发匹配 → WRITE / HOLD / IGNORE → 跨人设去重 → 不足 3 条用常青题补位"]
+    G["4. Draft Generation Engine<br/>已核事实 + Grok Context + 人设 + 硬结构 → Gemini sections → 本地规则 → 主编审核 / 重写"]
+    Q["5. Candidate Queue<br/>通过稿进入 needs_review → 自动配已授权素材 → 数据库限制每人最多 3 条"]
+    D["6. Frontend & Manual Delivery<br/>20 人未全部满 3 条：返回空数组并继续补齐<br/>全部完成：一次性展示 60 条 → 人工改写 / 审核 / 标记发布"]
+
+    X1 --> C
+    X2 --> C
+    O --> C
+    C --> T
+    H --> T
+    T --> R
+    E --> R
+    P --> R
+    R --> G --> Q --> D
+
+    AUTO["当前 Context 门槛<br/>定时器会自动 approve"]
+    SAFE["发布边界<br/>系统不自动发布"]
+    AUTO -.-> T
+    SAFE -.-> D
+
+    classDef source fill:#eef6ff,stroke:#4776a8,color:#17293c;
+    classDef engine fill:#f4f0ff,stroke:#7259a8,color:#281d40;
+    classDef gate fill:#fff4df,stroke:#a66b18,color:#4d3108;
+    classDef store fill:#eaf8ef,stroke:#3b7d52,color:#173b23;
+    classDef output fill:#fff0f2,stroke:#a34c5d,color:#481f28;
+    class X1,X2,O,E,P,H source;
+    class C,T,R,G engine;
+    class AUTO,SAFE gate;
+    class Q store;
+    class D output;

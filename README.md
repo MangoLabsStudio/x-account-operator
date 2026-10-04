@@ -48,6 +48,13 @@ flowchart LR
 | `POST /api/post-candidates/{id}/rewrite` | 按人工反馈重写单条候选 |
 | `POST /api/post-candidates/{id}/published` | 将当前队首标记为已发布 |
 | `GET /api/thesis-metrics` | 查看 Thesis 流水线指标 |
+| `GET /api/retail-attention/sources` | 查看散户注意力来源、最近成功时间和失败原因 |
+| `GET /api/retail-attention/items` | 读取统一格式的帖子、视频、搜索趋势和榜单信号 |
+| `GET /api/retail-attention/hot-signals` | 读取按来源归一化、按对象去重后的热点信号 |
+| `GET /api/retail-attention/viral-priors` | 读取排除明显机构号后的个人高流量原帖 |
+| `GET /api/retail-attention/observations` | 读取帖子或榜单对象的历次指标快照 |
+| `GET /api/retail-attention/runs` | 查看各来源抓取运行记录 |
+| `POST /api/retail-attention/run` | 手动触发指定来源或全部到期来源 |
 | `GET /health` | 服务、并发池和契约版本状态 |
 
 配置 `XOPS_OPERATOR_TOKEN` 后，所有非 GET 的 `/api` 请求必须携带 `X-Ops-Token`。
@@ -87,6 +94,19 @@ XOPS_MOTHER_POOL_ACCOUNTS=/app/configs/content_source_accounts.json
 XOPS_AI_SOURCE_ACCOUNTS=/app/configs/ai_content_source_accounts.json
 XOPS_AI_SOURCE_ENABLED=true
 
+XOPS_RETAIL_ATTENTION_ENABLED=true
+XOPS_RETAIL_ATTENTION_SOURCES=x,eastmoney_rank,google_trends,coingecko,bilibili,reddit,douyin
+XOPS_DOUYIN_TRANSCRIPT_MAX_RESULTS=10
+XOPS_DOUYIN_TRANSCRIPT_CONCURRENCY=3
+XOPS_DOUYIN_TRANSCRIPT_MAX_CHARGE_USD=0.08
+XOPS_RETAIL_ATTENTION_CONCURRENCY=3
+XOPS_X_VIRAL_HOURS=72
+XOPS_X_VIRAL_MAX_RESULTS=1000
+XOPS_BILIBILI_MAX_RESULTS=30
+XOPS_DOUYIN_KEYWORDS=财经,股票,基金,黄金,比特币
+XOPS_APIFY_POLL_TIMEOUT_SECONDS=900
+APIFY_TOKEN=...
+
 XOPS_DAILY_POST_ENABLED=true
 XOPS_DAILY_POST_TARGET_PER_PERSONA=3
 XOPS_DAILY_SUPPLEMENT_COOLDOWN_DAYS=7
@@ -118,6 +138,11 @@ XOPS_OPERATOR_TOKEN=...
 - `persona_editorial_evaluations`：每个人设对每个题的 `WRITE / HOLD / IGNORE`、Thesis 和生成断点。
 - `post_candidates`：正式待审稿为 `needs_review`，已确认发布为 `published`，被新一轮替代的旧稿为 `superseded`。
 - `topic_claim_history`：保存已覆盖的核心主张，用于同人设与跨人设去重。
+- `retail_source_runs`：每个来源独立保存成功、失败、数量和错误，不把部分覆盖写成全量成功。
+- `retail_source_state`：保存最近成功水位、连续失败次数和退避状态。
+- `retail_items`：统一保存原帖、原始 JSON、互动量、首次/最近发现时间并按平台 ID 去重。
+- `retail_item_observations`：逐次保留榜单位置与互动量快照，不覆盖历史。
+- `apify_runs`：保存付费 Actor 的 run 与 dataset，重启后续跑同一任务，避免重复扣费。
 
 ## 测试
 

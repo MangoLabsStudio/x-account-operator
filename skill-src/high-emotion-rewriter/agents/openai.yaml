@@ -1,0 +1,4 @@
+interface:
+  display_name: "高情绪洗稿"
+  short_description: "将高流量原帖改成信息不减、情绪更强的自然中文社媒成稿"
+  default_prompt: "使用 $high-emotion-rewriter 将给定高流量原帖改写为信息不减、情绪不降的自然中文成稿。"

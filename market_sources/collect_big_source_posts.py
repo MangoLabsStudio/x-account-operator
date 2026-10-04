@@ -38,7 +38,10 @@ MAX_RETRIES = 3
 
 
 def twitter241_api_key() -> str:
-    """Read the sole credential from Keychain only at request time."""
+    """Use the runtime secret on Linux, with macOS Keychain as local fallback."""
+    key = os.getenv("TWITTER241_RAPIDAPI_KEY", "").strip()
+    if key:
+        return key
     result = subprocess.run(
         ["security", "find-generic-password", "-s", "codex.twitter241.rapidapi", "-a", "TWITTER241_RAPIDAPI_KEY", "-w"],
         capture_output=True, text=True,
