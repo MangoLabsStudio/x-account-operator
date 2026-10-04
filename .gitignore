@@ -25,3 +25,7 @@ assets/characters/college-student-linjia/*
 
 # Accidental local scratch files
 select count(*) from source_posts;
+
+# Local verification snapshots, production backups, and machine-specific figure config
+artifacts/
+figures/puppeteer-config.json
